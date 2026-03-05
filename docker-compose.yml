@@ -1,0 +1,14 @@
+services:
+  proposal-manager:
+    build: .
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    volumes:
+      - ./uploads:/app/uploads
+      - ./generated_proposals:/app/generated_proposals
+      - ./templates:/app/templates
+      - ./reference_documents:/app/reference_documents
+      - ./config:/app/config
+    restart: unless-stopped

@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+
+{% block title %}Proposal — {{ meta.source_file }}{% endblock %}
+
+{% block content %}
+<section class="proposal-header">
+    <div class="proposal-meta">
+        <h1>Generated Proposal</h1>
+        <div class="meta-grid">
+            <div class="meta-item">
+                <span class="meta-label">Source</span>
+                <span class="meta-value">{{ meta.source_file }}</span>
+            </div>
+            <div class="meta-item">
+                <span class="meta-label">Type</span>
+                <span class="meta-value">
+                    <span class="badge badge-{{ meta.document_type|lower }}">{{ meta.document_type }}</span>
+                </span>
+            </div>
+            <div class="meta-item">
+                <span class="meta-label">Confidence</span>
+                <span class="meta-value">
+                    <div class="confidence-bar">
+                        <div class="confidence-fill" style="width: {{ meta.confidence_score }}%"></div>
+                        <span>{{ meta.confidence_score }}%</span>
+                    </div>
+                </span>
+            </div>
+            <div class="meta-item">
+                <span class="meta-label">Generated</span>
+                <span class="meta-value">{{ meta.generated_at[:19] }}</span>
+            </div>
+        </div>
+        <div class="proposal-actions">
+            <a href="{{ url_for('download', job_id=job_id, fmt='docx') }}" class="btn btn-primary">Download DOCX</a>
+            <a href="{{ url_for('download', job_id=job_id, fmt='md') }}" class="btn btn-secondary">Download Markdown</a>
+            <a href="{{ url_for('index') }}" class="btn btn-secondary">Back to Home</a>
+        </div>
+    </div>
+</section>
+
+{% if action_items %}
+<section class="action-items-section">
+    <h2>Action Items ({{ action_items|length }})</h2>
+    <p class="action-items-note">These items require human review before the proposal is submitted.</p>
+    <ul class="action-items-list">
+        {% for item in action_items %}
+        <li>{{ item }}</li>
+        {% endfor %}
+    </ul>
+</section>
+{% endif %}
+
+<section class="proposal-content">
+    <div class="proposal-body">
+        {{ proposal_html|safe }}
+    </div>
+</section>
+{% endblock %}
