@@ -1,12 +1,14 @@
 """Flask web application for the Proposal Manager Agent.
 
 Provides an intranet-accessible interface where the proposal team can:
-1. Upload RFP/RFQ documents.
-2. Trigger AI-powered proposal generation.
-3. Download the generated proposal as DOCX or Markdown.
+1. Select an industry vertical (or let the system auto-detect).
+2. Upload RFP/RFQ documents.
+3. Trigger AI-powered proposal generation.
+4. Download the generated proposal as DOCX or Markdown.
 """
 
-import os
+import json
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +33,7 @@ from config.settings import (
     MAX_UPLOAD_SIZE_MB,
     TEMPLATES_DIR,
     UPLOADS_DIR,
+    VERTICALS,
 )
 from document_parser import parse_document
 from proposal_agent import generate_proposal
@@ -52,9 +55,12 @@ def _allowed_file(filename: str) -> bool:
 @app.route("/")
 def index():
     """Landing page with upload form."""
-    # List recently generated proposals
     recent = _get_recent_proposals()
-    return render_template("index.html", recent_proposals=recent)
+    return render_template(
+        "index.html",
+        recent_proposals=recent,
+        verticals=VERTICALS,
+    )
 
 
 @app.route("/upload", methods=["POST"])
@@ -76,6 +82,9 @@ def upload():
         )
         return redirect(url_for("index"))
 
+    # Get selected vertical
+    vertical = request.form.get("vertical", "auto")
+
     # Save uploaded file
     job_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
     safe_name = secure_filename(file.filename)
@@ -89,8 +98,8 @@ def upload():
             flash("Could not extract text from the uploaded document.", "error")
             return redirect(url_for("index"))
 
-        # Generate the proposal
-        result = generate_proposal(rfp_text)
+        # Generate the proposal with vertical selection
+        result = generate_proposal(rfp_text, vertical=vertical)
 
         # Save Markdown output
         md_filename = f"proposal_{job_id}.md"
@@ -103,12 +112,12 @@ def upload():
         markdown_to_docx(result["proposal_markdown"], str(docx_path))
 
         # Save metadata
-        import json
-
         meta = {
             "job_id": job_id,
             "source_file": safe_name,
             "document_type": result["document_type"],
+            "vertical": result["vertical"],
+            "vertical_label": result["vertical_label"],
             "confidence_score": result["confidence_score"],
             "action_items_count": len(result["action_items"]),
             "generated_at": result["generated_at"],
@@ -131,8 +140,6 @@ def upload():
 @app.route("/proposal/<job_id>")
 def view_proposal(job_id: str):
     """View a generated proposal."""
-    import json
-
     meta_path = GENERATED_DIR / f"proposal_{job_id}_meta.json"
     if not meta_path.exists():
         flash("Proposal not found.", "error")
@@ -144,8 +151,6 @@ def view_proposal(job_id: str):
     proposal_html = md.markdown(proposal_md, extensions=["tables", "fenced_code"])
 
     # Extract action items from the markdown
-    import re
-
     action_items = re.findall(r"\[ACTION REQUIRED:\s*(.+?)\]", proposal_md)
 
     return render_template(
@@ -160,8 +165,6 @@ def view_proposal(job_id: str):
 @app.route("/download/<job_id>/<fmt>")
 def download(job_id: str, fmt: str):
     """Download a generated proposal as DOCX or Markdown."""
-    import json
-
     meta_path = GENERATED_DIR / f"proposal_{job_id}_meta.json"
     if not meta_path.exists():
         flash("Proposal not found.", "error")
@@ -189,8 +192,6 @@ def download(job_id: str, fmt: str):
 
 def _get_recent_proposals(limit: int = 10) -> list[dict]:
     """Get metadata for recently generated proposals."""
-    import json
-
     metas = []
     for meta_file in sorted(GENERATED_DIR.glob("*_meta.json"), reverse=True):
         try:

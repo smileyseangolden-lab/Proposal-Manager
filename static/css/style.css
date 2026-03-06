@@ -188,6 +188,64 @@ body {
 .proposals-table td { border-bottom: 1px solid var(--gray-100); }
 .proposals-table tr:last-child td { border-bottom: none; }
 
+/* Vertical selector */
+.vertical-selector {
+    margin-bottom: 24px;
+}
+.vertical-label {
+    display: block;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--gray-700);
+    margin-bottom: 10px;
+}
+.vertical-options {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 10px;
+}
+.vertical-option {
+    cursor: pointer;
+}
+.vertical-option input[type="radio"] {
+    display: none;
+}
+.vertical-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    padding: 16px 12px;
+    border: 2px solid var(--gray-200);
+    border-radius: var(--radius);
+    background: var(--white);
+    transition: border-color 0.2s, background 0.2s, box-shadow 0.2s;
+}
+.vertical-card:hover {
+    border-color: var(--primary);
+    background: var(--gray-50);
+}
+.vertical-option input[type="radio"]:checked + .vertical-card {
+    border-color: var(--primary);
+    background: var(--primary-light);
+    box-shadow: 0 0 0 1px var(--primary);
+}
+.vertical-icon {
+    font-size: 28px;
+    margin-bottom: 6px;
+}
+.vertical-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--gray-900);
+    margin-bottom: 4px;
+}
+.vertical-desc {
+    font-size: 11px;
+    color: var(--gray-500);
+    line-height: 1.3;
+}
+
 /* Badges */
 .badge {
     display: inline-block;
@@ -199,6 +257,7 @@ body {
 }
 .badge-rfp { background: #dbeafe; color: #1e40af; }
 .badge-rfq { background: #d1fae5; color: #065f46; }
+.badge-vertical { background: #f3e8ff; color: #6b21a8; }
 
 /* Confidence bar */
 .confidence-bar {

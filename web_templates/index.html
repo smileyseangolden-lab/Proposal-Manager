@@ -11,6 +11,33 @@
 
 <section class="upload-section">
     <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data" id="upload-form">
+
+        <div class="vertical-selector">
+            <label class="vertical-label">Industry Vertical</label>
+            <div class="vertical-options">
+                <label class="vertical-option selected" data-vertical="auto">
+                    <input type="radio" name="vertical" value="auto" checked>
+                    <div class="vertical-card">
+                        <span class="vertical-icon">&#128269;</span>
+                        <span class="vertical-name">Auto-Detect</span>
+                        <span class="vertical-desc">Automatically identify the vertical from the document content</span>
+                    </div>
+                </label>
+                {% for key, v in verticals.items() %}
+                <label class="vertical-option" data-vertical="{{ key }}">
+                    <input type="radio" name="vertical" value="{{ key }}">
+                    <div class="vertical-card">
+                        <span class="vertical-icon">
+                            {% if key == 'data_center' %}&#127960;{% elif key == 'life_science' %}&#129514;{% elif key == 'food_beverage' %}&#127860;{% else %}&#128196;{% endif %}
+                        </span>
+                        <span class="vertical-name">{{ v.label }}</span>
+                        <span class="vertical-desc">{{ v.description }}</span>
+                    </div>
+                </label>
+                {% endfor %}
+            </div>
+        </div>
+
         <div class="upload-area" id="drop-zone">
             <div class="upload-icon">&#128196;</div>
             <p class="upload-text">Drag &amp; drop your RFP/RFQ document here</p>
@@ -43,6 +70,7 @@
         <thead>
             <tr>
                 <th>Source Document</th>
+                <th>Vertical</th>
                 <th>Type</th>
                 <th>Confidence</th>
                 <th>Action Items</th>
@@ -54,6 +82,7 @@
             {% for p in recent_proposals %}
             <tr>
                 <td>{{ p.source_file }}</td>
+                <td><span class="badge badge-vertical">{{ p.vertical_label | default('General') }}</span></td>
                 <td><span class="badge badge-{{ p.document_type|lower }}">{{ p.document_type }}</span></td>
                 <td>
                     <div class="confidence-bar">

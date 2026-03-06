@@ -12,6 +12,12 @@
                 <span class="meta-value">{{ meta.source_file }}</span>
             </div>
             <div class="meta-item">
+                <span class="meta-label">Vertical</span>
+                <span class="meta-value">
+                    <span class="badge badge-vertical">{{ meta.vertical_label | default('General') }}</span>
+                </span>
+            </div>
+            <div class="meta-item">
                 <span class="meta-label">Type</span>
                 <span class="meta-value">
                     <span class="badge badge-{{ meta.document_type|lower }}">{{ meta.document_type }}</span>
