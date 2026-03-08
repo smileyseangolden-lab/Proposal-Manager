@@ -9,5 +9,6 @@ uploads/*
 !uploads/.gitkeep
 generated_proposals/*
 !generated_proposals/.gitkeep
+data/
 .venv/
 venv/

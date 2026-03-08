@@ -3,8 +3,15 @@
 This module implements the core agent that reads an uploaded RFP/RFQ,
 follows the vertical-specific workflow, and generates a complete proposal
 draft using the appropriate templates and reference material.
+
+Supports:
+- Vertical-specific workflows and templates
+- User-uploaded templates (overriding defaults)
+- Rate/price sheet context for pricing guidance
+- Interactive Q&A (returns questions when clarification is needed)
 """
 
+import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,28 +35,36 @@ from document_parser import (
 
 def _build_system_prompt(vertical_key: str, vertical_resources: dict,
                          global_templates: dict[str, str],
-                         global_references: dict[str, list[str]]) -> str:
-    """Assemble the system prompt with vertical-specific workflow, templates, and references."""
+                         global_references: dict[str, list[str]],
+                         rate_sheet_text: str = "",
+                         user_template_text: str = "",
+                         company_name: str = "") -> str:
+    """Assemble the system prompt with all context."""
 
     vertical_label = VERTICALS.get(vertical_key, {}).get("label", "General")
     workflow = vertical_resources.get("workflow", "")
     vertical_templates = vertical_resources.get("templates", {})
     vertical_ref_proposals = vertical_resources.get("reference_proposals", [])
 
+    company_line = f"You are generating this proposal on behalf of **{company_name}**.\n\n" if company_name else ""
+
     # Compile vertical-specific template text
     template_block = ""
+
+    # User-uploaded templates take highest priority
+    if user_template_text:
+        template_block += f"\n### User-Uploaded Template (HIGHEST PRIORITY — use this structure)\n```\n{user_template_text}\n```\n"
+
     for name, content in vertical_templates.items():
         template_block += f"\n### Vertical Template: {name}\n```\n{content}\n```\n"
 
-    # Also include global templates as supplementary
     for name, content in global_templates.items():
         template_block += f"\n### Global Template: {name}\n```\n{content}\n```\n"
 
-    # Compile reference material (truncate very long documents to stay in context)
+    # Reference material
     MAX_REF_CHARS = 12000
     ref_block = ""
 
-    # Vertical-specific reference proposals first
     if vertical_ref_proposals:
         ref_block += f"\n### {vertical_label} Reference Proposals\n"
         for i, doc_text in enumerate(vertical_ref_proposals, 1):
@@ -58,7 +73,6 @@ def _build_system_prompt(vertical_key: str, vertical_resources: dict,
                 truncated += "\n[...truncated for length...]"
             ref_block += f"\n#### Reference Proposal {i}\n```\n{truncated}\n```\n"
 
-    # Global reference documents
     for category, docs in global_references.items():
         if docs:
             ref_block += f"\n### {category.replace('_', ' ').title()}\n"
@@ -68,15 +82,32 @@ def _build_system_prompt(vertical_key: str, vertical_resources: dict,
                     truncated += "\n[...truncated for length...]"
                 ref_block += f"\n#### Document {i}\n```\n{truncated}\n```\n"
 
+    # Rate sheet block
+    rate_block = ""
+    if rate_sheet_text:
+        rate_block = f"""
+## Rate & Price Sheet Data
+
+The following rate/price sheet data has been provided by the user. Use these
+rates and prices as reference when structuring the pricing section. Do NOT
+fabricate rates — only use the rates provided below. If a rate is not available
+for a specific role or product, use an `[ACTION REQUIRED]` placeholder.
+
+```
+{rate_sheet_text[:8000]}
+```
+"""
+
     return f"""You are the Proposal Manager Agent — an expert proposal writer that generates
 professional proposals in response to customer RFP (Request for Proposal) and
 RFQ (Request for Quotation) documents.
 
-## Industry Vertical
+{company_line}## Industry Vertical
 
 You are generating a **{vertical_label}** proposal. Use the vertical-specific
 workflow, templates, and terminology appropriate for this industry. The vertical-
 specific templates take precedence over global templates when both are available.
+User-uploaded templates take highest precedence.
 
 ## Your Workflow
 
@@ -86,23 +117,29 @@ Follow this workflow precisely when generating proposals:
 
 ## Proposal Templates & Boilerplate
 
-Use these templates as the structural foundation for your output. The vertical-
-specific templates should be used as the primary structure. Global templates
-provide supplementary boilerplate content.
-
 {template_block}
 
 ## Reference Material
 
-Use the following reference proposals and documents for tone, structure, and
-level of detail. Adapt — do not copy verbatim.
-
 {ref_block}
+
+{rate_block}
+
+## Interactive Clarification
+
+If you encounter information in the RFP/RFQ that is ambiguous, contradictory,
+or critical to the proposal but missing, you may ask the user for clarification.
+To do this, include a section at the VERY END of your output titled
+"## CLARIFICATION QUESTIONS" with numbered questions. Each question should be
+on its own line prefixed with "Q:" and include context about why you need this
+information. Only ask questions that are truly critical to producing an accurate
+proposal — do not ask about information you can reasonably infer or mark as
+ACTION REQUIRED.
 
 ## Output Rules
 
 1. Output the complete proposal in well-structured Markdown.
-2. Use the vertical-specific template as your primary structure.
+2. Use the highest-priority template available as your primary structure.
 3. Fill in every section with tailored content that directly addresses the
    requirements in the uploaded document.
 4. For any information that requires human input (pricing figures, specific
@@ -112,7 +149,7 @@ level of detail. Adapt — do not copy verbatim.
      `[ACTION REQUIRED: BDM — description]` or
      `[ACTION REQUIRED: AE — description]` etc.
 5. Generate a compliance matrix mapping every requirement to your response.
-6. At the end, provide:
+6. At the end (before any CLARIFICATION QUESTIONS), provide:
    - A consolidated list of all ACTION REQUIRED items, grouped by responsible role.
    - A confidence score (0-100%) for how completely the RFP/RFQ was addressed.
 7. Write in professional, persuasive business English.
@@ -120,34 +157,44 @@ level of detail. Adapt — do not copy verbatim.
    — always use ACTION REQUIRED placeholders for these.
 9. Do NOT fabricate instrument counts, quantities, or material specifications.
 10. Do NOT invent margin assumptions or name subcontractors without input.
-11. Today's date is {datetime.now(timezone.utc).strftime("%B %d, %Y")}.
+11. If rate/price sheet data was provided, reference those rates where applicable
+    in the pricing section structure.
+12. Today's date is {datetime.now(timezone.utc).strftime("%B %d, %Y")}.
 """
 
 
 def generate_proposal(rfp_text: str, vertical: str = "auto",
+                      rate_sheet_data: dict = None,
+                      user_templates: dict = None,
+                      company_name: str = "",
+                      user_api_key: str = None,
+                      user_model: str = None,
+                      answered_questions: list = None,
                       progress_callback=None) -> dict:
     """Generate a proposal from the given RFP/RFQ text.
 
     Args:
         rfp_text: The extracted text content of the uploaded RFP/RFQ document.
-        vertical: The industry vertical key ('data_center', 'life_science',
-            'food_beverage', 'general') or 'auto' for auto-detection.
-        progress_callback: Optional callable(phase: str, message: str) for
-            streaming progress updates to the UI.
+        vertical: The industry vertical key or 'auto' for auto-detection.
+        rate_sheet_data: Parsed rate sheet data (dict with 'raw_text' key).
+        user_templates: User-uploaded template text by type.
+        company_name: User's company name for branding.
+        user_api_key: User's own API key (overrides global).
+        user_model: User's selected model (overrides global).
+        answered_questions: Previously answered Q&A pairs.
+        progress_callback: Optional callable(phase, message).
 
     Returns:
-        dict with keys:
-            - proposal_markdown: The full generated proposal as Markdown text.
-            - action_items: List of action-required items extracted from the proposal.
-            - confidence_score: Integer 0-100.
-            - document_type: 'RFP' or 'RFQ'.
-            - vertical: The vertical key used for generation.
-            - vertical_label: The human-readable vertical label.
-            - generated_at: ISO timestamp.
+        dict with proposal_markdown, action_items, confidence_score,
+        document_type, vertical, vertical_label, generated_at, and
+        optionally 'questions' if clarification is needed.
     """
-    if not ANTHROPIC_API_KEY:
+    api_key = user_api_key or ANTHROPIC_API_KEY
+    model = user_model or CLAUDE_MODEL
+
+    if not api_key:
         raise RuntimeError(
-            "ANTHROPIC_API_KEY is not set. Add it to your .env file."
+            "No API key configured. Go to Settings to add your Anthropic API key."
         )
 
     def _report(phase: str, message: str):
@@ -163,60 +210,81 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
     vertical_label = VERTICALS.get(vertical, {}).get("label", "General")
     _report("init", f"Loading {vertical_label} templates and reference documents...")
 
-    # Load vertical-specific resources
+    # Load resources
     vertical_resources = load_vertical_resources(vertical)
-
-    # Load global resources as supplementary context
     global_templates = load_templates(TEMPLATES_DIR)
     global_references = load_reference_documents(REFERENCE_DIR)
 
+    # Build rate sheet context
+    rate_sheet_text = ""
+    if rate_sheet_data:
+        for sheet_type, data in rate_sheet_data.items():
+            if isinstance(data, dict) and "raw_text" in data:
+                rate_sheet_text += f"\n### {sheet_type.replace('_', ' ').title()}\n{data['raw_text']}\n"
+
+    # Build user template context
+    user_template_text = ""
+    if user_templates:
+        for ttype, text in user_templates.items():
+            user_template_text += f"\n### {ttype.replace('_', ' ').title()}\n{text}\n"
+
     system_prompt = _build_system_prompt(
-        vertical, vertical_resources, global_templates, global_references
+        vertical, vertical_resources, global_templates, global_references,
+        rate_sheet_text=rate_sheet_text,
+        user_template_text=user_template_text,
+        company_name=company_name,
     )
 
     _report("analysis", f"Generating {vertical_label} proposal...")
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    # Build messages
+    user_message = (
+        f"Please generate a complete {vertical_label} proposal in "
+        "response to the following RFP/RFQ document. Follow the "
+        "workflow exactly.\n\n"
+        "---BEGIN DOCUMENT---\n"
+        f"{rfp_text}\n"
+        "---END DOCUMENT---"
+    )
 
-    # Stream the response for long-running generation
+    # Include answered questions as additional context
+    if answered_questions:
+        qa_block = "\n\n---PREVIOUSLY ANSWERED QUESTIONS---\n"
+        for qa in answered_questions:
+            qa_block += f"\nQ: {qa['question']}\nA: {qa['answer']}\n"
+        user_message += qa_block
+
+    client = anthropic.Anthropic(api_key=api_key)
+
     proposal_text = ""
     with client.messages.stream(
-        model=CLAUDE_MODEL,
+        model=model,
         max_tokens=16000,
         system=system_prompt,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    f"Please generate a complete {vertical_label} proposal in "
-                    "response to the following RFP/RFQ document. Follow the "
-                    "workflow exactly.\n\n"
-                    "---BEGIN DOCUMENT---\n"
-                    f"{rfp_text}\n"
-                    "---END DOCUMENT---"
-                ),
-            }
-        ],
+        messages=[{"role": "user", "content": user_message}],
     ) as stream:
         for text in stream.text_stream:
             proposal_text += text
 
     _report("post_processing", "Extracting action items and finalizing...")
 
-    # Extract action items from the generated proposal
-    action_items = re.findall(
-        r"\[ACTION REQUIRED:\s*(.+?)\]", proposal_text
-    )
+    # Extract action items
+    action_items = re.findall(r"\[ACTION REQUIRED:\s*(.+?)\]", proposal_text)
 
-    # Try to extract the confidence score from the proposal text
+    # Extract clarification questions
+    questions = _extract_questions(proposal_text)
+
+    # Remove the questions section from the final proposal text
+    proposal_text = re.sub(
+        r"\n## CLARIFICATION QUESTIONS.*$", "", proposal_text, flags=re.DOTALL
+    ).strip()
+
     confidence_score = _extract_confidence_score(proposal_text)
-
-    # Detect document type
     doc_type = _detect_document_type(rfp_text)
 
     _report("complete", "Proposal generation complete.")
 
-    return {
+    result = {
         "proposal_markdown": proposal_text,
         "action_items": action_items,
         "confidence_score": confidence_score,
@@ -226,9 +294,35 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
+    if questions:
+        result["questions"] = questions
+
+    return result
+
+
+def _extract_questions(text: str) -> list[dict]:
+    """Extract clarification questions from the proposal output."""
+    match = re.search(r"## CLARIFICATION QUESTIONS\s*\n(.*)", text, re.DOTALL)
+    if not match:
+        return []
+
+    questions_text = match.group(1)
+    questions = []
+    for line in questions_text.strip().split("\n"):
+        line = line.strip()
+        if line.startswith("Q:") or line.startswith("Q "):
+            q_text = line[2:].strip().lstrip(":").strip()
+            if q_text:
+                questions.append({"question": q_text, "context": ""})
+        elif re.match(r"^\d+[\.\)]\s*", line):
+            q_text = re.sub(r"^\d+[\.\)]\s*", "", line).strip()
+            if q_text:
+                questions.append({"question": q_text, "context": ""})
+
+    return questions
+
 
 def _extract_confidence_score(text: str) -> int:
-    """Extract confidence score from the proposal text."""
     match = re.search(r"[Cc]onfidence\s*[Ss]core[:\s]*(\d{1,3})%?", text)
     if match:
         return min(int(match.group(1)), 100)
@@ -236,7 +330,6 @@ def _extract_confidence_score(text: str) -> int:
 
 
 def _detect_document_type(text: str) -> str:
-    """Detect whether the uploaded document is an RFP or RFQ."""
     text_lower = text.lower()
     rfp_signals = text_lower.count("request for proposal") + text_lower.count("rfp")
     rfq_signals = text_lower.count("request for quotation") + text_lower.count(

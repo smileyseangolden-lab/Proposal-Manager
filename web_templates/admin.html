@@ -1,0 +1,148 @@
+{% extends "base.html" %}
+
+{% block title %}Admin Panel &mdash; Proposal Manager{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <h1>Admin Panel</h1>
+    <p class="page-subtitle">Company-wide proposal tracking and management</p>
+</section>
+
+<!-- Company-wide stats -->
+<section class="stats-grid">
+    <div class="stat-card">
+        <span class="stat-number">{{ company_stats.total_projects }}</span>
+        <span class="stat-label">Total Projects</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-number">{{ company_stats.total_proposals }}</span>
+        <span class="stat-label">Proposals Generated</span>
+    </div>
+    <div class="stat-card stat-green">
+        <span class="stat-number">{{ company_stats.win_rate }}%</span>
+        <span class="stat-label">Win Rate ({{ company_stats.total_won }})</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-number">${{ "{:,.0f}".format(company_stats.total_dollar) }}</span>
+        <span class="stat-label">Total Pipeline</span>
+    </div>
+</section>
+
+<!-- Users & Metrics -->
+<div class="card">
+    <h2>User Metrics</h2>
+    <table class="proposals-table">
+        <thead>
+            <tr>
+                <th>User</th>
+                <th>Email</th>
+                <th>Projects</th>
+                <th>Proposals</th>
+                <th>Won</th>
+                <th>Lost</th>
+                <th>Win Rate</th>
+                <th>Pipeline Value</th>
+                <th>Admin</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for us in user_stats %}
+            <tr>
+                <td><strong>{{ us.user.display_name or us.user.username }}</strong></td>
+                <td>{{ us.user.email }}</td>
+                <td>{{ us.total_projects }}</td>
+                <td>{{ us.proposal_count }}</td>
+                <td>{{ us.won }}</td>
+                <td>{{ us.lost }}</td>
+                <td>{{ us.win_rate }}%</td>
+                <td>${{ "{:,.0f}".format(us.total_dollar) }}</td>
+                <td>
+                    <form method="post" action="{{ url_for('toggle_admin', user_id=us.user.id) }}" class="inline-form">
+                        <button type="submit" class="btn btn-small {{ 'btn-danger' if us.user.is_admin else 'btn-secondary' }}"
+                                {{ 'disabled' if us.user.id == current_user.id }}>
+                            {{ 'Admin' if us.user.is_admin else 'User' }}
+                        </button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<!-- Company Default Templates -->
+<div class="card">
+    <h2>Company Default Templates & Workflows</h2>
+    <p class="card-desc">Upload company-standard templates and workflows that all users can access. Accepted formats: Word (.docx) and PDF (.pdf).</p>
+
+    <form method="post" action="{{ url_for('upload_company_template') }}" enctype="multipart/form-data" class="upload-inline">
+        <div class="form-row">
+            <div class="form-group">
+                <label>Name</label>
+                <input type="text" name="template_name" placeholder="e.g., MCT Proposal Template v3" required>
+            </div>
+            <div class="form-group">
+                <label>Vertical</label>
+                <select name="vertical">
+                    {% for key, v in verticals.items() %}
+                    <option value="{{ key }}">{{ v.label }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Type</label>
+                <select name="template_type">
+                    <option value="proposal">Proposal Template</option>
+                    <option value="workflow">Workflow</option>
+                    <option value="boilerplate">Boilerplate</option>
+                </select>
+            </div>
+        </div>
+        <div class="form-group">
+            <label>File (Word or PDF)</label>
+            <input type="file" name="template_file" accept=".docx,.doc,.pdf" required>
+        </div>
+        <button type="submit" class="btn btn-primary">Upload Company Template</button>
+    </form>
+
+    {% if company_templates %}
+    <table class="mini-table" style="margin-top: 16px;">
+        <thead><tr><th>Name</th><th>Vertical</th><th>Type</th><th>Uploaded By</th><th>Date</th><th></th></tr></thead>
+        <tbody>
+        {% for t in company_templates %}
+        <tr>
+            <td>{{ t.name }}</td>
+            <td>{{ t.vertical | replace('_', ' ') | title }}</td>
+            <td>{{ t.template_type | title }}</td>
+            <td>{{ t.user.display_name if t.user else 'Unknown' }}</td>
+            <td>{{ t.uploaded_at.strftime('%Y-%m-%d') }}</td>
+            <td>
+                <form method="post" action="{{ url_for('delete_company_template', template_id=t.id) }}" class="inline-form">
+                    <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this company template?')">Delete</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+</div>
+
+<!-- Recent Activity -->
+<div class="card">
+    <h2>Recent Activity</h2>
+    <table class="mini-table">
+        <thead><tr><th>User</th><th>Action</th><th>Detail</th><th>Time</th></tr></thead>
+        <tbody>
+        {% for log in recent_activity %}
+        <tr>
+            <td>{{ log.user.display_name or log.user.username if log.user else 'Unknown' }}</td>
+            <td><span class="badge badge-activity">{{ log.action }}</span></td>
+            <td>{{ log.detail[:80] }}{{ '...' if log.detail|length > 80 }}</td>
+            <td>{{ log.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

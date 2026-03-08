@@ -1,0 +1,207 @@
+{% extends "base.html" %}
+
+{% block title %}{{ project.name }} &mdash; Proposal Manager{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <div class="page-header-row">
+        <div>
+            <h1>{{ project.name }}</h1>
+            <p class="page-subtitle">{{ project.client_name or 'No client specified' }} &mdash; <span class="badge badge-status-{{ project.status }}">{{ project.status }}</span></p>
+        </div>
+        <div class="header-actions">
+            <form method="post" action="{{ url_for('update_project_status', project_id=project.id) }}" class="inline-form">
+                <input type="text" name="dollar_amount" placeholder="Dollar amount" value="{{ project.dollar_amount if project.dollar_amount else '' }}" class="input-small">
+                <select name="status" class="status-select">
+                    <option value="active" {{ 'selected' if project.status == 'active' }}>Active</option>
+                    <option value="submitted" {{ 'selected' if project.status == 'submitted' }}>Submitted</option>
+                    <option value="won" {{ 'selected' if project.status == 'won' }}>Won</option>
+                    <option value="lost" {{ 'selected' if project.status == 'lost' }}>Lost</option>
+                    <option value="archived" {{ 'selected' if project.status == 'archived' }}>Archived</option>
+                </select>
+                <button type="submit" class="btn btn-small btn-secondary">Update</button>
+            </form>
+        </div>
+    </div>
+</section>
+
+<!-- Upload Documents -->
+<div class="card">
+    <h2>Upload Documents</h2>
+    <p class="card-desc">Upload your RFP/RFQ, drawings, legal documents, or any other supporting files.</p>
+
+    <form method="post" action="{{ url_for('project_upload', project_id=project.id) }}" enctype="multipart/form-data">
+        <div class="form-row">
+            <div class="form-group" style="flex:2">
+                <label>Files</label>
+                <div class="upload-area upload-area-compact" id="drop-zone">
+                    <p class="upload-text">Drag & drop files here or click to browse</p>
+                    <p class="upload-formats">PDF, DOCX, TXT, MD, XLSX</p>
+                    <input type="file" name="documents" id="file-input" multiple accept=".pdf,.docx,.doc,.txt,.md,.xlsx,.xls">
+                </div>
+                <div class="file-info" id="file-info" style="display:none;">
+                    <span id="file-name"></span>
+                    <button type="button" id="clear-file" class="btn btn-small btn-secondary">Clear</button>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Document Type</label>
+                <select name="file_type">
+                    <option value="rfp">RFP / RFQ</option>
+                    <option value="drawing">Drawings</option>
+                    <option value="legal">Legal / Contract</option>
+                    <option value="supporting">Supporting Docs</option>
+                    <option value="rate_sheet">Rate Sheet</option>
+                </select>
+            </div>
+        </div>
+        <button type="submit" class="btn btn-primary">Upload Documents</button>
+    </form>
+</div>
+
+<!-- Uploaded Documents List -->
+{% if documents %}
+<div class="card">
+    <h2>Project Documents ({{ documents | length }})</h2>
+    <table class="mini-table">
+        <thead><tr><th>File</th><th>Type</th><th>Size</th><th>Uploaded</th></tr></thead>
+        <tbody>
+        {% for d in documents %}
+        <tr>
+            <td>{{ d.original_filename }}</td>
+            <td><span class="badge badge-doc-{{ d.file_type }}">{{ d.file_type }}</span></td>
+            <td>{{ "%.1f"|format(d.file_size / 1024 / 1024) }} MB</td>
+            <td>{{ d.uploaded_at.strftime('%Y-%m-%d %H:%M') }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+<!-- Generate Proposal -->
+{% if documents %}
+<div class="card card-highlight">
+    <h2>Generate Proposal</h2>
+    <form method="post" action="{{ url_for('project_generate', project_id=project.id) }}" id="generate-form">
+
+        <div class="form-group">
+            <label>Industry Vertical</label>
+            <div class="vertical-options">
+                <label class="vertical-option">
+                    <input type="radio" name="vertical" value="auto" checked>
+                    <div class="vertical-card">
+                        <span class="vertical-icon">&#128269;</span>
+                        <span class="vertical-name">Auto-Detect</span>
+                    </div>
+                </label>
+                {% for key, v in verticals.items() %}
+                <label class="vertical-option">
+                    <input type="radio" name="vertical" value="{{ key }}">
+                    <div class="vertical-card">
+                        <span class="vertical-icon">
+                            {% if key == 'data_center' %}&#127960;{% elif key == 'life_science' %}&#129514;{% elif key == 'food_beverage' %}&#127860;{% else %}&#128196;{% endif %}
+                        </span>
+                        <span class="vertical-name">{{ v.label }}</span>
+                    </div>
+                </label>
+                {% endfor %}
+            </div>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label>Template Source</label>
+                <select name="template_source">
+                    <option value="default">Company Default</option>
+                    <option value="user">My Custom Templates</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Output Format</label>
+                <select name="output_format">
+                    <option value="docx">Microsoft Word (.docx)</option>
+                    <option value="pdf">PDF</option>
+                    <option value="both">Both (Word + PDF)</option>
+                </select>
+            </div>
+        </div>
+
+        <button type="submit" class="btn btn-primary btn-large" id="generate-btn">Generate Proposal</button>
+    </form>
+
+    <div class="processing-overlay" id="processing" style="display:none;">
+        <div class="spinner"></div>
+        <p class="processing-text">Generating your proposal&hellip;</p>
+        <p class="processing-subtext">This typically takes 1-3 minutes. The AI may ask clarification questions.</p>
+    </div>
+</div>
+{% endif %}
+
+<!-- Past Proposals for this Project -->
+{% set proposals = project.proposals.order_by(None).all() %}
+{% if proposals %}
+<div class="card">
+    <h2>Generated Proposals</h2>
+    <table class="mini-table">
+        <thead><tr><th>Date</th><th>Type</th><th>Vertical</th><th>Confidence</th><th>Actions</th></tr></thead>
+        <tbody>
+        {% for prop in proposals %}
+        <tr>
+            <td>{{ prop.generated_at.strftime('%Y-%m-%d %H:%M') if prop.generated_at else 'N/A' }}</td>
+            <td><span class="badge badge-{{ prop.document_type | lower }}">{{ prop.document_type }}</span></td>
+            <td><span class="badge badge-vertical">{{ prop.vertical_label }}</span></td>
+            <td>
+                <div class="confidence-bar">
+                    <div class="confidence-fill" style="width: {{ prop.confidence_score }}%"></div>
+                    <span>{{ prop.confidence_score }}%</span>
+                </div>
+            </td>
+            <td>
+                <a href="{{ url_for('view_proposal', proposal_id=prop.id) }}" class="btn btn-small">View</a>
+                <a href="{{ url_for('download', proposal_id=prop.id, fmt='docx') }}" class="btn btn-small btn-secondary">DOCX</a>
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+    var dz = document.getElementById("drop-zone");
+    var fi = document.getElementById("file-input");
+    var info = document.getElementById("file-info");
+    var fname = document.getElementById("file-name");
+    var clear = document.getElementById("clear-file");
+    var form = document.getElementById("generate-form");
+    var proc = document.getElementById("processing");
+    var genBtn = document.getElementById("generate-btn");
+
+    if(dz){
+        dz.addEventListener("click", function(){fi.click();});
+        dz.addEventListener("dragover", function(e){e.preventDefault();dz.classList.add("dragover");});
+        dz.addEventListener("dragleave", function(){dz.classList.remove("dragover");});
+        dz.addEventListener("drop", function(e){
+            e.preventDefault();dz.classList.remove("dragover");
+            if(e.dataTransfer.files.length){fi.files=e.dataTransfer.files;showFiles(e.dataTransfer.files);}
+        });
+        fi.addEventListener("change", function(){if(fi.files.length) showFiles(fi.files);});
+        clear.addEventListener("click", function(){fi.value="";info.style.display="none";});
+    }
+    function showFiles(files){
+        fname.textContent=files.length+" file(s) selected";
+        info.style.display="flex";
+    }
+    if(form && proc){
+        form.addEventListener("submit", function(){
+            genBtn.disabled=true;genBtn.textContent="Processing\u2026";
+            proc.style.display="flex";
+        });
+    }
+})();
+</script>
+{% endblock %}

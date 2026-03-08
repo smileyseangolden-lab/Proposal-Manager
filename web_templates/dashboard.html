@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard &mdash; Proposal Manager{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <div class="page-header-row">
+        <div>
+            <h1>Dashboard</h1>
+            <p class="page-subtitle">Welcome back, {{ current_user.display_name or current_user.username }}</p>
+        </div>
+        <a href="{{ url_for('new_project') }}" class="btn btn-primary">+ New Project</a>
+    </div>
+</section>
+
+<!-- Stats cards -->
+<section class="stats-grid">
+    <div class="stat-card">
+        <span class="stat-number">{{ stats.total_projects }}</span>
+        <span class="stat-label">Total Projects</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-number">{{ stats.total_proposals }}</span>
+        <span class="stat-label">Proposals Generated</span>
+    </div>
+    <div class="stat-card stat-green">
+        <span class="stat-number">{{ stats.win_rate }}%</span>
+        <span class="stat-label">Win Rate ({{ stats.won }} won)</span>
+    </div>
+    <div class="stat-card stat-red">
+        <span class="stat-number">{{ stats.loss_rate }}%</span>
+        <span class="stat-label">Loss Rate ({{ stats.lost }} lost)</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-number">${{ "{:,.0f}".format(stats.avg_dollar) }}</span>
+        <span class="stat-label">Avg Proposal Value</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-number">${{ "{:,.0f}".format(stats.total_dollar) }}</span>
+        <span class="stat-label">Total Pipeline Value</span>
+    </div>
+</section>
+
+<!-- Active Projects -->
+<section class="section">
+    <h2>Active Projects</h2>
+    {% if active_projects %}
+    <table class="proposals-table">
+        <thead>
+            <tr>
+                <th>Project Name</th>
+                <th>Client</th>
+                <th>Vertical</th>
+                <th>Created</th>
+                <th>Status</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for p in active_projects %}
+            <tr>
+                <td><strong>{{ p.name }}</strong></td>
+                <td>{{ p.client_name or '&mdash;' }}</td>
+                <td><span class="badge badge-vertical">{{ p.vertical_label or 'Not set' }}</span></td>
+                <td>{{ p.created_at.strftime('%Y-%m-%d') }}</td>
+                <td><span class="badge badge-status-{{ p.status }}">{{ p.status }}</span></td>
+                <td>
+                    <a href="{{ url_for('project_upload', project_id=p.id) }}" class="btn btn-small">Open</a>
+                    <form method="post" action="{{ url_for('update_project_status', project_id=p.id) }}" class="inline-form">
+                        <select name="status" onchange="this.form.submit()" class="status-select">
+                            <option value="active" {{ 'selected' if p.status == 'active' }}>Active</option>
+                            <option value="submitted" {{ 'selected' if p.status == 'submitted' }}>Submitted</option>
+                            <option value="won" {{ 'selected' if p.status == 'won' }}>Won</option>
+                            <option value="lost" {{ 'selected' if p.status == 'lost' }}>Lost</option>
+                            <option value="archived" {{ 'selected' if p.status == 'archived' }}>Archived</option>
+                        </select>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">
+        <p>No active projects. <a href="{{ url_for('new_project') }}">Start a new project</a> to get going.</p>
+    </div>
+    {% endif %}
+</section>
+
+<!-- Past Projects -->
+{% if past_projects %}
+<section class="section">
+    <h2>Past Projects</h2>
+    <table class="proposals-table">
+        <thead>
+            <tr>
+                <th>Project Name</th>
+                <th>Client</th>
+                <th>Vertical</th>
+                <th>Value</th>
+                <th>Status</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for p in past_projects %}
+            <tr>
+                <td>{{ p.name }}</td>
+                <td>{{ p.client_name or '&mdash;' }}</td>
+                <td><span class="badge badge-vertical">{{ p.vertical_label or 'N/A' }}</span></td>
+                <td>{{ "${:,.0f}".format(p.dollar_amount) if p.dollar_amount else '&mdash;' }}</td>
+                <td><span class="badge badge-status-{{ p.status }}">{{ p.status }}</span></td>
+                <td>
+                    <a href="{{ url_for('project_upload', project_id=p.id) }}" class="btn btn-small btn-secondary">View</a>
+                    <form method="post" action="{{ url_for('update_project_status', project_id=p.id) }}" class="inline-form">
+                        <input type="hidden" name="dollar_amount" value="{{ p.dollar_amount }}">
+                        <select name="status" onchange="this.form.submit()" class="status-select">
+                            <option value="active" {{ 'selected' if p.status == 'active' }}>Active</option>
+                            <option value="submitted" {{ 'selected' if p.status == 'submitted' }}>Submitted</option>
+                            <option value="won" {{ 'selected' if p.status == 'won' }}>Won</option>
+                            <option value="lost" {{ 'selected' if p.status == 'lost' }}>Lost</option>
+                            <option value="archived" {{ 'selected' if p.status == 'archived' }}>Archived</option>
+                        </select>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</section>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+
+{% block title %}Clarification Questions &mdash; {{ project.name }}{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <h1>Clarification Questions</h1>
+    <p class="page-subtitle">The AI agent needs additional information to generate a more accurate proposal for <strong>{{ project.name }}</strong>.</p>
+</section>
+
+<div class="card">
+    <form method="post" action="{{ url_for('project_questions', project_id=project.id) }}">
+        {% for q in questions %}
+        <div class="question-block">
+            <div class="question-number">Question {{ loop.index }}</div>
+            <p class="question-text">{{ q.question }}</p>
+            {% if q.context %}
+            <p class="question-context">Context: {{ q.context }}</p>
+            {% endif %}
+            <div class="form-group">
+                <textarea name="answer_{{ q.id }}" rows="3" placeholder="Enter your answer..."></textarea>
+            </div>
+            <label class="skip-label">
+                <input type="checkbox" name="skip_{{ q.id }}" value="1">
+                Skip this question (the AI will use its best judgment)
+            </label>
+        </div>
+        {% endfor %}
+
+        <div class="form-actions">
+            <button type="submit" class="btn btn-primary btn-large">Submit Answers & Continue</button>
+            <a href="{{ url_for('project_upload', project_id=project.id) }}" class="btn btn-secondary">Back to Project</a>
+        </div>
+    </form>
+</div>
+{% endblock %}
