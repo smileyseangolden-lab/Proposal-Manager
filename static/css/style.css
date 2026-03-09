@@ -265,6 +265,18 @@ body {
 .processing-text { font-size: 18px; font-weight: 600; color: var(--gray-700); }
 .processing-subtext { font-size: 14px; color: var(--gray-500); margin-top: 4px; }
 
+/* ---- Project links ---- */
+.project-link {
+    color: var(--primary);
+    text-decoration: none;
+    font-weight: 600;
+    transition: color 0.15s;
+}
+.project-link:hover {
+    color: var(--primary-dark);
+    text-decoration: underline;
+}
+
 /* ---- Tables ---- */
 .proposals-table {
     width: 100%;

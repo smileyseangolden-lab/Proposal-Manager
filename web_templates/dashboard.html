@@ -59,7 +59,7 @@
         <tbody>
             {% for p in active_projects %}
             <tr>
-                <td><strong>{{ p.name }}</strong></td>
+                <td><a href="{{ url_for('project_upload', project_id=p.id) }}" class="project-link">{{ p.name }}</a></td>
                 <td>{{ p.client_name or '&mdash;' }}</td>
                 <td><span class="badge badge-vertical">{{ p.vertical_label or 'Not set' }}</span></td>
                 <td>{{ p.created_at.strftime('%Y-%m-%d') }}</td>
@@ -105,7 +105,7 @@
         <tbody>
             {% for p in past_projects %}
             <tr>
-                <td>{{ p.name }}</td>
+                <td><a href="{{ url_for('project_upload', project_id=p.id) }}" class="project-link">{{ p.name }}</a></td>
                 <td>{{ p.client_name or '&mdash;' }}</td>
                 <td><span class="badge badge-vertical">{{ p.vertical_label or 'N/A' }}</span></td>
                 <td>{{ "${:,.0f}".format(p.dollar_amount) if p.dollar_amount else '&mdash;' }}</td>
