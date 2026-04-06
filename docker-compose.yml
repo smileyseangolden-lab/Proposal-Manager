@@ -1,8 +1,11 @@
 services:
   proposal-manager:
     build: .
+    restart: unless-stopped
+    security_opt:
+      - apparmor:unconfined
     ports:
-      - "5000:5000"
+      - "127.0.0.1:15000:5000"
     env_file:
       - .env
     volumes:
@@ -11,4 +14,4 @@ services:
       - ./templates:/app/templates
       - ./reference_documents:/app/reference_documents
       - ./config:/app/config
-    restart: unless-stopped
+      - ./data:/app/data
