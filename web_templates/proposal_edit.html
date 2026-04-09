@@ -135,11 +135,18 @@
     });
 
     // Preview toggle
+    function escapeHtml(text) {
+        var div = document.createElement("div");
+        div.appendChild(document.createTextNode(text));
+        return div.innerHTML;
+    }
+
     window.togglePreview = function() {
         showingPreview = !showingPreview;
         if (showingPreview) {
-            // Simple markdown to HTML (basic conversion for preview)
-            var html = editor.value
+            // Escape HTML first to prevent XSS, then apply markdown formatting
+            var escaped = escapeHtml(editor.value);
+            var html = escaped
                 .replace(/^### (.+)$/gm, "<h3>$1</h3>")
                 .replace(/^## (.+)$/gm, "<h2>$1</h2>")
                 .replace(/^# (.+)$/gm, "<h1>$1</h1>")

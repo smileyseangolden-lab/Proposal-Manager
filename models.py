@@ -248,6 +248,9 @@ class ProposalCorrection(db.Model):
 class ProposalVersion(db.Model):
     """Version history for proposal edits. Each save creates a new version."""
     __tablename__ = "proposal_versions"
+    __table_args__ = (
+        db.UniqueConstraint("proposal_id", "version_number", name="uq_proposal_version"),
+    )
 
     id = db.Column(db.String(32), primary_key=True, default=_uuid)
     proposal_id = db.Column(db.String(32), db.ForeignKey("proposals.id"), nullable=False)

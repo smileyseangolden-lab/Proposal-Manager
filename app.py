@@ -11,6 +11,7 @@ Full-featured intranet application with:
 - Admin panel with company-wide tracking
 """
 
+import difflib
 import json
 import os
 import re
@@ -412,6 +413,10 @@ def add_staff_role():
         flash("Invalid rate format.", "error")
         return redirect(url_for("settings"))
 
+    if hourly_rate < 0 or overtime_rate < 0:
+        flash("Rates cannot be negative.", "error")
+        return redirect(url_for("settings"))
+
     role = StaffRole(
         user_id=current_user.id,
         role_name=role_name,
@@ -491,6 +496,10 @@ def add_equipment_item():
         flash("Invalid cost format.", "error")
         return redirect(url_for("settings"))
 
+    if unit_cost < 0:
+        flash("Cost cannot be negative.", "error")
+        return redirect(url_for("settings"))
+
     item = EquipmentItem(
         user_id=current_user.id,
         item_name=item_name,
@@ -542,6 +551,10 @@ def add_travel_rate():
         rate = float(rate.replace(",", "").replace("$", ""))
     except ValueError:
         flash("Invalid rate format.", "error")
+        return redirect(url_for("settings"))
+
+    if rate < 0:
+        flash("Rate cannot be negative.", "error")
         return redirect(url_for("settings"))
 
     tr = TravelExpenseRate(
@@ -1035,6 +1048,10 @@ def edit_proposal(proposal_id):
         new_content = request.form.get("markdown_content", "")
         change_summary = request.form.get("change_summary", "").strip() or "Manual edit"
 
+        if not new_content.strip():
+            flash("Proposal content cannot be empty.", "error")
+            return redirect(url_for("edit_proposal", proposal_id=proposal_id))
+
         # Get current version number
         latest = ProposalVersion.query.filter_by(proposal_id=proposal_id).order_by(
             ProposalVersion.version_number.desc()
@@ -1222,7 +1239,6 @@ def finalize_proposal(proposal_id):
 
     if v1 and latest and v1.id != latest.id:
         # Generate correction summary from diff
-        import difflib
         orig_lines = v1.markdown_content.splitlines()
         new_lines = latest.markdown_content.splitlines()
         diff = list(difflib.unified_diff(orig_lines, new_lines, lineterm=""))
@@ -1232,23 +1248,24 @@ def finalize_proposal(proposal_id):
             added = [l[1:] for l in diff if l.startswith("+") and not l.startswith("+++")]
             removed = [l[1:] for l in diff if l.startswith("-") and not l.startswith("---")]
 
-            summary_parts = []
-            if removed:
-                summary_parts.append(f"Removed/changed {len(removed)} line(s)")
-            if added:
-                summary_parts.append(f"Added/modified {len(added)} line(s)")
+            # Only create correction if there are meaningful changes
+            if added or removed:
+                summary_parts = []
+                if removed:
+                    summary_parts.append(f"Removed/changed {len(removed)} line(s)")
+                if added:
+                    summary_parts.append(f"Added/modified {len(added)} line(s)")
 
-            # Store up to 3000 chars of original and corrected snippets for context
-            correction = ProposalCorrection(
-                user_id=current_user.id,
-                proposal_id=proposal_id,
-                vertical=proposal.vertical,
-                correction_summary="; ".join(summary_parts),
-                original_snippet="\n".join(removed[:50])[:3000],
-                corrected_snippet="\n".join(added[:50])[:3000],
-                correction_type="general",
-            )
-            db.session.add(correction)
+                correction = ProposalCorrection(
+                    user_id=current_user.id,
+                    proposal_id=proposal_id,
+                    vertical=proposal.vertical,
+                    correction_summary="; ".join(summary_parts),
+                    original_snippet="\n".join(removed[:50])[:3000] if removed else "",
+                    corrected_snippet="\n".join(added[:50])[:3000] if added else "",
+                    correction_type="general",
+                )
+                db.session.add(correction)
 
     db.session.commit()
     _log_activity("proposal_finalize", f"Finalized proposal with corrections", project.id)
