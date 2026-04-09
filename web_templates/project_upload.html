@@ -111,19 +111,19 @@
 
         <div class="form-row">
             <div class="form-group">
-                <label>Template Source</label>
-                <select name="template_source">
-                    <option value="default">Company Default</option>
-                    <option value="user">My Custom Templates</option>
-                </select>
-            </div>
-            <div class="form-group">
                 <label>Output Format</label>
                 <select name="output_format">
                     <option value="docx">Microsoft Word (.docx)</option>
                     <option value="pdf">PDF</option>
                     <option value="both">Both (Word + PDF)</option>
                 </select>
+            </div>
+            <div class="form-group">
+                <label>Proposal Template</label>
+                <p class="form-hint" style="margin-top:4px;">
+                    {% if has_user_template %}Using your custom template{% elif has_company_template %}Using company default template{% else %}Using AI default (no template uploaded){% endif %}
+                    &mdash; <a href="{{ url_for('settings') }}">Manage templates</a>
+                </p>
             </div>
         </div>
 

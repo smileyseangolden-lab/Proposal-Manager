@@ -699,6 +699,14 @@ def project_upload(project_id):
     equipment_count = EquipmentItem.query.filter_by(user_id=current_user.id, is_active=True).count()
     travel_rate_count = TravelExpenseRate.query.filter_by(user_id=current_user.id, is_active=True).count()
 
+    # Template availability for indicator
+    has_user_template = UserVerticalTemplate.query.filter_by(
+        user_id=current_user.id, is_company_default=False
+    ).first() is not None
+    has_company_template = UserVerticalTemplate.query.filter_by(
+        is_company_default=True
+    ).first() is not None
+
     return render_template(
         "project_upload.html",
         project=project,
@@ -710,6 +718,8 @@ def project_upload(project_id):
         equipment_count=equipment_count,
         has_travel_rates=travel_rate_count > 0,
         travel_rate_count=travel_rate_count,
+        has_user_template=has_user_template,
+        has_company_template=has_company_template,
     )
 
 
@@ -722,7 +732,6 @@ def project_generate(project_id):
 
     vertical = request.form.get("vertical", "auto")
     output_format = request.form.get("output_format", "docx")
-    template_source = request.form.get("template_source", "default")  # default or user
 
     project.output_format = output_format
     db.session.commit()
@@ -817,33 +826,31 @@ def project_generate(project_id):
             except Exception:
                 continue
 
-    # Load user-specific or company-default templates
+    # Auto-select templates: user custom first, then company defaults as fallback
     user_templates = None
-    if template_source == "user":
-        user_tmpls = UserVerticalTemplate.query.filter_by(
-            user_id=current_user.id, vertical=vertical, is_company_default=False
-        ).all()
-        if user_tmpls:
-            user_templates = {}
-            for t in user_tmpls:
+    user_tmpls = UserVerticalTemplate.query.filter_by(
+        user_id=current_user.id, vertical=vertical, is_company_default=False
+    ).all()
+    if user_tmpls:
+        user_templates = {}
+        for t in user_tmpls:
+            try:
+                user_templates[t.template_type] = parse_document(t.file_path)
+            except Exception:
+                continue
+
+    # Fall back to company defaults for any missing template types
+    co_tmpls = UserVerticalTemplate.query.filter_by(
+        vertical=vertical, is_company_default=True
+    ).all()
+    if co_tmpls:
+        user_templates = user_templates or {}
+        for t in co_tmpls:
+            if t.template_type not in user_templates:
                 try:
                     user_templates[t.template_type] = parse_document(t.file_path)
                 except Exception:
                     continue
-
-    # Check for company defaults if user chose default
-    if template_source == "default" or not user_templates:
-        co_tmpls = UserVerticalTemplate.query.filter_by(
-            vertical=vertical, is_company_default=True
-        ).all()
-        if co_tmpls:
-            user_templates = user_templates or {}
-            for t in co_tmpls:
-                if t.template_type not in user_templates:
-                    try:
-                        user_templates[t.template_type] = parse_document(t.file_path)
-                    except Exception:
-                        continue
 
     # Load past corrections for AI learning
     past_corrections = ProposalCorrection.query.filter_by(
