@@ -9,12 +9,12 @@
 
 <!-- Tabs -->
 <div class="settings-tabs">
-    <button class="settings-tab active" data-tab="profile">Profile & AI</button>
-    <button class="settings-tab" data-tab="company">Proposal Setup</button>
+    <button class="settings-tab active" data-tab="company">Proposal Setup</button>
+    <button class="settings-tab" data-tab="profile">Profile & AI</button>
 </div>
 
 <!-- Tab 1: Profile & AI Settings -->
-<div class="settings-tab-panel active" id="tab-profile">
+<div class="settings-tab-panel" id="tab-profile">
     <div class="card">
         <h2>Profile & AI Settings</h2>
         <form method="post" action="{{ url_for('settings') }}">
@@ -73,7 +73,7 @@
 </div>
 
 <!-- Tab 2: Proposal Setup -->
-<div class="settings-tab-panel" id="tab-company">
+<div class="settings-tab-panel active" id="tab-company">
     <!-- My Industry Templates -->
     <div class="card">
         <h2>My Industry Templates</h2>
