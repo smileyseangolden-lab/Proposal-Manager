@@ -318,7 +318,7 @@ def upload_rate_sheet():
 
     if not file or not _allowed_file(file.filename, RATE_SHEET_EXTENSIONS):
         flash("Please upload an Excel file (.xlsx).", "error")
-        return redirect(url_for("settings"))
+        return redirect(url_for("settings") + "#company")
 
     safe, path, size = _save_upload(file, f"rate_sheets/{current_user.id}")
 
@@ -333,7 +333,7 @@ def upload_rate_sheet():
     db.session.commit()
     _log_activity("rate_sheet_upload", f"Uploaded {sheet_type}: {safe}")
     flash("Rate sheet uploaded.", "success")
-    return redirect(url_for("settings"))
+    return redirect(url_for("settings") + "#company")
 
 
 @app.route("/settings/upload-template", methods=["POST"])
@@ -345,7 +345,7 @@ def upload_user_template():
 
     if not file or not _allowed_file(file.filename, TEMPLATE_EXTENSIONS):
         flash("Please upload a Word or PDF file.", "error")
-        return redirect(url_for("settings"))
+        return redirect(url_for("settings") + "#profile")
 
     safe, path, size = _save_upload(file, f"user_templates/{current_user.id}")
 
@@ -374,7 +374,7 @@ def delete_rate_sheet(sheet_id):
     db.session.delete(sheet)
     db.session.commit()
     flash("Rate sheet deleted.", "success")
-    return redirect(url_for("settings"))
+    return redirect(url_for("settings") + "#company")
 
 
 @app.route("/settings/delete-template/<template_id>", methods=["POST"])
@@ -396,6 +396,23 @@ def delete_user_template(template_id):
 @app.route("/settings/add-staff-role", methods=["POST"])
 @login_required
 def add_staff_role():
+    # Handle file upload as rate sheet
+    uploaded_file = request.files.get("staff_rate_file")
+    if uploaded_file and uploaded_file.filename and _allowed_file(uploaded_file.filename, ALLOWED_EXTENSIONS | {"xlsx", "xls"}):
+        safe, path, size = _save_upload(uploaded_file, "rate_sheets")
+        sheet = UserRateSheet(
+            user_id=current_user.id,
+            name=f"Staff Rates - {safe}",
+            sheet_type="labor_rates",
+            file_path=path,
+            original_filename=safe,
+        )
+        db.session.add(sheet)
+        db.session.commit()
+        _log_activity("rate_sheet_upload", f"Uploaded staff rate sheet: {safe}")
+        flash(f"Rate sheet '{safe}' uploaded.", "success")
+        return redirect(url_for("settings") + "#company")
+
     role_name = request.form.get("role_name", "").strip()
     category = request.form.get("category", "").strip()
     hourly_rate = request.form.get("hourly_rate", "0")
@@ -404,18 +421,18 @@ def add_staff_role():
 
     if not role_name or not hourly_rate:
         flash("Role name and hourly rate are required.", "error")
-        return redirect(url_for("settings"))
+        return redirect(url_for("settings") + "#company")
 
     try:
         hourly_rate = float(hourly_rate.replace(",", "").replace("$", ""))
         overtime_rate = float(overtime_rate.replace(",", "").replace("$", "")) if overtime_rate else 0.0
     except ValueError:
         flash("Invalid rate format.", "error")
-        return redirect(url_for("settings"))
+        return redirect(url_for("settings") + "#company")
 
     if hourly_rate < 0 or overtime_rate < 0:
         flash("Rates cannot be negative.", "error")
-        return redirect(url_for("settings"))
+        return redirect(url_for("settings") + "#company")
 
     role = StaffRole(
         user_id=current_user.id,
@@ -429,7 +446,7 @@ def add_staff_role():
     db.session.commit()
     _log_activity("staff_role_add", f"Added staff role: {role_name} @ ${hourly_rate}/hr")
     flash(f"Staff role '{role_name}' added.", "success")
-    return redirect(url_for("settings"))
+    return redirect(url_for("settings") + "#company")
 
 
 @app.route("/settings/edit-staff-role/<role_id>", methods=["POST"])
@@ -449,12 +466,12 @@ def edit_staff_role(role_id):
         role.overtime_rate = float(ot.replace(",", "").replace("$", "")) if ot else 0.0
     except ValueError:
         flash("Invalid rate format.", "error")
-        return redirect(url_for("settings"))
+        return redirect(url_for("settings") + "#company")
 
     db.session.commit()
     _log_activity("staff_role_edit", f"Updated staff role: {role.role_name}")
     flash(f"Staff role '{role.role_name}' updated.", "success")
-    return redirect(url_for("settings"))
+    return redirect(url_for("settings") + "#company")
 
 
 @app.route("/settings/delete-staff-role/<role_id>", methods=["POST"])
@@ -468,7 +485,7 @@ def delete_staff_role(role_id):
     db.session.commit()
     _log_activity("staff_role_delete", f"Deleted staff role: {name}")
     flash(f"Staff role '{name}' deleted.", "success")
-    return redirect(url_for("settings"))
+    return redirect(url_for("settings") + "#company")
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +495,23 @@ def delete_staff_role(role_id):
 @app.route("/settings/add-equipment-item", methods=["POST"])
 @login_required
 def add_equipment_item():
+    # Handle file upload as price list
+    uploaded_file = request.files.get("equipment_file")
+    if uploaded_file and uploaded_file.filename and _allowed_file(uploaded_file.filename, ALLOWED_EXTENSIONS | {"xlsx", "xls"}):
+        safe, path, size = _save_upload(uploaded_file, "rate_sheets")
+        sheet = UserRateSheet(
+            user_id=current_user.id,
+            name=f"Equipment Price List - {safe}",
+            sheet_type="product_pricing",
+            file_path=path,
+            original_filename=safe,
+        )
+        db.session.add(sheet)
+        db.session.commit()
+        _log_activity("rate_sheet_upload", f"Uploaded equipment price list: {safe}")
+        flash(f"Price list '{safe}' uploaded.", "success")
+        return redirect(url_for("settings") + "#company")
+
     item_name = request.form.get("item_name", "").strip()
     category = request.form.get("eq_category", "").strip()
     part_number = request.form.get("part_number", "").strip()
@@ -488,17 +522,17 @@ def add_equipment_item():
 
     if not item_name or not unit_cost:
         flash("Item name and unit cost are required.", "error")
-        return redirect(url_for("settings"))
+        return redirect(url_for("settings") + "#company")
 
     try:
         unit_cost = float(unit_cost.replace(",", "").replace("$", ""))
     except ValueError:
         flash("Invalid cost format.", "error")
-        return redirect(url_for("settings"))
+        return redirect(url_for("settings") + "#company")
 
     if unit_cost < 0:
         flash("Cost cannot be negative.", "error")
-        return redirect(url_for("settings"))
+        return redirect(url_for("settings") + "#company")
 
     item = EquipmentItem(
         user_id=current_user.id,
@@ -514,7 +548,7 @@ def add_equipment_item():
     db.session.commit()
     _log_activity("equipment_add", f"Added equipment: {item_name} @ ${unit_cost}/{unit}")
     flash(f"Equipment item '{item_name}' added.", "success")
-    return redirect(url_for("settings"))
+    return redirect(url_for("settings") + "#company")
 
 
 @app.route("/settings/delete-equipment-item/<item_id>", methods=["POST"])
@@ -528,7 +562,7 @@ def delete_equipment_item(item_id):
     db.session.commit()
     _log_activity("equipment_delete", f"Deleted equipment: {name}")
     flash(f"Equipment item '{name}' deleted.", "success")
-    return redirect(url_for("settings"))
+    return redirect(url_for("settings") + "#company")
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +572,23 @@ def delete_equipment_item(item_id):
 @app.route("/settings/add-travel-rate", methods=["POST"])
 @login_required
 def add_travel_rate():
+    # Handle file upload as travel rate schedule
+    uploaded_file = request.files.get("travel_rate_file")
+    if uploaded_file and uploaded_file.filename and _allowed_file(uploaded_file.filename, ALLOWED_EXTENSIONS | {"xlsx", "xls"}):
+        safe, path, size = _save_upload(uploaded_file, "rate_sheets")
+        sheet = UserRateSheet(
+            user_id=current_user.id,
+            name=f"Travel Rates - {safe}",
+            sheet_type="labor_rates",
+            file_path=path,
+            original_filename=safe,
+        )
+        db.session.add(sheet)
+        db.session.commit()
+        _log_activity("rate_sheet_upload", f"Uploaded travel rate schedule: {safe}")
+        flash(f"Travel rate schedule '{safe}' uploaded.", "success")
+        return redirect(url_for("settings") + "#company")
+
     expense_type = request.form.get("expense_type", "").strip()
     description = request.form.get("travel_description", "").strip()
     rate = request.form.get("travel_rate", "0")
@@ -545,17 +596,17 @@ def add_travel_rate():
 
     if not expense_type or not rate:
         flash("Expense type and rate are required.", "error")
-        return redirect(url_for("settings"))
+        return redirect(url_for("settings") + "#company")
 
     try:
         rate = float(rate.replace(",", "").replace("$", ""))
     except ValueError:
         flash("Invalid rate format.", "error")
-        return redirect(url_for("settings"))
+        return redirect(url_for("settings") + "#company")
 
     if rate < 0:
         flash("Rate cannot be negative.", "error")
-        return redirect(url_for("settings"))
+        return redirect(url_for("settings") + "#company")
 
     tr = TravelExpenseRate(
         user_id=current_user.id,
@@ -568,7 +619,7 @@ def add_travel_rate():
     db.session.commit()
     _log_activity("travel_rate_add", f"Added travel rate: {expense_type} @ ${rate}/{unit}")
     flash(f"Travel rate '{expense_type}' added.", "success")
-    return redirect(url_for("settings"))
+    return redirect(url_for("settings") + "#company")
 
 
 @app.route("/settings/delete-travel-rate/<rate_id>", methods=["POST"])
@@ -582,7 +633,7 @@ def delete_travel_rate(rate_id):
     db.session.commit()
     _log_activity("travel_rate_delete", f"Deleted travel rate: {name}")
     flash(f"Travel rate '{name}' deleted.", "success")
-    return redirect(url_for("settings"))
+    return redirect(url_for("settings") + "#company")
 
 
 # ---------------------------------------------------------------------------
@@ -1284,9 +1335,19 @@ def add_company_standard():
     title = request.form.get("standard_title", "").strip()
     content = request.form.get("standard_content", "").strip()
 
-    if not category or not title or not content:
-        flash("Category, title, and content are all required.", "error")
-        return redirect(url_for("settings"))
+    if not category or not title:
+        flash("Category and title are required.", "error")
+        return redirect(url_for("settings") + "#company")
+
+    # Handle file upload as alternative to text content
+    uploaded_file = request.files.get("standard_file")
+    if uploaded_file and uploaded_file.filename and _allowed_file(uploaded_file.filename, ALLOWED_EXTENSIONS | {"xlsx", "xls"}):
+        safe, path, size = _save_upload(uploaded_file, "company_standards")
+        content = content or f"[Uploaded file: {safe}]"
+
+    if not content:
+        flash("Either content or a file is required.", "error")
+        return redirect(url_for("settings") + "#company")
 
     standard = CompanyStandard(
         user_id=current_user.id,
@@ -1298,7 +1359,7 @@ def add_company_standard():
     db.session.commit()
     _log_activity("company_standard_add", f"Added standard: {title}")
     flash(f"Company standard '{title}' added.", "success")
-    return redirect(url_for("settings"))
+    return redirect(url_for("settings") + "#company")
 
 
 @app.route("/settings/edit-company-standard/<standard_id>", methods=["POST"])
@@ -1315,7 +1376,7 @@ def edit_company_standard(standard_id):
     db.session.commit()
     _log_activity("company_standard_edit", f"Updated standard: {std.title}")
     flash(f"Standard '{std.title}' updated.", "success")
-    return redirect(url_for("settings"))
+    return redirect(url_for("settings") + "#company")
 
 
 @app.route("/settings/delete-company-standard/<standard_id>", methods=["POST"])
@@ -1329,7 +1390,7 @@ def delete_company_standard(standard_id):
     db.session.commit()
     _log_activity("company_standard_delete", f"Deleted standard: {title}")
     flash(f"Standard '{title}' deleted.", "success")
-    return redirect(url_for("settings"))
+    return redirect(url_for("settings") + "#company")
 
 
 # ---------------------------------------------------------------------------
@@ -1359,6 +1420,10 @@ def admin_panel():
         ).scalar() or 0
         proposal_count = Proposal.query.join(Project).filter(Project.user_id == user.id).count()
 
+        # Last activity timestamp
+        last_log = ActivityLog.query.filter_by(user_id=user.id).order_by(ActivityLog.created_at.desc()).first()
+        last_active = last_log.created_at.strftime('%Y-%m-%d') if last_log else None
+
         user_stats.append({
             "user": user,
             "total_projects": total,
@@ -1367,6 +1432,7 @@ def admin_panel():
             "lost": lost,
             "win_rate": round((won / decided) * 100) if decided > 0 else 0,
             "total_dollar": total_dollar,
+            "last_active": last_active,
         })
 
     # Company-wide totals
@@ -1375,23 +1441,23 @@ def admin_panel():
     total_won = Project.query.filter_by(status="won").count()
     total_lost = Project.query.filter_by(status="lost").count()
     total_decided = total_won + total_lost
+    total_users = len(users)
     company_total_dollar = db.session.query(func.sum(Project.dollar_amount)).filter(
         Project.dollar_amount > 0
     ).scalar() or 0
 
     company_stats = {
+        "total_users": total_users,
         "total_projects": total_projects,
         "total_proposals": total_proposals,
         "total_won": total_won,
         "total_lost": total_lost,
         "win_rate": round((total_won / total_decided) * 100) if total_decided > 0 else 0,
+        "loss_rate": round((total_lost / total_decided) * 100) if total_decided > 0 else 0,
         "total_dollar": company_total_dollar,
     }
 
     recent_activity = ActivityLog.query.order_by(ActivityLog.created_at.desc()).limit(50).all()
-
-    # Company default templates
-    company_templates = UserVerticalTemplate.query.filter_by(is_company_default=True).order_by(UserVerticalTemplate.uploaded_at.desc()).all()
 
     return render_template(
         "admin.html",
@@ -1399,8 +1465,6 @@ def admin_panel():
         user_stats=user_stats,
         company_stats=company_stats,
         recent_activity=recent_activity,
-        company_templates=company_templates,
-        verticals=VERTICALS,
     )
 
 
@@ -1470,6 +1534,121 @@ def toggle_admin(user_id):
     status = "granted" if user.is_admin else "revoked"
     flash(f"Admin access {status} for {user.username}.", "success")
     return redirect(url_for("admin_panel"))
+
+
+# ---------------------------------------------------------------------------
+# Document Library
+# ---------------------------------------------------------------------------
+
+@app.route("/documents")
+@login_required
+def document_library():
+    """All documents across all user projects, grouped by project."""
+    projects = Project.query.filter_by(user_id=current_user.id).order_by(Project.updated_at.desc()).all()
+
+    project_docs = []
+    total_docs = 0
+    for p in projects:
+        docs = ProjectDocument.query.filter_by(project_id=p.id).order_by(ProjectDocument.uploaded_at.desc()).all()
+        if docs:
+            project_docs.append({"project": p, "documents": docs})
+            total_docs += len(docs)
+
+    return render_template("document_library.html", project_docs=project_docs, total_docs=total_docs)
+
+
+# ---------------------------------------------------------------------------
+# FAQ
+# ---------------------------------------------------------------------------
+
+@app.route("/faq")
+@login_required
+def faq_page():
+    faqs = [
+        {
+            "q": "How do I generate a proposal?",
+            "a": "Create a new project, upload your RFP/RFQ documents, select the industry vertical and cost estimation options, then click 'Generate Proposal'. The AI will analyze your documents and produce a draft proposal in seconds."
+        },
+        {
+            "q": "What file formats can I upload?",
+            "a": "You can upload PDF, Word (.docx), plain text (.txt), Markdown (.md), and Excel (.xlsx, .xls) files. For project documents, PDF and Word are the most common. For rate sheets, Excel is recommended."
+        },
+        {
+            "q": "How does the AI learn from my edits?",
+            "a": "When you edit a proposal in the in-app editor and click 'Finalize & Teach AI', the system compares your edits to the original AI output. It stores the patterns of changes you make (tone, structure, pricing adjustments, etc.) and uses these corrections to improve future proposals for your account."
+        },
+        {
+            "q": "What are Company Standards?",
+            "a": "Company Standards are boilerplate content blocks (mission statement, certifications, safety record, past performance, etc.) that the AI automatically weaves into every proposal. Configure them in Settings > Proposal Setup."
+        },
+        {
+            "q": "How does cost estimation work?",
+            "a": "First, configure your staff sell rates, equipment price list, and travel rates in Settings > Proposal Setup. When generating a proposal, check the boxes for which cost estimates you want included. The AI will use your actual rates to build cost tables in the proposal."
+        },
+        {
+            "q": "Can I revert to a previous version of a proposal?",
+            "a": "Yes. Open the proposal editor and use the Version History sidebar on the right. Each version has a 'View' button to preview it and a 'Restore' button to revert to that version. Restoring creates a new version, so you never lose any edits."
+        },
+        {
+            "q": "What is the redline export?",
+            "a": "The 'Download Redline DOCX' feature creates a Word document showing what changed between the AI's original draft and your latest edits. Deletions appear in red strikethrough and additions in blue underline \u2014 useful for review with your team."
+        },
+        {
+            "q": "How do I set up my API key?",
+            "a": "Go to Settings > Profile & AI. Select your preferred AI provider and model, then enter your API key. The key is stored encrypted and is never shared. You need a valid API key for proposal generation to work."
+        },
+        {
+            "q": "What are the industry verticals?",
+            "a": "Verticals are industry-specific templates that guide the AI's proposal structure and language. Current verticals include Data Center, Life Science/Pharma, Food & Beverage, and General. Choose 'Auto-detect' to let the AI determine the best fit from your RFP."
+        },
+        {
+            "q": "Who has access to my data?",
+            "a": "Your projects, proposals, rates, and settings are visible only to you. Admins can see aggregate metrics (project counts, win rates, pipeline value) for company reporting, but they cannot view your proposal content or rate details."
+        },
+    ]
+    return render_template("faq.html", faqs=faqs)
+
+
+# ---------------------------------------------------------------------------
+# Help Chatbot (FAQ-based)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/chat", methods=["POST"])
+@login_required
+def chat_help():
+    """Simple FAQ-based chatbot that matches user questions to predefined answers."""
+    data = request.get_json(silent=True) or {}
+    message = data.get("message", "").strip().lower()
+
+    if not message:
+        return {"reply": "Please type a question and I'll do my best to help!"}
+
+    # Simple keyword matching for help topics
+    responses = {
+        ("generate", "proposal", "create"): "To generate a proposal: Create a new project, upload your RFP/RFQ documents, choose cost estimation options, and click 'Generate Proposal'. The AI will analyze your docs and produce a draft in seconds.",
+        ("upload", "file", "document", "format"): "You can upload PDF, Word (.docx), text (.txt), Markdown (.md), and Excel (.xlsx) files. Use the project page to upload RFP documents, and Settings for rate sheets.",
+        ("learn", "teach", "finalize", "correction"): "After editing a proposal, click 'Finalize & Teach AI' in the editor. The system captures your editing patterns and uses them to improve future proposals.",
+        ("rate", "pricing", "cost", "staff", "equipment", "travel"): "Configure your rates in Settings > Proposal Setup. Add staff hourly rates, equipment prices, and travel rates. The AI uses these when you check the cost estimation boxes during generation.",
+        ("version", "history", "revert", "restore"): "Open the proposal editor to see Version History in the right sidebar. You can view any version and restore previous ones. Restoring creates a new version so nothing is ever lost.",
+        ("redline", "tracked", "changes", "diff"): "Download Redline DOCX from the proposal view page. It shows AI-original vs your edits with red strikethrough (deletions) and blue underline (insertions).",
+        ("api", "key", "provider", "model", "llm"): "Go to Settings > Profile & AI to configure your AI provider, model, and API key. Currently supports Anthropic Claude, OpenAI GPT, and Google Gemini.",
+        ("vertical", "industry", "template"): "Verticals are industry-specific templates: Data Center, Life Science, Food & Beverage, and General. Choose during proposal generation or let the AI auto-detect from your RFP.",
+        ("admin", "user", "manage"): "Admins can view company-wide metrics, manage user permissions, and track activity from the Admin panel in the sidebar.",
+        ("standard", "boilerplate", "mission", "certification"): "Company Standards are reusable content blocks. Go to Settings > Proposal Setup to add mission statements, certifications, past performance, etc. The AI includes these in every proposal.",
+    }
+
+    best_match = None
+    best_score = 0
+    for keywords, response in responses.items():
+        score = sum(1 for kw in keywords if kw in message)
+        if score > best_score:
+            best_score = score
+            best_match = response
+
+    if best_match and best_score > 0:
+        return {"reply": best_match}
+
+    return {"reply": "I'm not sure about that. Try checking the FAQ page for detailed answers, or rephrase your question. I can help with: generating proposals, uploading files, cost estimation, version history, redline exports, API setup, and company standards."}
 
 
 # ---------------------------------------------------------------------------

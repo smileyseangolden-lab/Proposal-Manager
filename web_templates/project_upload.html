@@ -70,7 +70,7 @@
         <tr>
             <td>{{ d.original_filename }}</td>
             <td><span class="badge badge-doc-{{ d.file_type }}">{{ d.file_type }}</span></td>
-            <td>{{ "%.1f"|format(d.file_size / 1024 / 1024) }} MB</td>
+            <td>{% if d.file_size >= 1048576 %}{{ "%.1f"|format(d.file_size / 1048576) }} MB{% elif d.file_size >= 1024 %}{{ "%.0f"|format(d.file_size / 1024) }} KB{% else %}{{ d.file_size }} B{% endif %}</td>
             <td>{{ d.uploaded_at.strftime('%Y-%m-%d %H:%M') }}</td>
         </tr>
         {% endfor %}

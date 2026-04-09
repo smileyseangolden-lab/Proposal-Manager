@@ -5,11 +5,15 @@
 {% block content %}
 <section class="page-header">
     <h1>Admin Panel</h1>
-    <p class="page-subtitle">Company-wide proposal tracking and management</p>
+    <p class="page-subtitle">Rep management dashboard &mdash; Company-wide tracking and metrics</p>
 </section>
 
 <!-- Company-wide stats -->
 <section class="stats-grid">
+    <div class="stat-card">
+        <span class="stat-number">{{ company_stats.total_users }}</span>
+        <span class="stat-label">Active Users</span>
+    </div>
     <div class="stat-card">
         <span class="stat-number">{{ company_stats.total_projects }}</span>
         <span class="stat-label">Total Projects</span>
@@ -22,19 +26,24 @@
         <span class="stat-number">{{ company_stats.win_rate }}%</span>
         <span class="stat-label">Win Rate ({{ company_stats.total_won }})</span>
     </div>
+    <div class="stat-card stat-red">
+        <span class="stat-number">{{ company_stats.loss_rate }}%</span>
+        <span class="stat-label">Loss Rate ({{ company_stats.total_lost }})</span>
+    </div>
     <div class="stat-card">
         <span class="stat-number">${{ "{:,.0f}".format(company_stats.total_dollar) }}</span>
         <span class="stat-label">Total Pipeline</span>
     </div>
 </section>
 
-<!-- Users & Metrics -->
+<!-- User / Rep Metrics -->
 <div class="card">
-    <h2>User Metrics</h2>
+    <h2>Rep Performance</h2>
+    <p class="card-desc">Track each user's project pipeline, win/loss record, and proposal generation activity.</p>
     <table class="proposals-table">
         <thead>
             <tr>
-                <th>User</th>
+                <th>Rep Name</th>
                 <th>Email</th>
                 <th>Projects</th>
                 <th>Proposals</th>
@@ -42,7 +51,8 @@
                 <th>Lost</th>
                 <th>Win Rate</th>
                 <th>Pipeline Value</th>
-                <th>Admin</th>
+                <th>Last Active</th>
+                <th>Role</th>
             </tr>
         </thead>
         <tbody>
@@ -56,6 +66,7 @@
                 <td>{{ us.lost }}</td>
                 <td>{{ us.win_rate }}%</td>
                 <td>${{ "{:,.0f}".format(us.total_dollar) }}</td>
+                <td>{{ us.last_active or '&mdash;' }}</td>
                 <td>
                     <form method="post" action="{{ url_for('toggle_admin', user_id=us.user.id) }}" class="inline-form">
                         <button type="submit" class="btn btn-small {{ 'btn-danger' if us.user.is_admin else 'btn-secondary' }}"
@@ -70,75 +81,18 @@
     </table>
 </div>
 
-<!-- Company Default Templates -->
+<!-- Recent Activity Log -->
 <div class="card">
-    <h2>Company Default Templates & Workflows</h2>
-    <p class="card-desc">Upload company-standard templates and workflows that all users can access. Accepted formats: Word (.docx) and PDF (.pdf).</p>
-
-    <form method="post" action="{{ url_for('upload_company_template') }}" enctype="multipart/form-data" class="upload-inline">
-        <div class="form-row">
-            <div class="form-group">
-                <label>Name</label>
-                <input type="text" name="template_name" placeholder="e.g., MCT Proposal Template v3" required>
-            </div>
-            <div class="form-group">
-                <label>Vertical</label>
-                <select name="vertical">
-                    {% for key, v in verticals.items() %}
-                    <option value="{{ key }}">{{ v.label }}</option>
-                    {% endfor %}
-                </select>
-            </div>
-            <div class="form-group">
-                <label>Type</label>
-                <select name="template_type">
-                    <option value="proposal">Proposal Template</option>
-                    <option value="workflow">Workflow</option>
-                    <option value="boilerplate">Boilerplate</option>
-                </select>
-            </div>
-        </div>
-        <div class="form-group">
-            <label>File (Word or PDF)</label>
-            <input type="file" name="template_file" accept=".docx,.doc,.pdf" required>
-        </div>
-        <button type="submit" class="btn btn-primary">Upload Company Template</button>
-    </form>
-
-    {% if company_templates %}
-    <table class="mini-table" style="margin-top: 16px;">
-        <thead><tr><th>Name</th><th>Vertical</th><th>Type</th><th>Uploaded By</th><th>Date</th><th></th></tr></thead>
-        <tbody>
-        {% for t in company_templates %}
-        <tr>
-            <td>{{ t.name }}</td>
-            <td>{{ t.vertical | replace('_', ' ') | title }}</td>
-            <td>{{ t.template_type | title }}</td>
-            <td>{{ t.user.display_name if t.user else 'Unknown' }}</td>
-            <td>{{ t.uploaded_at.strftime('%Y-%m-%d') }}</td>
-            <td>
-                <form method="post" action="{{ url_for('delete_company_template', template_id=t.id) }}" class="inline-form">
-                    <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this company template?')">Delete</button>
-                </form>
-            </td>
-        </tr>
-        {% endfor %}
-        </tbody>
-    </table>
-    {% endif %}
-</div>
-
-<!-- Recent Activity -->
-<div class="card">
-    <h2>Recent Activity</h2>
+    <h2>Activity Log</h2>
+    <p class="card-desc">Recent actions across all users, sorted by most recent.</p>
     <table class="mini-table">
         <thead><tr><th>User</th><th>Action</th><th>Detail</th><th>Time</th></tr></thead>
         <tbody>
         {% for log in recent_activity %}
         <tr>
-            <td>{{ log.user.display_name or log.user.username if log.user else 'Unknown' }}</td>
+            <td><strong>{{ log.user.display_name or log.user.username if log.user else 'Unknown' }}</strong></td>
             <td><span class="badge badge-activity">{{ log.action }}</span></td>
-            <td>{{ log.detail[:80] }}{{ '...' if log.detail|length > 80 }}</td>
+            <td>{{ log.detail[:100] }}{{ '...' if log.detail|length > 100 }}</td>
             <td>{{ log.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
         </tr>
         {% endfor %}

@@ -58,14 +58,13 @@
         </thead>
         <tbody>
             {% for p in active_projects %}
-            <tr>
+            <tr class="clickable-row" data-href="{{ url_for('project_upload', project_id=p.id) }}">
                 <td><a href="{{ url_for('project_upload', project_id=p.id) }}" class="project-link">{{ p.name }}</a></td>
                 <td>{{ p.client_name or '&mdash;' }}</td>
                 <td><span class="badge badge-vertical">{{ p.vertical_label or 'Not set' }}</span></td>
                 <td>{{ p.created_at.strftime('%Y-%m-%d') }}</td>
                 <td><span class="badge badge-status-{{ p.status }}">{{ p.status }}</span></td>
-                <td>
-                    <a href="{{ url_for('project_upload', project_id=p.id) }}" class="btn btn-small">Open</a>
+                <td class="row-actions" onclick="event.stopPropagation()">
                     <form method="post" action="{{ url_for('update_project_status', project_id=p.id) }}" class="inline-form">
                         <select name="status" onchange="this.form.submit()" class="status-select">
                             <option value="active" {{ 'selected' if p.status == 'active' }}>Active</option>
@@ -104,14 +103,13 @@
         </thead>
         <tbody>
             {% for p in past_projects %}
-            <tr>
+            <tr class="clickable-row" data-href="{{ url_for('project_upload', project_id=p.id) }}">
                 <td><a href="{{ url_for('project_upload', project_id=p.id) }}" class="project-link">{{ p.name }}</a></td>
                 <td>{{ p.client_name or '&mdash;' }}</td>
                 <td><span class="badge badge-vertical">{{ p.vertical_label or 'N/A' }}</span></td>
                 <td>{{ "${:,.0f}".format(p.dollar_amount) if p.dollar_amount else '&mdash;' }}</td>
                 <td><span class="badge badge-status-{{ p.status }}">{{ p.status }}</span></td>
-                <td>
-                    <a href="{{ url_for('project_upload', project_id=p.id) }}" class="btn btn-small btn-secondary">View</a>
+                <td class="row-actions" onclick="event.stopPropagation()">
                     <form method="post" action="{{ url_for('update_project_status', project_id=p.id) }}" class="inline-form">
                         <input type="hidden" name="dollar_amount" value="{{ p.dollar_amount }}">
                         <select name="status" onchange="this.form.submit()" class="status-select">
@@ -129,4 +127,14 @@
     </table>
 </section>
 {% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.querySelectorAll(".clickable-row").forEach(function(row) {
+    row.addEventListener("click", function() {
+        window.location.href = this.dataset.href;
+    });
+});
+</script>
 {% endblock %}

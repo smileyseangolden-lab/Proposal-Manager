@@ -6,26 +6,97 @@
     <title>{% block title %}Proposal Manager{% endblock %}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
-<body>
-    <nav class="navbar">
-        <div class="container nav-container">
-            <a href="{{ url_for('dashboard') }}" class="nav-brand">Proposal Manager</a>
-            {% if current_user.is_authenticated %}
-            <div class="nav-links">
-                <a href="{{ url_for('dashboard') }}" class="nav-link">Dashboard</a>
-                <a href="{{ url_for('new_project') }}" class="nav-link">New Project</a>
-                {% if current_user.is_admin %}
-                <a href="{{ url_for('admin_panel') }}" class="nav-link nav-admin">Admin</a>
-                {% endif %}
-                <a href="{{ url_for('settings') }}" class="nav-link nav-settings">Settings</a>
-                <span class="nav-user">{{ current_user.display_name or current_user.username }}</span>
-                <a href="{{ url_for('logout') }}" class="nav-link nav-logout">Log out</a>
+<body{% if not current_user.is_authenticated %} class="auth-page"{% endif %}>
+    {% if current_user.is_authenticated %}
+    <aside class="sidebar">
+        <div class="sidebar-brand">
+            <a href="{{ url_for('dashboard') }}">
+                <span class="brand-icon">P</span>
+                <span class="brand-text">Proposal Manager</span>
+            </a>
+        </div>
+        <nav class="sidebar-nav">
+            <a href="{{ url_for('dashboard') }}" class="sidebar-link{% if request.endpoint == 'dashboard' %} active{% endif %}">
+                <span class="sidebar-icon">&#9776;</span>
+                <span>Dashboard</span>
+            </a>
+            <a href="{{ url_for('new_project') }}" class="sidebar-link{% if request.endpoint == 'new_project' %} active{% endif %}">
+                <span class="sidebar-icon">&#43;</span>
+                <span>New Project</span>
+            </a>
+            <a href="{{ url_for('document_library') }}" class="sidebar-link{% if request.endpoint == 'document_library' %} active{% endif %}">
+                <span class="sidebar-icon">&#128196;</span>
+                <span>Documents</span>
+            </a>
+            <a href="{{ url_for('settings') }}" class="sidebar-link{% if request.endpoint == 'settings' %} active{% endif %}">
+                <span class="sidebar-icon">&#9881;</span>
+                <span>Settings</span>
+            </a>
+            <a href="{{ url_for('faq_page') }}" class="sidebar-link{% if request.endpoint == 'faq_page' %} active{% endif %}">
+                <span class="sidebar-icon">?</span>
+                <span>FAQ</span>
+            </a>
+            {% if current_user.is_admin %}
+            <a href="{{ url_for('admin_panel') }}" class="sidebar-link sidebar-admin{% if request.endpoint == 'admin_panel' %} active{% endif %}">
+                <span class="sidebar-icon">&#9733;</span>
+                <span>Admin</span>
+            </a>
+            {% endif %}
+        </nav>
+        <div class="sidebar-footer">
+            <div class="sidebar-user">
+                <span class="sidebar-user-name">{{ current_user.display_name or current_user.username }}</span>
+                <span class="sidebar-user-company">{{ current_user.company_name or '' }}</span>
+            </div>
+            <a href="{{ url_for('logout') }}" class="sidebar-link sidebar-logout">
+                <span class="sidebar-icon">&#10140;</span>
+                <span>Log out</span>
+            </a>
+        </div>
+    </aside>
+
+    <div class="main-wrapper">
+        <header class="topbar">
+            <button class="sidebar-toggle" id="sidebar-toggle" type="button" aria-label="Toggle sidebar">&#9776;</button>
+            <div class="topbar-right">
+                <span class="topbar-user">{{ current_user.display_name or current_user.username }}</span>
+            </div>
+        </header>
+        <main class="main-content">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+            <div class="flash-messages">
+                {% for category, message in messages %}
+                <div class="flash flash-{{ category }}">{{ message }}</div>
+                {% endfor %}
             </div>
             {% endif %}
-        </div>
-    </nav>
+            {% endwith %}
 
-    <main class="container">
+            {% block content %}{% endblock %}
+        </main>
+        <footer class="footer">
+            <p>Proposal Manager Agent &mdash; Internal Use Only &mdash; Powered by Claude</p>
+        </footer>
+    </div>
+
+    <!-- Help Chatbot Widget -->
+    <button class="chatbot-trigger" id="chatbot-trigger" type="button" aria-label="Help">?</button>
+    <div class="chatbot-panel" id="chatbot-panel">
+        <div class="chatbot-header">
+            <h3>Help Assistant</h3>
+            <button class="chatbot-close" id="chatbot-close" type="button">&times;</button>
+        </div>
+        <div class="chatbot-messages" id="chatbot-messages">
+            <div class="chat-msg chat-msg-bot">Hi! I can help you with using Proposal Manager. Ask me about generating proposals, uploading files, cost estimation, version history, and more.</div>
+        </div>
+        <div class="chatbot-input">
+            <input type="text" id="chatbot-input" placeholder="Type a question..." autocomplete="off">
+            <button type="button" id="chatbot-send">Send</button>
+        </div>
+    </div>
+    {% else %}
+    <div class="auth-container">
         {% with messages = get_flashed_messages(with_categories=true) %}
         {% if messages %}
         <div class="flash-messages">
@@ -36,15 +107,80 @@
         {% endif %}
         {% endwith %}
 
-        {% block content %}{% endblock %}
-    </main>
-
-    <footer class="footer">
-        <div class="container">
-            <p>Proposal Manager Agent &mdash; Internal Use Only &mdash; Powered by Claude</p>
-        </div>
-    </footer>
+        {% block auth_content %}{% endblock %}
+    </div>
+    {% endif %}
 
     {% block scripts %}{% endblock %}
+    {% if current_user.is_authenticated %}
+    <script>
+    (function(){
+        // Sidebar toggle
+        var toggle = document.getElementById("sidebar-toggle");
+        var sidebar = document.querySelector(".sidebar");
+        var wrapper = document.querySelector(".main-wrapper");
+        if (toggle && sidebar) {
+            toggle.addEventListener("click", function() {
+                sidebar.classList.toggle("collapsed");
+                wrapper.classList.toggle("sidebar-collapsed");
+            });
+        }
+
+        // Help chatbot
+        var trigger = document.getElementById("chatbot-trigger");
+        var panel = document.getElementById("chatbot-panel");
+        var closeBtn = document.getElementById("chatbot-close");
+        var input = document.getElementById("chatbot-input");
+        var sendBtn = document.getElementById("chatbot-send");
+        var messages = document.getElementById("chatbot-messages");
+
+        if (trigger && panel) {
+            trigger.addEventListener("click", function() {
+                panel.classList.toggle("open");
+                if (panel.classList.contains("open")) input.focus();
+            });
+            closeBtn.addEventListener("click", function() {
+                panel.classList.remove("open");
+            });
+
+            function sendMessage() {
+                var text = input.value.trim();
+                if (!text) return;
+                var userMsg = document.createElement("div");
+                userMsg.className = "chat-msg chat-msg-user";
+                userMsg.textContent = text;
+                messages.appendChild(userMsg);
+                input.value = "";
+                messages.scrollTop = messages.scrollHeight;
+
+                fetch("/api/chat", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({message: text})
+                })
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    var botMsg = document.createElement("div");
+                    botMsg.className = "chat-msg chat-msg-bot";
+                    botMsg.textContent = data.reply;
+                    messages.appendChild(botMsg);
+                    messages.scrollTop = messages.scrollHeight;
+                })
+                .catch(function() {
+                    var errMsg = document.createElement("div");
+                    errMsg.className = "chat-msg chat-msg-bot";
+                    errMsg.textContent = "Sorry, something went wrong. Please try again.";
+                    messages.appendChild(errMsg);
+                });
+            }
+
+            sendBtn.addEventListener("click", sendMessage);
+            input.addEventListener("keydown", function(e) {
+                if (e.key === "Enter") sendMessage();
+            });
+        }
+    })();
+    </script>
+    {% endif %}
 </body>
 </html>

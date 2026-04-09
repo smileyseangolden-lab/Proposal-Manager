@@ -7,8 +7,14 @@
     <h1>Settings</h1>
 </section>
 
-<div class="settings-layout">
-    <!-- Profile & LLM Settings -->
+<!-- Tabs -->
+<div class="settings-tabs">
+    <button class="settings-tab active" data-tab="profile">Profile & AI</button>
+    <button class="settings-tab" data-tab="company">Proposal Setup</button>
+</div>
+
+<!-- Tab 1: Profile & AI Settings -->
+<div class="settings-tab-panel active" id="tab-profile">
     <div class="card">
         <h2>Profile & AI Settings</h2>
         <form method="post" action="{{ url_for('settings') }}">
@@ -65,385 +71,10 @@
         </form>
     </div>
 
-    <!-- Rate / Price Sheets -->
-    <div class="card">
-        <h2>Rate & Price Sheets</h2>
-        <p class="card-desc">Upload Excel spreadsheets with your company's standard labor rates and product pricing. The AI agent uses these for proposal pricing structure.</p>
-
-        <form method="post" action="{{ url_for('upload_rate_sheet') }}" enctype="multipart/form-data" class="upload-inline">
-            <div class="form-row">
-                <div class="form-group">
-                    <label for="sheet_name">Sheet Name</label>
-                    <input type="text" id="sheet_name" name="sheet_name" placeholder="e.g., 2026 Labor Rates">
-                </div>
-                <div class="form-group">
-                    <label for="sheet_type">Type</label>
-                    <select id="sheet_type" name="sheet_type">
-                        <option value="labor_rates">Labor Rates</option>
-                        <option value="product_pricing">Product Pricing</option>
-                    </select>
-                </div>
-            </div>
-            <div class="form-group">
-                <label>Excel File (.xlsx)</label>
-                <input type="file" name="rate_sheet" accept=".xlsx,.xls" required>
-            </div>
-            <button type="submit" class="btn btn-secondary">Upload Rate Sheet</button>
-        </form>
-
-        {% if rate_sheets %}
-        <table class="mini-table">
-            <thead><tr><th>Name</th><th>Type</th><th>Uploaded</th><th></th></tr></thead>
-            <tbody>
-            {% for s in rate_sheets %}
-            <tr>
-                <td>{{ s.name }}</td>
-                <td>{{ s.sheet_type | replace('_', ' ') | title }}</td>
-                <td>{{ s.uploaded_at.strftime('%Y-%m-%d') }}</td>
-                <td>
-                    <form method="post" action="{{ url_for('delete_rate_sheet', sheet_id=s.id) }}" class="inline-form">
-                        <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this rate sheet?')">Delete</button>
-                    </form>
-                </td>
-            </tr>
-            {% endfor %}
-            </tbody>
-        </table>
-        {% endif %}
-    </div>
-
-    <!-- Company Standards & Posture Library -->
-    <div class="card">
-        <h2>Company Standards & Posture</h2>
-        <p class="card-desc">Define your company's standard content that the AI will automatically include in proposals: mission statement, certifications, past performance, safety record, quality standards, terms & conditions, etc.</p>
-
-        <form method="post" action="{{ url_for('add_company_standard') }}" class="upload-inline">
-            <div class="form-row">
-                <div class="form-group">
-                    <label for="standard_category">Category *</label>
-                    <select id="standard_category" name="standard_category" required>
-                        <option value="Mission Statement">Mission Statement</option>
-                        <option value="Company Overview">Company Overview</option>
-                        <option value="Certifications">Certifications & Licenses</option>
-                        <option value="Past Performance">Past Performance</option>
-                        <option value="Safety Record">Safety Record</option>
-                        <option value="Quality Standards">Quality Standards</option>
-                        <option value="Insurance">Insurance & Bonding</option>
-                        <option value="Terms & Conditions">Terms & Conditions</option>
-                        <option value="Key Personnel">Key Personnel Bios</option>
-                        <option value="Differentiators">Differentiators / Value Proposition</option>
-                        <option value="Other">Other</option>
-                    </select>
-                </div>
-                <div class="form-group" style="flex:2">
-                    <label for="standard_title">Title *</label>
-                    <input type="text" id="standard_title" name="standard_title" placeholder="e.g., ISO 9001:2015 Certification" required>
-                </div>
-            </div>
-            <div class="form-group">
-                <label for="standard_content">Content * <span class="form-hint">(Markdown supported)</span></label>
-                <textarea id="standard_content" name="standard_content" rows="4" placeholder="Enter the boilerplate text, certification details, past performance narrative, etc." required></textarea>
-            </div>
-            <button type="submit" class="btn btn-secondary">Add Company Standard</button>
-        </form>
-
-        {% if company_standards %}
-        <table class="mini-table">
-            <thead><tr><th>Category</th><th>Title</th><th>Preview</th><th></th></tr></thead>
-            <tbody>
-            {% for s in company_standards %}
-            <tr>
-                <td><span class="badge badge-vertical">{{ s.category }}</span></td>
-                <td>{{ s.title }}</td>
-                <td class="td-desc">{{ s.content[:80] }}{{ '...' if s.content|length > 80 }}</td>
-                <td>
-                    <form method="post" action="{{ url_for('delete_company_standard', standard_id=s.id) }}" class="inline-form">
-                        <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this standard?')">Delete</button>
-                    </form>
-                </td>
-            </tr>
-            {% endfor %}
-            </tbody>
-        </table>
-        {% else %}
-        <p class="empty-hint">No company standards defined yet. Add your company's boilerplate content above to auto-include in proposals.</p>
-        {% endif %}
-    </div>
-
-    <!-- Staff Hourly Rates -->
-    <div class="card">
-        <h2>Staff Hourly Sell Rates</h2>
-        <p class="card-desc">Define your staff roles and hourly sell rates. The AI uses these to estimate staffing costs when generating proposals.</p>
-
-        <form method="post" action="{{ url_for('add_staff_role') }}" class="upload-inline">
-            <div class="form-row">
-                <div class="form-group">
-                    <label for="role_name">Role / Title *</label>
-                    <input type="text" id="role_name" name="role_name" placeholder="e.g., Senior Engineer" required>
-                </div>
-                <div class="form-group">
-                    <label for="sr_category">Category</label>
-                    <select id="sr_category" name="category">
-                        <option value="Engineering">Engineering</option>
-                        <option value="Management">Management</option>
-                        <option value="Technician">Technician</option>
-                        <option value="Design">Design</option>
-                        <option value="Administrative">Administrative</option>
-                        <option value="Commissioning">Commissioning</option>
-                        <option value="Project Controls">Project Controls</option>
-                        <option value="Safety">Safety</option>
-                        <option value="Quality">Quality</option>
-                        <option value="Other">Other</option>
-                    </select>
-                </div>
-            </div>
-            <div class="form-row">
-                <div class="form-group">
-                    <label for="hourly_rate">Hourly Sell Rate ($) *</label>
-                    <input type="number" id="hourly_rate" name="hourly_rate" step="0.01" min="0" placeholder="175.00" required>
-                </div>
-                <div class="form-group">
-                    <label for="overtime_rate">OT Rate ($) <span class="form-hint">(optional)</span></label>
-                    <input type="number" id="overtime_rate" name="overtime_rate" step="0.01" min="0" placeholder="262.50">
-                </div>
-            </div>
-            <div class="form-group">
-                <label for="sr_description">Description <span class="form-hint">(optional)</span></label>
-                <input type="text" id="sr_description" name="description" placeholder="e.g., Controls/automation engineer, PLC/SCADA">
-            </div>
-            <button type="submit" class="btn btn-secondary">Add Staff Role</button>
-        </form>
-
-        {% if staff_roles %}
-        <table class="mini-table">
-            <thead><tr><th>Role</th><th>Category</th><th>Hourly Rate</th><th>OT Rate</th><th>Description</th><th></th></tr></thead>
-            <tbody>
-            {% for r in staff_roles %}
-            <tr>
-                <td>{{ r.role_name }}</td>
-                <td>{{ r.category }}</td>
-                <td>${{ "%.2f"|format(r.hourly_rate) }}</td>
-                <td>{{ "$%.2f"|format(r.overtime_rate) if r.overtime_rate else '—' }}</td>
-                <td class="td-desc">{{ r.description or '—' }}</td>
-                <td>
-                    <form method="post" action="{{ url_for('delete_staff_role', role_id=r.id) }}" class="inline-form">
-                        <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this staff role?')">Delete</button>
-                    </form>
-                </td>
-            </tr>
-            {% endfor %}
-            </tbody>
-        </table>
-        {% else %}
-        <p class="empty-hint">No staff roles defined yet. Add roles above so the AI can estimate staffing costs.</p>
-        {% endif %}
-    </div>
-
-    <!-- Equipment & Materials Price List -->
-    <div class="card">
-        <h2>Equipment & Materials Price List</h2>
-        <p class="card-desc">Define your standard equipment, materials, and product pricing. The AI references this for Bill of Materials estimates in proposals.</p>
-
-        <form method="post" action="{{ url_for('add_equipment_item') }}" class="upload-inline">
-            <div class="form-row">
-                <div class="form-group" style="flex:2">
-                    <label for="item_name">Item Name *</label>
-                    <input type="text" id="item_name" name="item_name" placeholder="e.g., Schneider PLC M580" required>
-                </div>
-                <div class="form-group">
-                    <label for="eq_category">Category</label>
-                    <select id="eq_category" name="eq_category">
-                        <option value="Electrical">Electrical</option>
-                        <option value="Mechanical">Mechanical</option>
-                        <option value="Instrumentation">Instrumentation</option>
-                        <option value="Controls">Controls</option>
-                        <option value="Software">Software</option>
-                        <option value="Safety">Safety</option>
-                        <option value="Networking">Networking</option>
-                        <option value="General">General</option>
-                        <option value="Other">Other</option>
-                    </select>
-                </div>
-            </div>
-            <div class="form-row">
-                <div class="form-group">
-                    <label for="part_number">Part / Model Number</label>
-                    <input type="text" id="part_number" name="part_number" placeholder="e.g., BMEP584040">
-                </div>
-                <div class="form-group">
-                    <label for="manufacturer">Manufacturer</label>
-                    <input type="text" id="manufacturer" name="manufacturer" placeholder="e.g., Schneider Electric">
-                </div>
-            </div>
-            <div class="form-row">
-                <div class="form-group">
-                    <label for="unit_cost">Unit Cost ($) *</label>
-                    <input type="number" id="unit_cost" name="unit_cost" step="0.01" min="0" placeholder="4500.00" required>
-                </div>
-                <div class="form-group">
-                    <label for="eq_unit">Unit of Measure</label>
-                    <select id="eq_unit" name="unit">
-                        <option value="each">Each</option>
-                        <option value="ft">Per Foot</option>
-                        <option value="m">Per Meter</option>
-                        <option value="lot">Per Lot</option>
-                        <option value="set">Per Set</option>
-                        <option value="hr">Per Hour</option>
-                        <option value="license">Per License</option>
-                    </select>
-                </div>
-            </div>
-            <div class="form-group">
-                <label for="eq_description">Description <span class="form-hint">(optional)</span></label>
-                <input type="text" id="eq_description" name="eq_description" placeholder="e.g., High-performance modular PLC for process control">
-            </div>
-            <button type="submit" class="btn btn-secondary">Add Equipment Item</button>
-        </form>
-
-        {% if equipment_items %}
-        <table class="mini-table">
-            <thead><tr><th>Item</th><th>Category</th><th>Part #</th><th>Manufacturer</th><th>Unit Cost</th><th>Unit</th><th></th></tr></thead>
-            <tbody>
-            {% for e in equipment_items %}
-            <tr>
-                <td>{{ e.item_name }}</td>
-                <td>{{ e.category }}</td>
-                <td>{{ e.part_number or '—' }}</td>
-                <td>{{ e.manufacturer or '—' }}</td>
-                <td>${{ "%.2f"|format(e.unit_cost) }}</td>
-                <td>{{ e.unit }}</td>
-                <td>
-                    <form method="post" action="{{ url_for('delete_equipment_item', item_id=e.id) }}" class="inline-form">
-                        <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this item?')">Delete</button>
-                    </form>
-                </td>
-            </tr>
-            {% endfor %}
-            </tbody>
-        </table>
-        {% else %}
-        <p class="empty-hint">No equipment items defined yet. Add items above so the AI can estimate material costs.</p>
-        {% endif %}
-    </div>
-
-    <!-- Travel & Expense Rates -->
-    <div class="card">
-        <h2>Travel & Expense Rates</h2>
-        <p class="card-desc">Define standard travel and expense rates (per diem, mileage, airfare, hotel, etc.). The AI uses these to estimate travel costs in proposals.</p>
-
-        <form method="post" action="{{ url_for('add_travel_rate') }}" class="upload-inline">
-            <div class="form-row">
-                <div class="form-group">
-                    <label for="expense_type">Expense Type *</label>
-                    <select id="expense_type" name="expense_type" required>
-                        <option value="Per Diem">Per Diem</option>
-                        <option value="Hotel">Hotel</option>
-                        <option value="Airfare">Airfare</option>
-                        <option value="Rental Car">Rental Car</option>
-                        <option value="Mileage">Mileage</option>
-                        <option value="Parking/Tolls">Parking / Tolls</option>
-                        <option value="Meals">Meals</option>
-                        <option value="Other">Other</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label for="travel_rate">Rate ($) *</label>
-                    <input type="number" id="travel_rate" name="travel_rate" step="0.01" min="0" placeholder="75.00" required>
-                </div>
-                <div class="form-group">
-                    <label for="travel_unit">Unit</label>
-                    <select id="travel_unit" name="travel_unit">
-                        <option value="per day">Per Day</option>
-                        <option value="per night">Per Night</option>
-                        <option value="per trip">Per Trip</option>
-                        <option value="per mile">Per Mile</option>
-                        <option value="per week">Per Week</option>
-                        <option value="flat rate">Flat Rate</option>
-                    </select>
-                </div>
-            </div>
-            <div class="form-group">
-                <label for="travel_description">Description <span class="form-hint">(optional)</span></label>
-                <input type="text" id="travel_description" name="travel_description" placeholder="e.g., GSA rate for domestic travel">
-            </div>
-            <button type="submit" class="btn btn-secondary">Add Travel Rate</button>
-        </form>
-
-        {% if travel_rates %}
-        <table class="mini-table">
-            <thead><tr><th>Expense Type</th><th>Rate</th><th>Unit</th><th>Description</th><th></th></tr></thead>
-            <tbody>
-            {% for t in travel_rates %}
-            <tr>
-                <td>{{ t.expense_type }}</td>
-                <td>${{ "%.2f"|format(t.rate) }}</td>
-                <td>{{ t.unit }}</td>
-                <td class="td-desc">{{ t.description or '—' }}</td>
-                <td>
-                    <form method="post" action="{{ url_for('delete_travel_rate', rate_id=t.id) }}" class="inline-form">
-                        <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this rate?')">Delete</button>
-                    </form>
-                </td>
-            </tr>
-            {% endfor %}
-            </tbody>
-        </table>
-        {% else %}
-        <p class="empty-hint">No travel rates defined yet. Add rates above so the AI can estimate travel costs.</p>
-        {% endif %}
-    </div>
-
-    <!-- Rate / Price Sheets (Excel Upload) -->
-    <div class="card">
-        <h2>Rate & Price Sheets (Excel Upload)</h2>
-        <p class="card-desc">Upload Excel spreadsheets with your company's standard labor rates and product pricing. The AI agent uses these for proposal pricing structure. Use this as an alternative to manually entering rates above.</p>
-
-        <form method="post" action="{{ url_for('upload_rate_sheet') }}" enctype="multipart/form-data" class="upload-inline">
-            <div class="form-row">
-                <div class="form-group">
-                    <label for="sheet_name">Sheet Name</label>
-                    <input type="text" id="sheet_name" name="sheet_name" placeholder="e.g., 2026 Labor Rates">
-                </div>
-                <div class="form-group">
-                    <label for="sheet_type">Type</label>
-                    <select id="sheet_type" name="sheet_type">
-                        <option value="labor_rates">Labor Rates</option>
-                        <option value="product_pricing">Product Pricing</option>
-                    </select>
-                </div>
-            </div>
-            <div class="form-group">
-                <label>Excel File (.xlsx)</label>
-                <input type="file" name="rate_sheet" accept=".xlsx,.xls" required>
-            </div>
-            <button type="submit" class="btn btn-secondary">Upload Rate Sheet</button>
-        </form>
-
-        {% if rate_sheets %}
-        <table class="mini-table">
-            <thead><tr><th>Name</th><th>Type</th><th>Uploaded</th><th></th></tr></thead>
-            <tbody>
-            {% for s in rate_sheets %}
-            <tr>
-                <td>{{ s.name }}</td>
-                <td>{{ s.sheet_type | replace('_', ' ') | title }}</td>
-                <td>{{ s.uploaded_at.strftime('%Y-%m-%d') }}</td>
-                <td>
-                    <form method="post" action="{{ url_for('delete_rate_sheet', sheet_id=s.id) }}" class="inline-form">
-                        <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this rate sheet?')">Delete</button>
-                    </form>
-                </td>
-            </tr>
-            {% endfor %}
-            </tbody>
-        </table>
-        {% endif %}
-    </div>
-
-    <!-- User Vertical Templates -->
+    <!-- My Industry Templates -->
     <div class="card">
         <h2>My Industry Templates</h2>
-        <p class="card-desc">Upload your own proposal templates and workflows for each vertical. These override the company defaults when you select "Use my template" during proposal generation.</p>
+        <p class="card-desc">Upload your own proposal templates and workflows for each vertical.</p>
 
         <form method="post" action="{{ url_for('upload_user_template') }}" enctype="multipart/form-data" class="upload-inline">
             <div class="form-row">
@@ -497,4 +128,351 @@
         {% endif %}
     </div>
 </div>
+
+<!-- Tab 2: Proposal Setup -->
+<div class="settings-tab-panel" id="tab-company">
+    <!-- Company Standards & Posture Library -->
+    <div class="card">
+        <h2>Company Standards & Posture</h2>
+        <p class="card-desc">Define your company's standard content that the AI will automatically include in proposals: mission statement, certifications, past performance, safety record, quality standards, etc.</p>
+
+        <form method="post" action="{{ url_for('add_company_standard') }}" enctype="multipart/form-data" class="upload-inline">
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="standard_category">Category *</label>
+                    <select id="standard_category" name="standard_category" required>
+                        <option value="Mission Statement">Mission Statement</option>
+                        <option value="Company Overview">Company Overview</option>
+                        <option value="Certifications">Certifications & Licenses</option>
+                        <option value="Past Performance">Past Performance</option>
+                        <option value="Safety Record">Safety Record</option>
+                        <option value="Quality Standards">Quality Standards</option>
+                        <option value="Insurance">Insurance & Bonding</option>
+                        <option value="Terms & Conditions">Terms & Conditions</option>
+                        <option value="Key Personnel">Key Personnel Bios</option>
+                        <option value="Differentiators">Differentiators / Value Proposition</option>
+                        <option value="Other">Other</option>
+                    </select>
+                </div>
+                <div class="form-group" style="flex:2">
+                    <label for="standard_title">Title *</label>
+                    <input type="text" id="standard_title" name="standard_title" placeholder="e.g., ISO 9001:2015 Certification" required>
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="standard_content">Content <span class="form-hint">(Markdown supported &mdash; or upload a file below)</span></label>
+                <textarea id="standard_content" name="standard_content" rows="4" placeholder="Enter the boilerplate text, certification details, past performance narrative, etc."></textarea>
+            </div>
+            <div class="form-group">
+                <label>Or Upload File <span class="form-hint">(.docx, .pdf, .xlsx)</span></label>
+                <input type="file" name="standard_file" accept=".docx,.doc,.pdf,.xlsx,.xls">
+            </div>
+            <button type="submit" class="btn btn-secondary">Add Company Standard</button>
+        </form>
+
+        {% if company_standards %}
+        <table class="mini-table">
+            <thead><tr><th>Category</th><th>Title</th><th>Preview</th><th></th></tr></thead>
+            <tbody>
+            {% for s in company_standards %}
+            <tr>
+                <td><span class="badge badge-vertical">{{ s.category }}</span></td>
+                <td>{{ s.title }}</td>
+                <td class="td-desc">{{ s.content[:80] }}{{ '...' if s.content|length > 80 }}</td>
+                <td>
+                    <form method="post" action="{{ url_for('delete_company_standard', standard_id=s.id) }}" class="inline-form">
+                        <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this standard?')">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p class="empty-hint">No company standards defined yet. Add your company's boilerplate content above to auto-include in proposals.</p>
+        {% endif %}
+    </div>
+
+    <!-- Staff Hourly Rates -->
+    <div class="card">
+        <h2>Staff Hourly Sell Rates</h2>
+        <p class="card-desc">Define your staff roles and hourly sell rates. The AI uses these to estimate staffing costs when generating proposals. You can enter manually or upload a spreadsheet.</p>
+
+        <form method="post" action="{{ url_for('add_staff_role') }}" enctype="multipart/form-data" class="upload-inline">
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="role_name">Role / Title *</label>
+                    <input type="text" id="role_name" name="role_name" placeholder="e.g., Senior Engineer">
+                </div>
+                <div class="form-group">
+                    <label for="sr_category">Category</label>
+                    <select id="sr_category" name="category">
+                        <option value="Engineering">Engineering</option>
+                        <option value="Management">Management</option>
+                        <option value="Technician">Technician</option>
+                        <option value="Design">Design</option>
+                        <option value="Administrative">Administrative</option>
+                        <option value="Commissioning">Commissioning</option>
+                        <option value="Project Controls">Project Controls</option>
+                        <option value="Safety">Safety</option>
+                        <option value="Quality">Quality</option>
+                        <option value="Other">Other</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="hourly_rate">Hourly Sell Rate ($) *</label>
+                    <input type="number" id="hourly_rate" name="hourly_rate" step="0.01" min="0" placeholder="175.00">
+                </div>
+                <div class="form-group">
+                    <label for="overtime_rate">OT Rate ($) <span class="form-hint">(optional)</span></label>
+                    <input type="number" id="overtime_rate" name="overtime_rate" step="0.01" min="0" placeholder="262.50">
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="sr_description">Description <span class="form-hint">(optional)</span></label>
+                <input type="text" id="sr_description" name="description" placeholder="e.g., Controls/automation engineer, PLC/SCADA">
+            </div>
+            <div class="form-group">
+                <label>Or Upload Rate Sheet <span class="form-hint">(.xlsx, .xls, .docx, .pdf)</span></label>
+                <input type="file" name="staff_rate_file" accept=".xlsx,.xls,.docx,.doc,.pdf">
+            </div>
+            <button type="submit" class="btn btn-secondary">Add Staff Role</button>
+        </form>
+
+        {% if staff_roles %}
+        <table class="mini-table">
+            <thead><tr><th>Role</th><th>Category</th><th>Hourly Rate</th><th>OT Rate</th><th>Description</th><th></th></tr></thead>
+            <tbody>
+            {% for r in staff_roles %}
+            <tr>
+                <td>{{ r.role_name }}</td>
+                <td>{{ r.category }}</td>
+                <td>${{ "%.2f"|format(r.hourly_rate) }}</td>
+                <td>{{ "$%.2f"|format(r.overtime_rate) if r.overtime_rate else '—' }}</td>
+                <td class="td-desc">{{ r.description or '—' }}</td>
+                <td>
+                    <form method="post" action="{{ url_for('delete_staff_role', role_id=r.id) }}" class="inline-form">
+                        <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this staff role?')">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p class="empty-hint">No staff roles defined yet. Add roles above so the AI can estimate staffing costs.</p>
+        {% endif %}
+
+        {% if rate_sheets %}
+        <h3 style="margin-top:20px; font-size:15px; color:var(--gray-700);">Uploaded Rate Sheets</h3>
+        <table class="mini-table">
+            <thead><tr><th>Name</th><th>Type</th><th>Uploaded</th><th></th></tr></thead>
+            <tbody>
+            {% for s in rate_sheets %}
+            <tr>
+                <td>{{ s.name }}</td>
+                <td>{{ s.sheet_type | replace('_', ' ') | title }}</td>
+                <td>{{ s.uploaded_at.strftime('%Y-%m-%d') }}</td>
+                <td>
+                    <form method="post" action="{{ url_for('delete_rate_sheet', sheet_id=s.id) }}" class="inline-form">
+                        <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this rate sheet?')">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+    </div>
+
+    <!-- Equipment & Materials Price List -->
+    <div class="card">
+        <h2>Equipment & Materials Price List</h2>
+        <p class="card-desc">Define your standard equipment, materials, and product pricing. The AI references this for Bill of Materials estimates in proposals.</p>
+
+        <form method="post" action="{{ url_for('add_equipment_item') }}" enctype="multipart/form-data" class="upload-inline">
+            <div class="form-row">
+                <div class="form-group" style="flex:2">
+                    <label for="item_name">Item Name *</label>
+                    <input type="text" id="item_name" name="item_name" placeholder="e.g., Schneider PLC M580">
+                </div>
+                <div class="form-group">
+                    <label for="eq_category">Category</label>
+                    <select id="eq_category" name="eq_category">
+                        <option value="Electrical">Electrical</option>
+                        <option value="Mechanical">Mechanical</option>
+                        <option value="Instrumentation">Instrumentation</option>
+                        <option value="Controls">Controls</option>
+                        <option value="Software">Software</option>
+                        <option value="Safety">Safety</option>
+                        <option value="Networking">Networking</option>
+                        <option value="General">General</option>
+                        <option value="Other">Other</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="part_number">Part / Model Number</label>
+                    <input type="text" id="part_number" name="part_number" placeholder="e.g., BMEP584040">
+                </div>
+                <div class="form-group">
+                    <label for="manufacturer">Manufacturer</label>
+                    <input type="text" id="manufacturer" name="manufacturer" placeholder="e.g., Schneider Electric">
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="unit_cost">Unit Cost ($) *</label>
+                    <input type="number" id="unit_cost" name="unit_cost" step="0.01" min="0" placeholder="4500.00">
+                </div>
+                <div class="form-group">
+                    <label for="eq_unit">Unit of Measure</label>
+                    <select id="eq_unit" name="unit">
+                        <option value="each">Each</option>
+                        <option value="ft">Per Foot</option>
+                        <option value="m">Per Meter</option>
+                        <option value="lot">Per Lot</option>
+                        <option value="set">Per Set</option>
+                        <option value="hr">Per Hour</option>
+                        <option value="license">Per License</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="eq_description">Description <span class="form-hint">(optional)</span></label>
+                <input type="text" id="eq_description" name="eq_description" placeholder="e.g., High-performance modular PLC for process control">
+            </div>
+            <div class="form-group">
+                <label>Or Upload Price List <span class="form-hint">(.xlsx, .xls, .docx, .pdf)</span></label>
+                <input type="file" name="equipment_file" accept=".xlsx,.xls,.docx,.doc,.pdf">
+            </div>
+            <button type="submit" class="btn btn-secondary">Add Equipment Item</button>
+        </form>
+
+        {% if equipment_items %}
+        <table class="mini-table">
+            <thead><tr><th>Item</th><th>Category</th><th>Part #</th><th>Manufacturer</th><th>Unit Cost</th><th>Unit</th><th></th></tr></thead>
+            <tbody>
+            {% for e in equipment_items %}
+            <tr>
+                <td>{{ e.item_name }}</td>
+                <td>{{ e.category }}</td>
+                <td>{{ e.part_number or '—' }}</td>
+                <td>{{ e.manufacturer or '—' }}</td>
+                <td>${{ "%.2f"|format(e.unit_cost) }}</td>
+                <td>{{ e.unit }}</td>
+                <td>
+                    <form method="post" action="{{ url_for('delete_equipment_item', item_id=e.id) }}" class="inline-form">
+                        <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this item?')">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p class="empty-hint">No equipment items defined yet. Add items above so the AI can estimate material costs.</p>
+        {% endif %}
+    </div>
+
+    <!-- Travel & Expense Rates -->
+    <div class="card">
+        <h2>Travel & Expense Rates</h2>
+        <p class="card-desc">Define standard travel and expense rates (per diem, mileage, airfare, hotel, etc.). The AI uses these to estimate travel costs in proposals.</p>
+
+        <form method="post" action="{{ url_for('add_travel_rate') }}" enctype="multipart/form-data" class="upload-inline">
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="expense_type">Expense Type *</label>
+                    <select id="expense_type" name="expense_type" required>
+                        <option value="Per Diem">Per Diem</option>
+                        <option value="Hotel">Hotel</option>
+                        <option value="Airfare">Airfare</option>
+                        <option value="Rental Car">Rental Car</option>
+                        <option value="Mileage">Mileage</option>
+                        <option value="Parking/Tolls">Parking / Tolls</option>
+                        <option value="Meals">Meals</option>
+                        <option value="Other">Other</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="travel_rate">Rate ($) *</label>
+                    <input type="number" id="travel_rate" name="travel_rate" step="0.01" min="0" placeholder="75.00">
+                </div>
+                <div class="form-group">
+                    <label for="travel_unit">Unit</label>
+                    <select id="travel_unit" name="travel_unit">
+                        <option value="per day">Per Day</option>
+                        <option value="per night">Per Night</option>
+                        <option value="per trip">Per Trip</option>
+                        <option value="per mile">Per Mile</option>
+                        <option value="per week">Per Week</option>
+                        <option value="flat rate">Flat Rate</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="travel_description">Description <span class="form-hint">(optional)</span></label>
+                <input type="text" id="travel_description" name="travel_description" placeholder="e.g., GSA rate for domestic travel">
+            </div>
+            <div class="form-group">
+                <label>Or Upload Rate Schedule <span class="form-hint">(.xlsx, .xls, .docx, .pdf)</span></label>
+                <input type="file" name="travel_rate_file" accept=".xlsx,.xls,.docx,.doc,.pdf">
+            </div>
+            <button type="submit" class="btn btn-secondary">Add Travel Rate</button>
+        </form>
+
+        {% if travel_rates %}
+        <table class="mini-table">
+            <thead><tr><th>Expense Type</th><th>Rate</th><th>Unit</th><th>Description</th><th></th></tr></thead>
+            <tbody>
+            {% for t in travel_rates %}
+            <tr>
+                <td>{{ t.expense_type }}</td>
+                <td>${{ "%.2f"|format(t.rate) }}</td>
+                <td>{{ t.unit }}</td>
+                <td class="td-desc">{{ t.description or '—' }}</td>
+                <td>
+                    <form method="post" action="{{ url_for('delete_travel_rate', rate_id=t.id) }}" class="inline-form">
+                        <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this rate?')">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p class="empty-hint">No travel rates defined yet. Add rates above so the AI can estimate travel costs.</p>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+    var tabs = document.querySelectorAll(".settings-tab");
+    var panels = document.querySelectorAll(".settings-tab-panel");
+
+    tabs.forEach(function(tab) {
+        tab.addEventListener("click", function() {
+            var target = this.dataset.tab;
+            tabs.forEach(function(t) { t.classList.remove("active"); });
+            panels.forEach(function(p) { p.classList.remove("active"); });
+            this.classList.add("active");
+            document.getElementById("tab-" + target).classList.add("active");
+        });
+    });
+
+    // Restore tab from URL hash
+    var hash = window.location.hash.replace("#", "");
+    if (hash) {
+        var targetTab = document.querySelector('.settings-tab[data-tab="' + hash + '"]');
+        if (targetTab) targetTab.click();
+    }
+})();
+</script>
 {% endblock %}

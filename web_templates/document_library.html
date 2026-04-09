@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+
+{% block title %}Document Library &mdash; Proposal Manager{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <div class="page-header-row">
+        <div>
+            <h1>Document Library</h1>
+            <p class="page-subtitle">{{ total_docs }} document(s) across all projects</p>
+        </div>
+    </div>
+</section>
+
+{% if project_docs %}
+    {% for pd in project_docs %}
+    <div class="card">
+        <h2>
+            <a href="{{ url_for('project_upload', project_id=pd.project.id) }}" class="project-link">{{ pd.project.name }}</a>
+            <span class="badge badge-status-{{ pd.project.status }}" style="margin-left:8px; vertical-align: middle;">{{ pd.project.status }}</span>
+        </h2>
+        <p class="card-desc">{{ pd.project.client_name or 'No client' }} &mdash; {{ pd.documents | length }} document(s)</p>
+        <table class="mini-table">
+            <thead>
+                <tr>
+                    <th>File Name</th>
+                    <th>Type</th>
+                    <th>Size</th>
+                    <th>Uploaded</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for d in pd.documents %}
+            <tr>
+                <td>{{ d.original_filename }}</td>
+                <td><span class="badge badge-doc-{{ d.file_type }}">{{ d.file_type }}</span></td>
+                <td>{% if d.file_size >= 1048576 %}{{ "%.1f"|format(d.file_size / 1048576) }} MB{% elif d.file_size >= 1024 %}{{ "%.0f"|format(d.file_size / 1024) }} KB{% else %}{{ d.file_size }} B{% endif %}</td>
+                <td>{{ d.uploaded_at.strftime('%Y-%m-%d %H:%M') }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endfor %}
+{% else %}
+<div class="empty-state">
+    <p>No documents uploaded yet. <a href="{{ url_for('new_project') }}">Create a project</a> and upload your RFP/RFQ documents to get started.</p>
+</div>
+{% endif %}
+{% endblock %}
