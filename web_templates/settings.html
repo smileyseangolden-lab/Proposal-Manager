@@ -70,11 +70,14 @@
             <button type="submit" class="btn btn-primary">Save Settings</button>
         </form>
     </div>
+</div>
 
+<!-- Tab 2: Proposal Setup -->
+<div class="settings-tab-panel" id="tab-company">
     <!-- My Industry Templates -->
     <div class="card">
         <h2>My Industry Templates</h2>
-        <p class="card-desc">Upload your own proposal templates and workflows for each vertical.</p>
+        <p class="card-desc">Upload your own proposal templates and workflows for each vertical. The AI will automatically use these when generating proposals.</p>
 
         <form method="post" action="{{ url_for('upload_user_template') }}" enctype="multipart/form-data" class="upload-inline">
             <div class="form-row">
@@ -127,10 +130,6 @@
         </table>
         {% endif %}
     </div>
-</div>
-
-<!-- Tab 2: Proposal Setup -->
-<div class="settings-tab-panel" id="tab-company">
     <!-- Company Standards & Posture Library -->
     <div class="card">
         <h2>Company Standards & Posture</h2>

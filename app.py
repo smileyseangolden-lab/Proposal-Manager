@@ -345,7 +345,7 @@ def upload_user_template():
 
     if not file or not _allowed_file(file.filename, TEMPLATE_EXTENSIONS):
         flash("Please upload a Word or PDF file.", "error")
-        return redirect(url_for("settings") + "#profile")
+        return redirect(url_for("settings") + "#company")
 
     safe, path, size = _save_upload(file, f"user_templates/{current_user.id}")
 
@@ -362,7 +362,7 @@ def upload_user_template():
     db.session.commit()
     _log_activity("template_upload", f"Uploaded {template_type} for {vertical}: {safe}")
     flash("Template uploaded.", "success")
-    return redirect(url_for("settings"))
+    return redirect(url_for("settings") + "#company")
 
 
 @app.route("/settings/delete-rate-sheet/<sheet_id>", methods=["POST"])
@@ -386,7 +386,7 @@ def delete_user_template(template_id):
     db.session.delete(tmpl)
     db.session.commit()
     flash("Template deleted.", "success")
-    return redirect(url_for("settings"))
+    return redirect(url_for("settings") + "#company")
 
 
 # ---------------------------------------------------------------------------
