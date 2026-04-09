@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+
+{% block title %}Version {{ version.version_number }} &mdash; {{ project.name }}{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <div class="page-header-row">
+        <div>
+            <h1>Version {{ version.version_number }}</h1>
+            <p class="page-subtitle">
+                {{ project.name }} &mdash;
+                <span class="badge badge-{{ 'status-active' if version.edit_source == 'ai' else 'status-submitted' }}">
+                    {{ 'AI Generated' if version.edit_source == 'ai' else 'Human Edited' }}
+                </span>
+                &mdash; {{ version.created_at.strftime('%Y-%m-%d %H:%M') }}
+            </p>
+            {% if version.change_summary %}
+            <p class="page-subtitle" style="margin-top:4px;">{{ version.change_summary }}</p>
+            {% endif %}
+        </div>
+        <div class="header-actions">
+            <a href="{{ url_for('edit_proposal', proposal_id=proposal.id) }}" class="btn btn-small btn-primary">Back to Editor</a>
+            <form method="post" action="{{ url_for('restore_version', proposal_id=proposal.id, version_id=version.id) }}" class="inline-form">
+                <button type="submit" class="btn btn-small btn-secondary" onclick="return confirm('Restore this version?')">Restore This Version</button>
+            </form>
+        </div>
+    </div>
+</section>
+
+<section class="proposal-content">
+    <div class="proposal-body">
+        {{ proposal_html|safe }}
+    </div>
+</section>
+{% endblock %}

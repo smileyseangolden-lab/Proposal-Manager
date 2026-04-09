@@ -49,17 +49,23 @@ from config.settings import (
 from document_parser import parse_document
 from models import (
     ActivityLog,
+    CompanyStandard,
+    EquipmentItem,
     Project,
     ProjectDocument,
     Proposal,
+    ProposalCorrection,
     ProposalQuestion,
+    ProposalVersion,
+    StaffRole,
+    TravelExpenseRate,
     User,
     UserRateSheet,
     UserVerticalTemplate,
     db,
 )
 from proposal_agent import generate_proposal
-from proposal_export import markdown_to_docx
+from proposal_export import markdown_to_docx, markdown_to_redline_docx
 from rate_sheet_parser import parse_rate_sheet
 
 # ---------------------------------------------------------------------------
@@ -282,11 +288,23 @@ def settings():
     rate_sheets = UserRateSheet.query.filter_by(user_id=current_user.id).order_by(UserRateSheet.uploaded_at.desc()).all()
     # User vertical templates
     user_templates = UserVerticalTemplate.query.filter_by(user_id=current_user.id, is_company_default=False).order_by(UserVerticalTemplate.uploaded_at.desc()).all()
+    # Staff roles
+    staff_roles = StaffRole.query.filter_by(user_id=current_user.id).order_by(StaffRole.category, StaffRole.role_name).all()
+    # Equipment items
+    equipment_items = EquipmentItem.query.filter_by(user_id=current_user.id).order_by(EquipmentItem.category, EquipmentItem.item_name).all()
+    # Travel expense rates
+    travel_rates = TravelExpenseRate.query.filter_by(user_id=current_user.id).order_by(TravelExpenseRate.expense_type).all()
+    # Company standards
+    company_standards = CompanyStandard.query.filter_by(user_id=current_user.id).order_by(CompanyStandard.category, CompanyStandard.title).all()
 
     return render_template(
         "settings.html",
         rate_sheets=rate_sheets,
         user_templates=user_templates,
+        staff_roles=staff_roles,
+        equipment_items=equipment_items,
+        travel_rates=travel_rates,
+        company_standards=company_standards,
         verticals=VERTICALS,
     )
 
@@ -371,6 +389,190 @@ def delete_user_template(template_id):
 
 
 # ---------------------------------------------------------------------------
+# Staff Roles
+# ---------------------------------------------------------------------------
+
+@app.route("/settings/add-staff-role", methods=["POST"])
+@login_required
+def add_staff_role():
+    role_name = request.form.get("role_name", "").strip()
+    category = request.form.get("category", "").strip()
+    hourly_rate = request.form.get("hourly_rate", "0")
+    overtime_rate = request.form.get("overtime_rate", "0")
+    description = request.form.get("description", "").strip()
+
+    if not role_name or not hourly_rate:
+        flash("Role name and hourly rate are required.", "error")
+        return redirect(url_for("settings"))
+
+    try:
+        hourly_rate = float(hourly_rate.replace(",", "").replace("$", ""))
+        overtime_rate = float(overtime_rate.replace(",", "").replace("$", "")) if overtime_rate else 0.0
+    except ValueError:
+        flash("Invalid rate format.", "error")
+        return redirect(url_for("settings"))
+
+    role = StaffRole(
+        user_id=current_user.id,
+        role_name=role_name,
+        category=category,
+        hourly_rate=hourly_rate,
+        overtime_rate=overtime_rate,
+        description=description,
+    )
+    db.session.add(role)
+    db.session.commit()
+    _log_activity("staff_role_add", f"Added staff role: {role_name} @ ${hourly_rate}/hr")
+    flash(f"Staff role '{role_name}' added.", "success")
+    return redirect(url_for("settings"))
+
+
+@app.route("/settings/edit-staff-role/<role_id>", methods=["POST"])
+@login_required
+def edit_staff_role(role_id):
+    role = db.session.get(StaffRole, role_id)
+    if not role or role.user_id != current_user.id:
+        abort(404)
+
+    role.role_name = request.form.get("role_name", role.role_name).strip()
+    role.category = request.form.get("category", role.category).strip()
+    role.description = request.form.get("description", role.description).strip()
+
+    try:
+        role.hourly_rate = float(request.form.get("hourly_rate", str(role.hourly_rate)).replace(",", "").replace("$", ""))
+        ot = request.form.get("overtime_rate", str(role.overtime_rate))
+        role.overtime_rate = float(ot.replace(",", "").replace("$", "")) if ot else 0.0
+    except ValueError:
+        flash("Invalid rate format.", "error")
+        return redirect(url_for("settings"))
+
+    db.session.commit()
+    _log_activity("staff_role_edit", f"Updated staff role: {role.role_name}")
+    flash(f"Staff role '{role.role_name}' updated.", "success")
+    return redirect(url_for("settings"))
+
+
+@app.route("/settings/delete-staff-role/<role_id>", methods=["POST"])
+@login_required
+def delete_staff_role(role_id):
+    role = db.session.get(StaffRole, role_id)
+    if not role or role.user_id != current_user.id:
+        abort(404)
+    name = role.role_name
+    db.session.delete(role)
+    db.session.commit()
+    _log_activity("staff_role_delete", f"Deleted staff role: {name}")
+    flash(f"Staff role '{name}' deleted.", "success")
+    return redirect(url_for("settings"))
+
+
+# ---------------------------------------------------------------------------
+# Equipment / Materials Price List
+# ---------------------------------------------------------------------------
+
+@app.route("/settings/add-equipment-item", methods=["POST"])
+@login_required
+def add_equipment_item():
+    item_name = request.form.get("item_name", "").strip()
+    category = request.form.get("eq_category", "").strip()
+    part_number = request.form.get("part_number", "").strip()
+    manufacturer = request.form.get("manufacturer", "").strip()
+    unit_cost = request.form.get("unit_cost", "0")
+    unit = request.form.get("unit", "each").strip()
+    description = request.form.get("eq_description", "").strip()
+
+    if not item_name or not unit_cost:
+        flash("Item name and unit cost are required.", "error")
+        return redirect(url_for("settings"))
+
+    try:
+        unit_cost = float(unit_cost.replace(",", "").replace("$", ""))
+    except ValueError:
+        flash("Invalid cost format.", "error")
+        return redirect(url_for("settings"))
+
+    item = EquipmentItem(
+        user_id=current_user.id,
+        item_name=item_name,
+        category=category,
+        part_number=part_number,
+        manufacturer=manufacturer,
+        unit_cost=unit_cost,
+        unit=unit,
+        description=description,
+    )
+    db.session.add(item)
+    db.session.commit()
+    _log_activity("equipment_add", f"Added equipment: {item_name} @ ${unit_cost}/{unit}")
+    flash(f"Equipment item '{item_name}' added.", "success")
+    return redirect(url_for("settings"))
+
+
+@app.route("/settings/delete-equipment-item/<item_id>", methods=["POST"])
+@login_required
+def delete_equipment_item(item_id):
+    item = db.session.get(EquipmentItem, item_id)
+    if not item or item.user_id != current_user.id:
+        abort(404)
+    name = item.item_name
+    db.session.delete(item)
+    db.session.commit()
+    _log_activity("equipment_delete", f"Deleted equipment: {name}")
+    flash(f"Equipment item '{name}' deleted.", "success")
+    return redirect(url_for("settings"))
+
+
+# ---------------------------------------------------------------------------
+# Travel & Expense Rates
+# ---------------------------------------------------------------------------
+
+@app.route("/settings/add-travel-rate", methods=["POST"])
+@login_required
+def add_travel_rate():
+    expense_type = request.form.get("expense_type", "").strip()
+    description = request.form.get("travel_description", "").strip()
+    rate = request.form.get("travel_rate", "0")
+    unit = request.form.get("travel_unit", "per day").strip()
+
+    if not expense_type or not rate:
+        flash("Expense type and rate are required.", "error")
+        return redirect(url_for("settings"))
+
+    try:
+        rate = float(rate.replace(",", "").replace("$", ""))
+    except ValueError:
+        flash("Invalid rate format.", "error")
+        return redirect(url_for("settings"))
+
+    tr = TravelExpenseRate(
+        user_id=current_user.id,
+        expense_type=expense_type,
+        description=description,
+        rate=rate,
+        unit=unit,
+    )
+    db.session.add(tr)
+    db.session.commit()
+    _log_activity("travel_rate_add", f"Added travel rate: {expense_type} @ ${rate}/{unit}")
+    flash(f"Travel rate '{expense_type}' added.", "success")
+    return redirect(url_for("settings"))
+
+
+@app.route("/settings/delete-travel-rate/<rate_id>", methods=["POST"])
+@login_required
+def delete_travel_rate(rate_id):
+    tr = db.session.get(TravelExpenseRate, rate_id)
+    if not tr or tr.user_id != current_user.id:
+        abort(404)
+    name = tr.expense_type
+    db.session.delete(tr)
+    db.session.commit()
+    _log_activity("travel_rate_delete", f"Deleted travel rate: {name}")
+    flash(f"Travel rate '{name}' deleted.", "success")
+    return redirect(url_for("settings"))
+
+
+# ---------------------------------------------------------------------------
 # Projects
 # ---------------------------------------------------------------------------
 
@@ -427,11 +629,23 @@ def project_upload(project_id):
         return redirect(url_for("project_upload", project_id=project_id))
 
     documents = ProjectDocument.query.filter_by(project_id=project_id).order_by(ProjectDocument.uploaded_at.desc()).all()
+
+    # Counts for cost estimation checkboxes
+    staff_role_count = StaffRole.query.filter_by(user_id=current_user.id, is_active=True).count()
+    equipment_count = EquipmentItem.query.filter_by(user_id=current_user.id, is_active=True).count()
+    travel_rate_count = TravelExpenseRate.query.filter_by(user_id=current_user.id, is_active=True).count()
+
     return render_template(
         "project_upload.html",
         project=project,
         documents=documents,
         verticals=VERTICALS,
+        has_staff_roles=staff_role_count > 0,
+        staff_role_count=staff_role_count,
+        has_equipment=equipment_count > 0,
+        equipment_count=equipment_count,
+        has_travel_rates=travel_rate_count > 0,
+        travel_rate_count=travel_rate_count,
     )
 
 
@@ -468,7 +682,67 @@ def project_generate(project_id):
         flash("Could not extract text from the uploaded documents.", "error")
         return redirect(url_for("project_upload", project_id=project_id))
 
-    # Load user rate sheets
+    # Read cost estimation checkbox options
+    include_staff_types = request.form.get("include_staff_types") == "1"
+    include_staff_hours = request.form.get("include_staff_hours") == "1"
+    include_equipment_bom = request.form.get("include_equipment_bom") == "1"
+    include_travel_expenses = request.form.get("include_travel_expenses") == "1"
+
+    cost_options = {
+        "include_staff_types": include_staff_types,
+        "include_staff_hours": include_staff_hours,
+        "include_equipment_bom": include_equipment_bom,
+        "include_travel_expenses": include_travel_expenses,
+    }
+
+    # Build structured rate data from DB entries
+    staff_roles_data = None
+    if include_staff_types or include_staff_hours:
+        roles = StaffRole.query.filter_by(user_id=current_user.id, is_active=True).all()
+        if roles:
+            staff_roles_data = [
+                {
+                    "role_name": r.role_name,
+                    "category": r.category,
+                    "hourly_rate": r.hourly_rate,
+                    "overtime_rate": r.overtime_rate,
+                    "description": r.description,
+                }
+                for r in roles
+            ]
+
+    equipment_data = None
+    if include_equipment_bom:
+        items = EquipmentItem.query.filter_by(user_id=current_user.id, is_active=True).all()
+        if items:
+            equipment_data = [
+                {
+                    "item_name": e.item_name,
+                    "category": e.category,
+                    "part_number": e.part_number,
+                    "manufacturer": e.manufacturer,
+                    "unit_cost": e.unit_cost,
+                    "unit": e.unit,
+                    "description": e.description,
+                }
+                for e in items
+            ]
+
+    travel_data = None
+    if include_travel_expenses:
+        rates = TravelExpenseRate.query.filter_by(user_id=current_user.id, is_active=True).all()
+        if rates:
+            travel_data = [
+                {
+                    "expense_type": t.expense_type,
+                    "rate": t.rate,
+                    "unit": t.unit,
+                    "description": t.description,
+                }
+                for t in rates
+            ]
+
+    # Load user rate sheets (Excel uploads)
     rate_sheet_data = None
     active_sheets = UserRateSheet.query.filter_by(user_id=current_user.id, is_active=True).all()
     if active_sheets:
@@ -507,6 +781,33 @@ def project_generate(project_id):
                     except Exception:
                         continue
 
+    # Load past corrections for AI learning
+    past_corrections = ProposalCorrection.query.filter_by(
+        user_id=current_user.id
+    ).order_by(ProposalCorrection.created_at.desc()).limit(10).all()
+
+    corrections_data = None
+    if past_corrections:
+        corrections_data = [
+            {
+                "vertical": c.vertical,
+                "summary": c.correction_summary,
+                "original": c.original_snippet[:500],
+                "corrected": c.corrected_snippet[:500],
+                "type": c.correction_type,
+            }
+            for c in past_corrections
+        ]
+
+    # Load company standards for auto-injection
+    standards = CompanyStandard.query.filter_by(user_id=current_user.id, is_active=True).all()
+    company_standards_data = None
+    if standards:
+        company_standards_data = [
+            {"category": s.category, "title": s.title, "content": s.content}
+            for s in standards
+        ]
+
     try:
         result = generate_proposal(
             combined_text,
@@ -516,6 +817,12 @@ def project_generate(project_id):
             company_name=current_user.company_name,
             user_api_key=current_user.api_key_encrypted or None,
             user_model=current_user.llm_model or None,
+            cost_options=cost_options,
+            staff_roles_data=staff_roles_data,
+            equipment_data=equipment_data,
+            travel_data=travel_data,
+            past_corrections=corrections_data,
+            company_standards=company_standards_data,
         )
 
         # Check if the agent has questions
@@ -561,6 +868,17 @@ def project_generate(project_id):
             pdf_file=pdf_filename,
         )
         db.session.add(proposal)
+        db.session.flush()  # Get proposal.id before commit
+
+        # Save version 1 (AI-generated original)
+        v1 = ProposalVersion(
+            proposal_id=proposal.id,
+            version_number=1,
+            markdown_content=result["proposal_markdown"],
+            edit_source="ai",
+            change_summary="AI-generated original",
+        )
+        db.session.add(v1)
         db.session.commit()
         _log_activity("proposal_generate", f"Generated {result['vertical_label']} proposal", project_id)
 
@@ -697,6 +1015,304 @@ def download(proposal_id, fmt):
         return redirect(url_for("view_proposal", proposal_id=proposal_id))
 
     return send_file(str(file_path), mimetype=mimetype, as_attachment=True, download_name=file_path.name)
+
+
+# ---------------------------------------------------------------------------
+# Proposal Editor & Version Control
+# ---------------------------------------------------------------------------
+
+@app.route("/proposal/<proposal_id>/edit", methods=["GET", "POST"])
+@login_required
+def edit_proposal(proposal_id):
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not project or (project.user_id != current_user.id and not current_user.is_admin):
+        abort(404)
+
+    if request.method == "POST":
+        new_content = request.form.get("markdown_content", "")
+        change_summary = request.form.get("change_summary", "").strip() or "Manual edit"
+
+        # Get current version number
+        latest = ProposalVersion.query.filter_by(proposal_id=proposal_id).order_by(
+            ProposalVersion.version_number.desc()
+        ).first()
+        next_version = (latest.version_number + 1) if latest else 1
+
+        # Save new version
+        version = ProposalVersion(
+            proposal_id=proposal_id,
+            version_number=next_version,
+            markdown_content=new_content,
+            edit_source="human_web",
+            editor_id=current_user.id,
+            change_summary=change_summary,
+        )
+        db.session.add(version)
+
+        # Update the markdown file on disk
+        md_path = GENERATED_DIR / proposal.md_file
+        md_path.write_text(new_content, encoding="utf-8")
+
+        # Regenerate DOCX from new content
+        if proposal.docx_file:
+            docx_path = GENERATED_DIR / proposal.docx_file
+            markdown_to_docx(new_content, str(docx_path))
+
+        # Update action items count
+        action_items = re.findall(r"\[ACTION REQUIRED:\s*(.+?)\]", new_content)
+        proposal.action_items_count = len(action_items)
+
+        db.session.commit()
+        _log_activity("proposal_edit", f"Edited proposal v{next_version}: {change_summary}", project.id)
+        flash(f"Proposal saved as version {next_version}.", "success")
+        return redirect(url_for("edit_proposal", proposal_id=proposal_id))
+
+    # Load current content
+    md_path = GENERATED_DIR / proposal.md_file
+    current_content = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+
+    # Load version history
+    versions = ProposalVersion.query.filter_by(proposal_id=proposal_id).order_by(
+        ProposalVersion.version_number.desc()
+    ).all()
+
+    return render_template(
+        "proposal_edit.html",
+        proposal=proposal,
+        project=project,
+        current_content=current_content,
+        versions=versions,
+    )
+
+
+@app.route("/proposal/<proposal_id>/version/<version_id>")
+@login_required
+def view_version(proposal_id, version_id):
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not project or (project.user_id != current_user.id and not current_user.is_admin):
+        abort(404)
+
+    version = db.session.get(ProposalVersion, version_id)
+    if not version or version.proposal_id != proposal_id:
+        abort(404)
+
+    proposal_html = md.markdown(version.markdown_content, extensions=["tables", "fenced_code"])
+
+    return render_template(
+        "proposal_version.html",
+        proposal=proposal,
+        project=project,
+        version=version,
+        proposal_html=proposal_html,
+    )
+
+
+@app.route("/proposal/<proposal_id>/restore/<version_id>", methods=["POST"])
+@login_required
+def restore_version(proposal_id, version_id):
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not project or (project.user_id != current_user.id and not current_user.is_admin):
+        abort(404)
+
+    version = db.session.get(ProposalVersion, version_id)
+    if not version or version.proposal_id != proposal_id:
+        abort(404)
+
+    # Get next version number
+    latest = ProposalVersion.query.filter_by(proposal_id=proposal_id).order_by(
+        ProposalVersion.version_number.desc()
+    ).first()
+    next_version = (latest.version_number + 1) if latest else 1
+
+    # Create new version from restored content
+    restored = ProposalVersion(
+        proposal_id=proposal_id,
+        version_number=next_version,
+        markdown_content=version.markdown_content,
+        edit_source="human_web",
+        editor_id=current_user.id,
+        change_summary=f"Restored from version {version.version_number}",
+    )
+    db.session.add(restored)
+
+    # Update file on disk
+    md_path = GENERATED_DIR / proposal.md_file
+    md_path.write_text(version.markdown_content, encoding="utf-8")
+
+    if proposal.docx_file:
+        docx_path = GENERATED_DIR / proposal.docx_file
+        markdown_to_docx(version.markdown_content, str(docx_path))
+
+    db.session.commit()
+    _log_activity("proposal_restore", f"Restored proposal to v{version.version_number}", project.id)
+    flash(f"Restored to version {version.version_number} (saved as v{next_version}).", "success")
+    return redirect(url_for("edit_proposal", proposal_id=proposal_id))
+
+
+@app.route("/proposal/<proposal_id>/redline")
+@login_required
+def download_redline(proposal_id):
+    """Download a DOCX with tracked changes comparing AI original to current version."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not project or (project.user_id != current_user.id and not current_user.is_admin):
+        abort(404)
+
+    # Get the AI original (v1) and latest version
+    v1 = ProposalVersion.query.filter_by(proposal_id=proposal_id, version_number=1).first()
+    latest = ProposalVersion.query.filter_by(proposal_id=proposal_id).order_by(
+        ProposalVersion.version_number.desc()
+    ).first()
+
+    if not v1 or not latest or v1.id == latest.id:
+        flash("No changes to compare — only one version exists.", "error")
+        return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
+    # Compare two specific versions if requested via query params
+    compare_from = request.args.get("from")
+    compare_to = request.args.get("to")
+    if compare_from and compare_to:
+        v_from = db.session.get(ProposalVersion, compare_from)
+        v_to = db.session.get(ProposalVersion, compare_to)
+        if v_from and v_to and v_from.proposal_id == proposal_id and v_to.proposal_id == proposal_id:
+            v1 = v_from
+            latest = v_to
+
+    redline_filename = f"redline_{proposal.job_id}_v{v1.version_number}_to_v{latest.version_number}.docx"
+    redline_path = GENERATED_DIR / redline_filename
+
+    author = current_user.display_name or current_user.username
+    markdown_to_redline_docx(v1.markdown_content, latest.markdown_content, str(redline_path), author=author)
+
+    return send_file(
+        str(redline_path),
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        as_attachment=True,
+        download_name=redline_filename,
+    )
+
+
+@app.route("/proposal/<proposal_id>/finalize", methods=["POST"])
+@login_required
+def finalize_proposal(proposal_id):
+    """Mark proposal as finalized and capture AI learning corrections."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not project or (project.user_id != current_user.id and not current_user.is_admin):
+        abort(404)
+
+    # Get AI original (v1) and latest human version
+    v1 = ProposalVersion.query.filter_by(proposal_id=proposal_id, version_number=1).first()
+    latest = ProposalVersion.query.filter_by(proposal_id=proposal_id).order_by(
+        ProposalVersion.version_number.desc()
+    ).first()
+
+    if v1 and latest and v1.id != latest.id:
+        # Generate correction summary from diff
+        import difflib
+        orig_lines = v1.markdown_content.splitlines()
+        new_lines = latest.markdown_content.splitlines()
+        diff = list(difflib.unified_diff(orig_lines, new_lines, lineterm=""))
+
+        if diff:
+            # Build a human-readable correction summary
+            added = [l[1:] for l in diff if l.startswith("+") and not l.startswith("+++")]
+            removed = [l[1:] for l in diff if l.startswith("-") and not l.startswith("---")]
+
+            summary_parts = []
+            if removed:
+                summary_parts.append(f"Removed/changed {len(removed)} line(s)")
+            if added:
+                summary_parts.append(f"Added/modified {len(added)} line(s)")
+
+            # Store up to 3000 chars of original and corrected snippets for context
+            correction = ProposalCorrection(
+                user_id=current_user.id,
+                proposal_id=proposal_id,
+                vertical=proposal.vertical,
+                correction_summary="; ".join(summary_parts),
+                original_snippet="\n".join(removed[:50])[:3000],
+                corrected_snippet="\n".join(added[:50])[:3000],
+                correction_type="general",
+            )
+            db.session.add(correction)
+
+    db.session.commit()
+    _log_activity("proposal_finalize", f"Finalized proposal with corrections", project.id)
+    flash("Proposal finalized. AI will learn from your edits for future proposals.", "success")
+    return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
+
+# ---------------------------------------------------------------------------
+# Company Standards & Posture Library
+# ---------------------------------------------------------------------------
+
+@app.route("/settings/add-company-standard", methods=["POST"])
+@login_required
+def add_company_standard():
+    category = request.form.get("standard_category", "").strip()
+    title = request.form.get("standard_title", "").strip()
+    content = request.form.get("standard_content", "").strip()
+
+    if not category or not title or not content:
+        flash("Category, title, and content are all required.", "error")
+        return redirect(url_for("settings"))
+
+    standard = CompanyStandard(
+        user_id=current_user.id,
+        category=category,
+        title=title,
+        content=content,
+    )
+    db.session.add(standard)
+    db.session.commit()
+    _log_activity("company_standard_add", f"Added standard: {title}")
+    flash(f"Company standard '{title}' added.", "success")
+    return redirect(url_for("settings"))
+
+
+@app.route("/settings/edit-company-standard/<standard_id>", methods=["POST"])
+@login_required
+def edit_company_standard(standard_id):
+    std = db.session.get(CompanyStandard, standard_id)
+    if not std or std.user_id != current_user.id:
+        abort(404)
+
+    std.category = request.form.get("standard_category", std.category).strip()
+    std.title = request.form.get("standard_title", std.title).strip()
+    std.content = request.form.get("standard_content", std.content).strip()
+
+    db.session.commit()
+    _log_activity("company_standard_edit", f"Updated standard: {std.title}")
+    flash(f"Standard '{std.title}' updated.", "success")
+    return redirect(url_for("settings"))
+
+
+@app.route("/settings/delete-company-standard/<standard_id>", methods=["POST"])
+@login_required
+def delete_company_standard(standard_id):
+    std = db.session.get(CompanyStandard, standard_id)
+    if not std or std.user_id != current_user.id:
+        abort(404)
+    title = std.title
+    db.session.delete(std)
+    db.session.commit()
+    _log_activity("company_standard_delete", f"Deleted standard: {title}")
+    flash(f"Standard '{title}' deleted.", "success")
+    return redirect(url_for("settings"))
 
 
 # ---------------------------------------------------------------------------

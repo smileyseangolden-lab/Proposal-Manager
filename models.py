@@ -152,6 +152,116 @@ class UserVerticalTemplate(db.Model):
     user = db.relationship("User", backref="vertical_templates")
 
 
+class StaffRole(db.Model):
+    """Staff role types with hourly sell rates for proposal cost estimation."""
+    __tablename__ = "staff_roles"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    role_name = db.Column(db.String(200), nullable=False)
+    category = db.Column(db.String(100), default="")  # e.g., Engineering, Management, Admin
+    hourly_rate = db.Column(db.Float, nullable=False)
+    overtime_rate = db.Column(db.Float, default=0.0)
+    currency = db.Column(db.String(10), default="USD")
+    description = db.Column(db.Text, default="")
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=_utcnow)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow)
+
+    user = db.relationship("User", backref="staff_roles")
+
+
+class EquipmentItem(db.Model):
+    """Equipment and materials price list for BOM estimation."""
+    __tablename__ = "equipment_items"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    item_name = db.Column(db.String(300), nullable=False)
+    category = db.Column(db.String(100), default="")  # e.g., Electrical, Mechanical, Software
+    part_number = db.Column(db.String(100), default="")
+    manufacturer = db.Column(db.String(200), default="")
+    unit_cost = db.Column(db.Float, nullable=False)
+    unit = db.Column(db.String(50), default="each")  # each, ft, m, lot, etc.
+    currency = db.Column(db.String(10), default="USD")
+    description = db.Column(db.Text, default="")
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=_utcnow)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow)
+
+    user = db.relationship("User", backref="equipment_items")
+
+
+class TravelExpenseRate(db.Model):
+    """Travel and expense rates for cost estimation."""
+    __tablename__ = "travel_expense_rates"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    expense_type = db.Column(db.String(100), nullable=False)  # airfare, hotel, per_diem, mileage, rental_car, other
+    description = db.Column(db.String(300), default="")
+    rate = db.Column(db.Float, nullable=False)
+    unit = db.Column(db.String(50), default="per day")  # per day, per mile, per trip, per night, etc.
+    currency = db.Column(db.String(10), default="USD")
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=_utcnow)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow)
+
+    user = db.relationship("User", backref="travel_expense_rates")
+
+
+class CompanyStandard(db.Model):
+    """Company standards, posture, boilerplate content for auto-injection into proposals."""
+    __tablename__ = "company_standards"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    category = db.Column(db.String(100), nullable=False)  # mission, certifications, past_performance, terms, safety, quality, etc.
+    title = db.Column(db.String(300), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=_utcnow)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow)
+
+    user = db.relationship("User", backref="company_standards")
+
+
+class ProposalCorrection(db.Model):
+    """Stores AI-vs-human edit patterns for learning. Generated when a human-edited
+    version is finalized, comparing it to the original AI output."""
+    __tablename__ = "proposal_corrections"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    proposal_id = db.Column(db.String(32), db.ForeignKey("proposals.id"), nullable=False)
+    vertical = db.Column(db.String(50), default="general")
+    correction_summary = db.Column(db.Text, nullable=False)  # Natural language summary of changes
+    original_snippet = db.Column(db.Text, default="")
+    corrected_snippet = db.Column(db.Text, default="")
+    correction_type = db.Column(db.String(50), default="general")  # tone, structure, pricing, scope, compliance, etc.
+    created_at = db.Column(db.DateTime, default=_utcnow)
+
+    user = db.relationship("User", backref="proposal_corrections")
+    proposal = db.relationship("Proposal", backref="corrections")
+
+
+class ProposalVersion(db.Model):
+    """Version history for proposal edits. Each save creates a new version."""
+    __tablename__ = "proposal_versions"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    proposal_id = db.Column(db.String(32), db.ForeignKey("proposals.id"), nullable=False)
+    version_number = db.Column(db.Integer, nullable=False, default=1)
+    markdown_content = db.Column(db.Text, nullable=False)
+    edit_source = db.Column(db.String(20), default="ai")  # ai, human, human_web, human_import
+    editor_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    change_summary = db.Column(db.Text, default="")
+    created_at = db.Column(db.DateTime, default=_utcnow)
+
+    proposal = db.relationship("Proposal", backref="versions")
+    editor = db.relationship("User")
+
+
 class ActivityLog(db.Model):
     """Track all user activity for admin reporting."""
     __tablename__ = "activity_logs"

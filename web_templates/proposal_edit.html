@@ -1,0 +1,206 @@
+{% extends "base.html" %}
+
+{% block title %}Edit Proposal &mdash; {{ project.name }}{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <div class="page-header-row">
+        <div>
+            <h1>Edit Proposal</h1>
+            <p class="page-subtitle">{{ project.name }} &mdash; {{ proposal.vertical_label }}</p>
+        </div>
+        <div class="header-actions">
+            <a href="{{ url_for('view_proposal', proposal_id=proposal.id) }}" class="btn btn-small btn-secondary">View Rendered</a>
+            <a href="{{ url_for('download', proposal_id=proposal.id, fmt='docx') }}" class="btn btn-small btn-secondary">Download DOCX</a>
+            <a href="{{ url_for('download_redline', proposal_id=proposal.id) }}" class="btn btn-small btn-secondary">Download Redline</a>
+        </div>
+    </div>
+</section>
+
+<div class="editor-layout">
+    <!-- Editor pane -->
+    <div class="card editor-card">
+        <form method="post" action="{{ url_for('edit_proposal', proposal_id=proposal.id) }}" id="editor-form">
+            <div class="editor-toolbar">
+                <div class="toolbar-left">
+                    <button type="button" class="btn btn-small btn-secondary" id="btn-preview" onclick="togglePreview()">Preview</button>
+                    <button type="button" class="btn btn-small btn-secondary" onclick="insertBold()">B</button>
+                    <button type="button" class="btn btn-small btn-secondary" onclick="insertItalic()">I</button>
+                    <button type="button" class="btn btn-small btn-secondary" onclick="insertHeading()">H2</button>
+                    <button type="button" class="btn btn-small btn-secondary" onclick="insertTable()">Table</button>
+                    <button type="button" class="btn btn-small btn-secondary" onclick="insertActionItem()">Action Item</button>
+                </div>
+                <div class="toolbar-right">
+                    <span class="editor-status" id="editor-status">Ready</span>
+                </div>
+            </div>
+
+            <div id="editor-container">
+                <textarea name="markdown_content" id="markdown-editor" spellcheck="true">{{ current_content }}</textarea>
+            </div>
+
+            <div id="preview-container" style="display:none;">
+                <div class="proposal-body" id="preview-body"></div>
+            </div>
+
+            <div class="editor-footer">
+                <div class="form-group" style="flex:1;margin-bottom:0;">
+                    <input type="text" name="change_summary" placeholder="Describe your changes (e.g., Updated pricing section, Fixed scope description)" class="change-summary-input">
+                </div>
+                <button type="submit" class="btn btn-primary">Save Version</button>
+            </div>
+        </form>
+    </div>
+
+    <!-- Version history sidebar -->
+    <div class="card version-sidebar">
+        <h2>Version History</h2>
+        {% if versions %}
+        <div class="version-list">
+            {% for v in versions %}
+            <div class="version-item {{ 'version-current' if loop.first }}">
+                <div class="version-header">
+                    <span class="version-number">v{{ v.version_number }}</span>
+                    <span class="version-source badge badge-{{ 'status-active' if v.edit_source == 'ai' else 'status-submitted' }}">
+                        {{ 'AI' if v.edit_source == 'ai' else 'Human' }}
+                    </span>
+                </div>
+                <p class="version-summary">{{ v.change_summary or 'No description' }}</p>
+                <p class="version-date">{{ v.created_at.strftime('%Y-%m-%d %H:%M') }}</p>
+                {% if v.editor %}
+                <p class="version-editor">by {{ v.editor.display_name or v.editor.username }}</p>
+                {% endif %}
+                <div class="version-actions">
+                    <a href="{{ url_for('view_version', proposal_id=proposal.id, version_id=v.id) }}" class="btn btn-small btn-secondary">View</a>
+                    {% if not loop.first %}
+                    <form method="post" action="{{ url_for('restore_version', proposal_id=proposal.id, version_id=v.id) }}" class="inline-form">
+                        <button type="submit" class="btn btn-small btn-secondary" onclick="return confirm('Restore this version? A new version will be created.')">Restore</button>
+                    </form>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        {% else %}
+        <p class="empty-hint">No version history yet.</p>
+        {% endif %}
+
+        {% if versions|length > 1 %}
+        <div style="margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--gray-200);">
+            <form method="post" action="{{ url_for('finalize_proposal', proposal_id=proposal.id) }}">
+                <button type="submit" class="btn btn-primary btn-small" style="width:100%;" onclick="return confirm('Finalize this proposal? The AI will learn from your edits to improve future proposals.')">Finalize & Teach AI</button>
+            </form>
+            <p style="font-size:11px; color:var(--gray-500); margin-top:6px; text-align:center;">Captures your edits so the AI generates better proposals next time.</p>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+    var editor = document.getElementById("markdown-editor");
+    var editorContainer = document.getElementById("editor-container");
+    var previewContainer = document.getElementById("preview-container");
+    var previewBody = document.getElementById("preview-body");
+    var btnPreview = document.getElementById("btn-preview");
+    var status = document.getElementById("editor-status");
+    var form = document.getElementById("editor-form");
+    var showingPreview = false;
+
+    // Auto-resize textarea
+    function autoResize() {
+        editor.style.height = "auto";
+        editor.style.height = Math.max(500, editor.scrollHeight) + "px";
+    }
+    editor.addEventListener("input", autoResize);
+    autoResize();
+
+    // Track unsaved changes
+    var originalContent = editor.value;
+    editor.addEventListener("input", function() {
+        if (editor.value !== originalContent) {
+            status.textContent = "Unsaved changes";
+            status.style.color = "#d97706";
+        } else {
+            status.textContent = "Ready";
+            status.style.color = "";
+        }
+    });
+
+    form.addEventListener("submit", function() {
+        status.textContent = "Saving...";
+        originalContent = editor.value;
+    });
+
+    // Preview toggle
+    window.togglePreview = function() {
+        showingPreview = !showingPreview;
+        if (showingPreview) {
+            // Simple markdown to HTML (basic conversion for preview)
+            var html = editor.value
+                .replace(/^### (.+)$/gm, "<h3>$1</h3>")
+                .replace(/^## (.+)$/gm, "<h2>$1</h2>")
+                .replace(/^# (.+)$/gm, "<h1>$1</h1>")
+                .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+                .replace(/\*(.+?)\*/g, "<em>$1</em>")
+                .replace(/\n\n/g, "</p><p>")
+                .replace(/\n/g, "<br>");
+            previewBody.innerHTML = "<p>" + html + "</p>";
+            editorContainer.style.display = "none";
+            previewContainer.style.display = "block";
+            btnPreview.textContent = "Edit";
+        } else {
+            editorContainer.style.display = "block";
+            previewContainer.style.display = "none";
+            btnPreview.textContent = "Preview";
+        }
+    };
+
+    // Toolbar helpers
+    window.insertBold = function() {
+        insertAround("**", "**", "bold text");
+    };
+    window.insertItalic = function() {
+        insertAround("*", "*", "italic text");
+    };
+    window.insertHeading = function() {
+        insertAtCursor("\n## Heading\n");
+    };
+    window.insertTable = function() {
+        insertAtCursor("\n| Column 1 | Column 2 | Column 3 |\n|----------|----------|----------|\n| Data | Data | Data |\n");
+    };
+    window.insertActionItem = function() {
+        insertAtCursor("[ACTION REQUIRED: description]");
+    };
+
+    function insertAround(before, after, placeholder) {
+        var start = editor.selectionStart;
+        var end = editor.selectionEnd;
+        var selected = editor.value.substring(start, end) || placeholder;
+        editor.value = editor.value.substring(0, start) + before + selected + after + editor.value.substring(end);
+        editor.focus();
+        editor.selectionStart = start + before.length;
+        editor.selectionEnd = start + before.length + selected.length;
+        editor.dispatchEvent(new Event("input"));
+    }
+
+    function insertAtCursor(text) {
+        var start = editor.selectionStart;
+        editor.value = editor.value.substring(0, start) + text + editor.value.substring(editor.selectionEnd);
+        editor.focus();
+        editor.selectionStart = editor.selectionEnd = start + text.length;
+        editor.dispatchEvent(new Event("input"));
+    }
+
+    // Warn on leaving with unsaved changes
+    window.addEventListener("beforeunload", function(e) {
+        if (editor.value !== originalContent) {
+            e.preventDefault();
+            e.returnValue = "";
+        }
+    });
+})();
+</script>
+{% endblock %}

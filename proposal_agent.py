@@ -38,7 +38,13 @@ def _build_system_prompt(vertical_key: str, vertical_resources: dict,
                          global_references: dict[str, list[str]],
                          rate_sheet_text: str = "",
                          user_template_text: str = "",
-                         company_name: str = "") -> str:
+                         company_name: str = "",
+                         cost_options: dict = None,
+                         staff_roles_data: list = None,
+                         equipment_data: list = None,
+                         travel_data: list = None,
+                         past_corrections: list = None,
+                         company_standards: list = None) -> str:
     """Assemble the system prompt with all context."""
 
     vertical_label = VERTICALS.get(vertical_key, {}).get("label", "General")
@@ -98,6 +104,144 @@ for a specific role or product, use an `[ACTION REQUIRED]` placeholder.
 ```
 """
 
+    # Build cost estimation instructions
+    cost_estimation_block = ""
+    if cost_options:
+        sections = []
+
+        if cost_options.get("include_staff_types") and staff_roles_data:
+            roles_table = "| Role | Category | Hourly Rate | OT Rate | Description |\n|------|----------|-------------|---------|-------------|\n"
+            for r in staff_roles_data:
+                ot = f"${r['overtime_rate']:.2f}" if r['overtime_rate'] else "N/A"
+                desc = r['description'] or ''
+                roles_table += f"| {r['role_name']} | {r['category']} | ${r['hourly_rate']:.2f} | {ot} | {desc} |\n"
+            sections.append(f"""
+### Staff Type Estimation (REQUESTED)
+The user has requested that you estimate what types of staff are needed for this project.
+Using the RFP/RFQ requirements, identify which of the following staff roles would be needed:
+
+{roles_table}
+
+Include a **Staffing Plan** section in the proposal with a table showing:
+- Recommended staff roles from the list above
+- Quantity of each role needed
+- Justification for why each role is needed based on the RFP scope
+""")
+
+        if cost_options.get("include_staff_hours") and staff_roles_data:
+            sections.append("""
+### Staff Hours Estimation (REQUESTED)
+The user has requested a detailed staff hours breakdown. For each recommended staff role,
+estimate the number of hours needed based on the project scope in the RFP/RFQ.
+
+Include a **Labor Cost Estimate** table with:
+| Role | Qty | Hours per Person | Total Hours | Hourly Rate | Total Cost |
+
+Calculate subtotals per role and a grand total for labor.
+Use the hourly rates from the staff roles table above — do NOT fabricate rates.
+If overtime is expected, include a separate OT line using the OT rate.
+""")
+
+        if cost_options.get("include_equipment_bom") and equipment_data:
+            equip_table = "| Item | Category | Part # | Manufacturer | Unit Cost | Unit |\n|------|----------|--------|-------------|-----------|------|\n"
+            for e in equipment_data:
+                equip_table += f"| {e['item_name']} | {e['category']} | {e['part_number'] or 'N/A'} | {e['manufacturer'] or 'N/A'} | ${e['unit_cost']:.2f} | {e['unit']} |\n"
+            sections.append(f"""
+### Equipment / Bill of Materials Estimation (REQUESTED)
+The user has requested an equipment and materials estimate. Using the RFP/RFQ scope,
+identify which items from the user's price list would be needed:
+
+{equip_table}
+
+Include a **Bill of Materials / Equipment Estimate** table with:
+| Item | Part # | Qty | Unit Cost | Total Cost |
+
+Only include items that are relevant to the RFP scope. If additional items are needed
+that are NOT in the user's price list, add them with `[ACTION REQUIRED: pricing needed]`.
+Calculate subtotals by category and a grand total.
+""")
+
+        if cost_options.get("include_travel_expenses") and travel_data:
+            travel_table = "| Expense Type | Rate | Unit | Description |\n|-------------|------|------|-------------|\n"
+            for t in travel_data:
+                travel_table += f"| {t['expense_type']} | ${t['rate']:.2f} | {t['unit']} | {t['description'] or ''} |\n"
+            sections.append(f"""
+### Travel & Expense Estimation (REQUESTED)
+The user has requested a travel and expense estimate. Based on the project scope,
+location, and duration inferred from the RFP/RFQ, estimate travel costs using these rates:
+
+{travel_table}
+
+Include a **Travel & Expenses Estimate** table with:
+| Expense Type | Rate | Qty/Duration | Total Cost |
+
+Consider: number of trips, number of personnel traveling, project duration,
+and site location when estimating quantities. Calculate a grand total.
+""")
+
+        if sections:
+            cost_estimation_block = f"""
+## Cost Estimation Instructions
+
+The user has selected the following cost estimation options. You MUST include these
+sections in the proposal. Use the user's actual rates — do NOT fabricate pricing.
+
+{"".join(sections)}
+
+### Cost Summary
+After the individual cost sections, include a **Total Project Cost Summary** table:
+| Category | Estimated Cost |
+|----------|---------------|
+| Labor | $X |
+| Equipment/Materials | $X |
+| Travel & Expenses | $X |
+| **Total Estimated Cost** | **$X** |
+
+Only include categories that were requested above.
+"""
+
+    # Build company standards block
+    standards_block = ""
+    if company_standards:
+        standards_items = []
+        for s in company_standards:
+            standards_items.append(f"### {s['category']}: {s['title']}\n{s['content']}")
+        joined_standards = "\n\n".join(standards_items)
+        standards_block = f"""
+## Company Standards & Posture
+
+The following are the company's standard boilerplate content, certifications,
+past performance narratives, and other reusable sections. You MUST incorporate
+relevant standards into the proposal where appropriate. Use the exact content
+provided — do not paraphrase certifications or modify factual claims.
+
+{joined_standards}
+"""
+
+    # Build AI learning block from past corrections
+    learning_block = ""
+    if past_corrections:
+        correction_items = []
+        for c in past_corrections:
+            item = f"- **{c['type'].title()}**: {c['summary']}"
+            if c.get('original') and c.get('corrected'):
+                item += f"\n  - AI wrote: \"{c['original'][:200]}...\""
+                item += f"\n  - Human changed to: \"{c['corrected'][:200]}...\""
+            correction_items.append(item)
+        joined_corrections = "\n".join(correction_items)
+        learning_block = f"""
+## Learning from Past Corrections
+
+The user has previously reviewed and edited AI-generated proposals. Below are
+patterns from those corrections. LEARN from these and adjust your output
+accordingly to match the user's preferences and style:
+
+{joined_corrections}
+
+Apply these lessons: match the user's preferred tone, detail level, structure,
+and content choices. Avoid repeating the same mistakes identified above.
+"""
+
     return f"""You are the Proposal Manager Agent — an expert proposal writer that generates
 professional proposals in response to customer RFP (Request for Proposal) and
 RFQ (Request for Quotation) documents.
@@ -124,6 +268,12 @@ Follow this workflow precisely when generating proposals:
 {ref_block}
 
 {rate_block}
+
+{cost_estimation_block}
+
+{standards_block}
+
+{learning_block}
 
 ## Interactive Clarification
 
@@ -170,7 +320,13 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
                       user_api_key: str = None,
                       user_model: str = None,
                       answered_questions: list = None,
-                      progress_callback=None) -> dict:
+                      progress_callback=None,
+                      cost_options: dict = None,
+                      staff_roles_data: list = None,
+                      equipment_data: list = None,
+                      travel_data: list = None,
+                      past_corrections: list = None,
+                      company_standards: list = None) -> dict:
     """Generate a proposal from the given RFP/RFQ text.
 
     Args:
@@ -183,6 +339,12 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
         user_model: User's selected model (overrides global).
         answered_questions: Previously answered Q&A pairs.
         progress_callback: Optional callable(phase, message).
+        cost_options: Dict of booleans for which cost sections to include.
+        staff_roles_data: List of staff role dicts from user's settings.
+        equipment_data: List of equipment item dicts from user's settings.
+        travel_data: List of travel expense rate dicts from user's settings.
+        past_corrections: List of correction dicts from past human edits.
+        company_standards: List of company standard dicts for auto-injection.
 
     Returns:
         dict with proposal_markdown, action_items, confidence_score,
@@ -233,6 +395,12 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
         rate_sheet_text=rate_sheet_text,
         user_template_text=user_template_text,
         company_name=company_name,
+        cost_options=cost_options,
+        staff_roles_data=staff_roles_data,
+        equipment_data=equipment_data,
+        travel_data=travel_data,
+        past_corrections=past_corrections,
+        company_standards=company_standards,
     )
 
     _report("analysis", f"Generating {vertical_label} proposal...")
