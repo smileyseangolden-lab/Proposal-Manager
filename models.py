@@ -37,6 +37,13 @@ class User(UserMixin, db.Model):
     llm_model = db.Column(db.String(100), default="claude-opus-4-6")
     api_key_encrypted = db.Column(db.Text, default="")
 
+    # Company logo / branding
+    company_logo_path = db.Column(db.String(1000), default="")
+    company_logo_original_name = db.Column(db.String(500), default="")
+    company_logo_use_in_proposals = db.Column(db.Boolean, default=True)
+    company_logo_placement = db.Column(db.String(20), default="top_left")  # top_left, center
+    company_logo_show_on_cover = db.Column(db.Boolean, default=True)
+
     # Relationships
     projects = db.relationship("Project", backref="owner", lazy="dynamic", foreign_keys="Project.user_id")
     activity_logs = db.relationship("ActivityLog", backref="user", lazy="dynamic")

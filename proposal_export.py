@@ -12,12 +12,25 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
 
-def markdown_to_docx(markdown_text: str, output_path: str) -> str:
+def markdown_to_docx(
+    markdown_text: str,
+    output_path: str,
+    logo_path: str | None = None,
+    logo_placement: str = "top_left",
+    logo_on_cover: bool = False,
+    company_name: str = "",
+    font_name: str = "Calibri",
+) -> str:
     """Convert a Markdown proposal to a formatted DOCX file.
 
     Args:
         markdown_text: The proposal in Markdown format.
         output_path: File path for the output DOCX.
+        logo_path: Optional path to a company logo image to embed.
+        logo_placement: "top_left" or "center" — where to put the logo.
+        logo_on_cover: If True, add a dedicated cover page before the body.
+        company_name: Company name displayed on the cover page (if enabled).
+        font_name: Default body font to use.
 
     Returns:
         The output file path.
@@ -34,8 +47,16 @@ def markdown_to_docx(markdown_text: str, output_path: str) -> str:
     # Default font
     style = doc.styles["Normal"]
     font = style.font
-    font.name = "Calibri"
+    font.name = font_name or "Calibri"
     font.size = Pt(11)
+
+    # Embed company logo
+    logo_exists = bool(logo_path) and Path(logo_path).exists()
+    if logo_exists:
+        if logo_on_cover:
+            _add_cover_page(doc, logo_path, logo_placement, company_name)
+        else:
+            _add_inline_logo(doc, logo_path, logo_placement)
 
     lines = markdown_text.split("\n")
     i = 0
@@ -140,6 +161,61 @@ def _add_formatted_text(paragraph, text: str):
             run.italic = True
         else:
             paragraph.add_run(part)
+
+
+def _logo_width_for_placement(placement: str) -> Inches:
+    """Return an appropriate rendered width based on placement."""
+    if placement == "center":
+        return Inches(3.0)
+    return Inches(1.75)  # top_left — letterhead size
+
+
+def _add_inline_logo(doc, logo_path: str, placement: str):
+    """Add the logo at the very top of the document (before any content)."""
+    p = doc.add_paragraph()
+    if placement == "center":
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    else:
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    run = p.add_run()
+    try:
+        run.add_picture(str(logo_path), width=_logo_width_for_placement(placement))
+    except Exception:
+        # If the image can't be embedded, silently fall through — don't break export
+        pass
+
+
+def _add_cover_page(doc, logo_path: str, placement: str, company_name: str = ""):
+    """Add a dedicated cover page with the logo, followed by a page break."""
+    # Spacer paragraphs to vertically push logo off the top edge
+    for _ in range(3):
+        doc.add_paragraph()
+
+    p = doc.add_paragraph()
+    if placement == "center":
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    else:
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+    run = p.add_run()
+    try:
+        # Larger logo on dedicated cover pages
+        width = Inches(4.0) if placement == "center" else Inches(2.5)
+        run.add_picture(str(logo_path), width=width)
+    except Exception:
+        pass
+
+    if company_name:
+        p2 = doc.add_paragraph()
+        if placement == "center":
+            p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        cn_run = p2.add_run(company_name)
+        cn_run.font.size = Pt(16)
+        cn_run.bold = True
+
+    # Add a page break so the proposal body starts on a new page
+    doc.add_page_break()
 
 
 def markdown_to_redline_docx(original_md: str, revised_md: str, output_path: str,

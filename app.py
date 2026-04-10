@@ -37,6 +37,7 @@ from flask_login import (
     login_user,
     logout_user,
 )
+from PIL import Image
 from werkzeug.utils import secure_filename
 
 from config.settings import (
@@ -131,6 +132,9 @@ login_manager.login_message_category = "error"
 
 RATE_SHEET_EXTENSIONS = {"xlsx", "xls"}
 TEMPLATE_EXTENSIONS = {"pdf", "docx", "doc"}
+LOGO_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "gif", "bmp"}
+LOGO_MAX_DIMENSION = 600  # px — resize so the longest side is at most this
+LOGO_PNG_OPTIMIZE = True
 
 
 @app.context_processor
@@ -219,6 +223,19 @@ with app.app_context():
                 # Backfill: set existing admins to admin role
                 _cur.execute('UPDATE users SET role = "admin" WHERE is_admin = 1')
                 _conn.commit()
+
+            # Migrate users table to add company logo columns if missing
+            _user_logo_migrations = [
+                ("company_logo_path", 'ALTER TABLE users ADD COLUMN company_logo_path VARCHAR(1000) DEFAULT ""'),
+                ("company_logo_original_name", 'ALTER TABLE users ADD COLUMN company_logo_original_name VARCHAR(500) DEFAULT ""'),
+                ("company_logo_use_in_proposals", "ALTER TABLE users ADD COLUMN company_logo_use_in_proposals BOOLEAN DEFAULT 1"),
+                ("company_logo_placement", 'ALTER TABLE users ADD COLUMN company_logo_placement VARCHAR(20) DEFAULT "top_left"'),
+                ("company_logo_show_on_cover", "ALTER TABLE users ADD COLUMN company_logo_show_on_cover BOOLEAN DEFAULT 1"),
+            ]
+            for _col, _sql in _user_logo_migrations:
+                if _col not in _user_cols:
+                    _cur.execute(_sql)
+            _conn.commit()
 
             # Migrate proposals table for Part 3 review lifecycle
             _cur.execute("PRAGMA table_info(proposals)")
@@ -315,6 +332,69 @@ def _save_upload(file, subdir: str = "") -> tuple[str, str, int]:
     file.save(str(dest))
     size = dest.stat().st_size
     return safe, str(dest), size
+
+
+def _logo_docx_kwargs(user, company_name_override: str = "") -> dict:
+    """Build the logo-related kwargs passed into markdown_to_docx so they
+    respect the user's branding preferences."""
+    if not getattr(user, "company_logo_path", None):
+        return {"font_name": user.font_preference or "Calibri"}
+    if not getattr(user, "company_logo_use_in_proposals", False):
+        return {"font_name": user.font_preference or "Calibri"}
+    logo_path = user.company_logo_path
+    if not Path(logo_path).exists():
+        return {"font_name": user.font_preference or "Calibri"}
+    return {
+        "logo_path": logo_path,
+        "logo_placement": user.company_logo_placement or "top_left",
+        "logo_on_cover": bool(getattr(user, "company_logo_show_on_cover", False)),
+        "company_name": company_name_override or (user.company_name or ""),
+        "font_name": user.font_preference or "Calibri",
+    }
+
+
+def _process_and_save_logo(file, user_id: str) -> tuple[str, str, int]:
+    """Load an uploaded image, auto-orient, resize to a reasonable size,
+    and save as an optimized PNG. Transparency is preserved where possible.
+
+    Returns (original_filename, saved_full_path, saved_file_size).
+    Raises ValueError on an unreadable/invalid image.
+    """
+    original_name = secure_filename(file.filename or "logo")
+    dest_dir = UPLOADS_DIR / f"logos/{user_id}"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    unique = f"logo_{uuid.uuid4().hex[:8]}.png"
+    dest = dest_dir / unique
+
+    try:
+        img = Image.open(file.stream)
+        img.load()
+    except Exception as e:
+        raise ValueError(f"Could not read image: {e}")
+
+    # Respect EXIF orientation
+    try:
+        from PIL import ImageOps
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+
+    # Convert palette / CMYK to RGBA so transparency is preserved and colors render correctly
+    if img.mode not in ("RGB", "RGBA", "LA", "L"):
+        img = img.convert("RGBA")
+    elif img.mode == "L":
+        img = img.convert("RGBA")
+
+    # Resize so the longest dimension is at most LOGO_MAX_DIMENSION
+    max_dim = max(img.width, img.height)
+    if max_dim > LOGO_MAX_DIMENSION:
+        ratio = LOGO_MAX_DIMENSION / float(max_dim)
+        new_size = (int(img.width * ratio), int(img.height * ratio))
+        img = img.resize(new_size, Image.LANCZOS)
+
+    img.save(str(dest), format="PNG", optimize=LOGO_PNG_OPTIMIZE)
+    size = dest.stat().st_size
+    return original_name, str(dest), size
 
 
 # ---------------------------------------------------------------------------
@@ -611,6 +691,13 @@ def settings():
         if api_key:
             current_user.api_key_encrypted = api_key  # In production, encrypt this
 
+        # Company logo preferences (checkboxes come through only when checked)
+        current_user.company_logo_use_in_proposals = bool(request.form.get("company_logo_use_in_proposals"))
+        current_user.company_logo_show_on_cover = bool(request.form.get("company_logo_show_on_cover"))
+        placement = request.form.get("company_logo_placement", current_user.company_logo_placement or "top_left")
+        if placement in ("top_left", "center"):
+            current_user.company_logo_placement = placement
+
         db.session.commit()
         _log_activity("settings_update", "Updated user settings")
         flash("Settings saved.", "success")
@@ -644,6 +731,7 @@ def settings():
         revision_templates=revision_templates,
         revision_categories=REVISION_CATEGORIES,
         verticals=VERTICALS,
+        logo_max_dimension=LOGO_MAX_DIMENSION,
     )
 
 
@@ -724,6 +812,85 @@ def delete_user_template(template_id):
     db.session.commit()
     flash("Template deleted.", "success")
     return redirect(url_for("settings") + "#company")
+
+
+# ---------------------------------------------------------------------------
+# Company logo upload
+# ---------------------------------------------------------------------------
+
+@app.route("/settings/upload-logo", methods=["POST"])
+@login_required
+def upload_company_logo():
+    file = request.files.get("company_logo")
+    if not file or not file.filename:
+        flash("Please choose an image file to upload.", "error")
+        return redirect(url_for("settings") + "#profile")
+
+    if not _allowed_file(file.filename, LOGO_EXTENSIONS):
+        flash(
+            "Unsupported image type. Please upload a PNG, JPG, JPEG, WebP, GIF, or BMP.",
+            "error",
+        )
+        return redirect(url_for("settings") + "#profile")
+
+    try:
+        original_name, saved_path, saved_size = _process_and_save_logo(file, current_user.id)
+    except ValueError as e:
+        flash(f"Could not process image: {e}", "error")
+        return redirect(url_for("settings") + "#profile")
+
+    # Remove old logo file if any
+    if current_user.company_logo_path:
+        try:
+            old = Path(current_user.company_logo_path)
+            if old.exists() and old.is_file():
+                old.unlink()
+        except Exception:
+            pass
+
+    current_user.company_logo_path = saved_path
+    current_user.company_logo_original_name = original_name
+    # If this is the user's first logo upload, default "use in proposals" to True
+    if not current_user.company_logo_placement:
+        current_user.company_logo_placement = "top_left"
+    db.session.commit()
+    _log_activity("logo_upload", f"Uploaded company logo ({saved_size // 1024} KB)")
+    flash(
+        f"Logo uploaded and optimized ({saved_size // 1024} KB). "
+        "You can now choose how it appears on your proposals.",
+        "success",
+    )
+    return redirect(url_for("settings") + "#profile")
+
+
+@app.route("/settings/delete-logo", methods=["POST"])
+@login_required
+def delete_company_logo():
+    if current_user.company_logo_path:
+        try:
+            old = Path(current_user.company_logo_path)
+            if old.exists() and old.is_file():
+                old.unlink()
+        except Exception:
+            pass
+    current_user.company_logo_path = ""
+    current_user.company_logo_original_name = ""
+    db.session.commit()
+    _log_activity("logo_delete", "Removed company logo")
+    flash("Company logo removed.", "success")
+    return redirect(url_for("settings") + "#profile")
+
+
+@app.route("/settings/logo-preview")
+@login_required
+def company_logo_preview():
+    """Serve the current user's company logo (private — only to the owner)."""
+    if not current_user.company_logo_path:
+        abort(404)
+    logo_path = Path(current_user.company_logo_path)
+    if not logo_path.exists():
+        abort(404)
+    return send_file(str(logo_path), mimetype="image/png")
 
 
 # ---------------------------------------------------------------------------
@@ -1321,7 +1488,12 @@ def project_generate(project_id):
 
         docx_filename = f"proposal_{job_id}.docx"
         docx_path = GENERATED_DIR / docx_filename
-        markdown_to_docx(result["proposal_markdown"], str(docx_path))
+        _brand_user = project.owner or current_user
+        markdown_to_docx(
+            result["proposal_markdown"],
+            str(docx_path),
+            **_logo_docx_kwargs(_brand_user),
+        )
 
         pdf_filename = ""
         # PDF generation could be added here if needed
@@ -1696,7 +1868,12 @@ def edit_proposal(proposal_id):
         # Regenerate DOCX from new content
         if proposal.docx_file:
             docx_path = GENERATED_DIR / proposal.docx_file
-            markdown_to_docx(new_content, str(docx_path))
+            _brand_user = project.owner or current_user
+            markdown_to_docx(
+                new_content,
+                str(docx_path),
+                **_logo_docx_kwargs(_brand_user),
+            )
 
         # Update action items count
         action_items = re.findall(r"\[ACTION REQUIRED:\s*(.+?)\]", new_content)
@@ -1787,7 +1964,12 @@ def restore_version(proposal_id, version_id):
 
     if proposal.docx_file:
         docx_path = GENERATED_DIR / proposal.docx_file
-        markdown_to_docx(version.markdown_content, str(docx_path))
+        _brand_user = project.owner or current_user
+        markdown_to_docx(
+            version.markdown_content,
+            str(docx_path),
+            **_logo_docx_kwargs(_brand_user),
+        )
 
     db.session.commit()
     _log_activity("proposal_restore", f"Restored proposal to v{version.version_number}", project.id)

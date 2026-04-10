@@ -15,6 +15,100 @@
 
 <!-- Tab 1: Profile & AI Settings -->
 <div class="settings-tab-panel" id="tab-profile">
+    <!-- Company Logo / Branding -->
+    <div class="card">
+        <h2>Company Logo</h2>
+        <p class="card-desc">
+            Upload your company logo to automatically brand your generated proposals.
+            Accepted formats: <strong>PNG, JPG, JPEG, WebP, GIF, BMP</strong>.
+            Uploaded images are automatically resized and re-encoded as optimized PNG
+            (longest side up to {{ logo_max_dimension }}px) so they stay small in memory
+            and look crisp in Word documents. Transparency is preserved when available.
+        </p>
+
+        {% if current_user.company_logo_path %}
+        <div class="logo-preview-wrap">
+            <div class="logo-preview-box">
+                <img src="{{ url_for('company_logo_preview') }}?v={{ current_user.id[:6] }}{{ current_user.company_logo_original_name }}" alt="Company logo preview" class="logo-preview-img">
+            </div>
+            <div class="logo-preview-meta">
+                <div class="logo-preview-name">{{ current_user.company_logo_original_name or 'logo.png' }}</div>
+                <form method="post" action="{{ url_for('delete_company_logo') }}" class="inline-form" onsubmit="return confirm('Remove your company logo?');">
+                    <button type="submit" class="btn btn-small btn-danger">Remove logo</button>
+                </form>
+            </div>
+        </div>
+        {% else %}
+        <p class="empty-hint">No logo uploaded yet. Upload one below to enable proposal branding.</p>
+        {% endif %}
+
+        <form method="post" action="{{ url_for('upload_company_logo') }}" enctype="multipart/form-data" class="upload-inline">
+            <div class="form-group">
+                <label for="company_logo">
+                    {% if current_user.company_logo_path %}Replace logo{% else %}Upload logo{% endif %}
+                </label>
+                <input type="file" id="company_logo" name="company_logo" accept=".png,.jpg,.jpeg,.webp,.gif,.bmp,image/*" required>
+                <span class="form-hint">Most common image types accepted. Images are automatically compressed to a reasonable memory footprint.</span>
+            </div>
+            <button type="submit" class="btn btn-secondary">
+                {% if current_user.company_logo_path %}Replace Logo{% else %}Upload Logo{% endif %}
+            </button>
+        </form>
+
+        {% if current_user.company_logo_path %}
+        <hr class="card-divider">
+        <form method="post" action="{{ url_for('settings') }}">
+            <h3 class="subheading">Proposal Branding Options</h3>
+            <p class="card-desc">Control how your logo appears on generated proposals.</p>
+
+            <div class="form-group checkbox-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" name="company_logo_use_in_proposals" value="1"
+                           {% if current_user.company_logo_use_in_proposals %}checked{% endif %}>
+                    <span>Use this logo on all newly generated proposals</span>
+                </label>
+            </div>
+
+            <div class="form-group">
+                <label>Logo Placement</label>
+                <div class="radio-group">
+                    <label class="radio-card {% if (current_user.company_logo_placement or 'top_left') == 'top_left' %}selected{% endif %}">
+                        <input type="radio" name="company_logo_placement" value="top_left"
+                               {% if (current_user.company_logo_placement or 'top_left') == 'top_left' %}checked{% endif %}>
+                        <span class="radio-card-title">Top Left</span>
+                        <span class="radio-card-desc">Left-aligned header on the title page. Classic letterhead look.</span>
+                    </label>
+                    <label class="radio-card {% if current_user.company_logo_placement == 'center' %}selected{% endif %}">
+                        <input type="radio" name="company_logo_placement" value="center"
+                               {% if current_user.company_logo_placement == 'center' %}checked{% endif %}>
+                        <span class="radio-card-title">Centered</span>
+                        <span class="radio-card-desc">Centered above the proposal title (cover-page style).</span>
+                    </label>
+                </div>
+            </div>
+
+            <div class="form-group checkbox-group">
+                <label class="checkbox-label">
+                    <input type="checkbox" name="company_logo_show_on_cover" value="1"
+                           {% if current_user.company_logo_show_on_cover %}checked{% endif %}>
+                    <span>Add a dedicated cover page with the logo before the proposal body</span>
+                </label>
+                <span class="form-hint">Recommended for formal RFP responses. Uncheck to embed inline at the top of page 1 only.</span>
+            </div>
+
+            <!-- Preserve other profile fields so this form save doesn't wipe them -->
+            <input type="hidden" name="display_name" value="{{ current_user.display_name }}">
+            <input type="hidden" name="email" value="{{ current_user.email }}">
+            <input type="hidden" name="company_name" value="{{ current_user.company_name }}">
+            <input type="hidden" name="font_preference" value="{{ current_user.font_preference }}">
+            <input type="hidden" name="llm_provider" value="{{ current_user.llm_provider }}">
+            <input type="hidden" name="llm_model" value="{{ current_user.llm_model }}">
+
+            <button type="submit" class="btn btn-primary">Save Branding Options</button>
+        </form>
+        {% endif %}
+    </div>
+
     <div class="card">
         <h2>Profile & AI Settings</h2>
         <form method="post" action="{{ url_for('settings') }}">
@@ -32,6 +126,10 @@
                 <label for="company_name">Company Name</label>
                 <input type="text" id="company_name" name="company_name" value="{{ current_user.company_name }}">
             </div>
+            <!-- Preserve logo preferences when saving this form -->
+            <input type="hidden" name="company_logo_placement" value="{{ current_user.company_logo_placement or 'top_left' }}">
+            {% if current_user.company_logo_use_in_proposals %}<input type="hidden" name="company_logo_use_in_proposals" value="1">{% endif %}
+            {% if current_user.company_logo_show_on_cover %}<input type="hidden" name="company_logo_show_on_cover" value="1">{% endif %}
             <div class="form-row">
                 <div class="form-group">
                     <label for="llm_provider">AI LLM Provider</label>
