@@ -67,4 +67,59 @@
         {{ proposal_html|safe }}
     </div>
 </section>
+
+<!-- Review Comments -->
+<section class="comments-section">
+    <div class="comments-header">
+        <h2>Review Comments
+            {% if open_comment_count %}<span class="badge badge-danger">{{ open_comment_count }} open</span>{% endif %}
+        </h2>
+    </div>
+
+    <form method="post" action="{{ url_for('add_proposal_comment', proposal_id=proposal.id) }}" class="comment-form card">
+        <div class="form-group">
+            <label for="section_anchor">Section (optional)</label>
+            <input type="text" id="section_anchor" name="section_anchor" placeholder="e.g., Scope of Work, Pricing Table">
+        </div>
+        <div class="form-group">
+            <label for="body">Comment</label>
+            <textarea id="body" name="body" rows="3" required placeholder="Add a review note for the team…"></textarea>
+        </div>
+        <button type="submit" class="btn btn-primary btn-small">Post Comment</button>
+    </form>
+
+    {% if comments %}
+    <ul class="comment-list">
+        {% for c in comments %}
+        <li id="comment-{{ c.id }}" class="comment-item{% if c.is_resolved %} comment-resolved{% endif %}">
+            <div class="comment-meta">
+                <strong>{{ c.author.display_name or c.author.username if c.author else 'User' }}</strong>
+                <span class="comment-time">{{ c.created_at.strftime('%Y-%m-%d %H:%M') }}</span>
+                {% if c.section_anchor %}
+                <span class="comment-anchor">&rsaquo; {{ c.section_anchor }}</span>
+                {% endif %}
+                {% if c.is_resolved %}
+                <span class="badge badge-success">Resolved</span>
+                {% endif %}
+            </div>
+            <div class="comment-body">{{ c.body }}</div>
+            <div class="comment-actions">
+                <form method="post" action="{{ url_for('resolve_proposal_comment', proposal_id=proposal.id, comment_id=c.id) }}" class="inline-form">
+                    <button type="submit" class="btn btn-small btn-secondary">
+                        {{ 'Unresolve' if c.is_resolved else 'Mark Resolved' }}
+                    </button>
+                </form>
+                {% if c.author_id == current_user.id or current_user.is_admin %}
+                <form method="post" action="{{ url_for('delete_proposal_comment', proposal_id=proposal.id, comment_id=c.id) }}" class="inline-form" onsubmit="return confirm('Delete this comment?')">
+                    <button type="submit" class="btn btn-small btn-danger">Delete</button>
+                </form>
+                {% endif %}
+            </div>
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty-state">No comments yet. Start the review.</p>
+    {% endif %}
+</section>
 {% endblock %}

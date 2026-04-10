@@ -11,6 +11,7 @@ from models import (
     UserRateSheet, UserVerticalTemplate, ActivityLog,
     StaffRole, EquipmentItem, TravelExpenseRate,
     CompanyStandard, ProposalCorrection, ProposalVersion,
+    ProposalComment,
 )
 from proposal_export import markdown_to_docx, markdown_to_redline_docx
 
@@ -399,6 +400,207 @@ with app.app_context():
         markdown_to_docx("# Proposal\n\n## Staffing Plan\n\n| Role | Hours | Rate |\n|---|---|---|\n| Engineer | 100 | $150 |\n", f.name)
         test("DOCX with tables created", os.path.exists(f.name) and os.path.getsize(f.name) > 1000)
         os.unlink(f.name)
+
+    # ===== PART 2: RE-LOGIN AS ORIGINAL USER =====
+    client.get('/logout')
+    client.post('/login', data={'username': 'testuser', 'password': 'testpass123'})
+
+    # ===== PART 2: DUE DATES & CALENDAR =====
+    print("\n=== Part 2: Due Dates & Calendar ===")
+    # Create a project with a due date
+    from datetime import datetime as _dt, timedelta as _td
+    due = (_dt.utcnow() + _td(days=5)).strftime('%Y-%m-%d')
+    resp = client.post('/projects/new', data={
+        'project_name': 'Deadline Project',
+        'client_name': 'TimeSensitive LLC',
+        'due_date': due,
+    }, follow_redirects=True)
+    test("New project with due_date returns 200", resp.status_code == 200)
+    dl_project = Project.query.filter_by(name='Deadline Project').first()
+    test("Due date saved", dl_project is not None and dl_project.due_date is not None)
+    test("Due date correct day", dl_project.due_date.strftime('%Y-%m-%d') == due)
+
+    # Update the due date
+    new_due = (_dt.utcnow() + _td(days=10)).strftime('%Y-%m-%d')
+    resp = client.post(f'/projects/{dl_project.id}/set-due-date', data={
+        'due_date': new_due,
+    }, follow_redirects=True)
+    test("Set due date returns 200", resp.status_code == 200)
+    db.session.refresh(dl_project)
+    test("Due date updated", dl_project.due_date.strftime('%Y-%m-%d') == new_due)
+
+    # Clear due date
+    client.post(f'/projects/{dl_project.id}/set-due-date', data={'due_date': ''}, follow_redirects=True)
+    db.session.refresh(dl_project)
+    test("Due date cleared", dl_project.due_date is None)
+
+    # Set it to a date within 7 days for dashboard "Due Soon" widget
+    soon_due = (_dt.utcnow() + _td(days=3)).strftime('%Y-%m-%d')
+    client.post(f'/projects/{dl_project.id}/set-due-date', data={'due_date': soon_due})
+
+    # Calendar view
+    resp = client.get('/calendar')
+    test("Calendar loads", resp.status_code == 200)
+    test("Calendar shows project", b'Deadline Project' in resp.data)
+
+    # Calendar with explicit year/month
+    now = _dt.utcnow()
+    resp = client.get(f'/calendar?year={now.year}&month={now.month}')
+    test("Calendar with year/month loads", resp.status_code == 200)
+
+    # Dashboard should show upcoming deadline
+    resp = client.get('/')
+    test("Dashboard loads with deadlines", resp.status_code == 200)
+    test("Dashboard shows upcoming deadline", b'Due Soon' in resp.data)
+
+    # ===== PART 2: WIN/LOSS CAPTURE =====
+    print("\n=== Part 2: Win/Loss Analysis ===")
+    # Create a project and close it as lost with reason/competitor
+    client.post('/projects/new', data={
+        'project_name': 'Lost Deal Project',
+        'client_name': 'BigCorp',
+    }, follow_redirects=True)
+    lost_proj = Project.query.filter_by(name='Lost Deal Project').first()
+
+    resp = client.post(f'/projects/{lost_proj.id}/update-status', data={
+        'status': 'lost',
+        'close_reason': 'Price was 15% higher than competitor',
+        'close_category': 'price',
+        'competitor_name': 'Acme Controls',
+        'dollar_amount': '250000',
+    }, follow_redirects=True)
+    test("Update status to lost returns 200", resp.status_code == 200)
+    db.session.refresh(lost_proj)
+    test("Status is lost", lost_proj.status == 'lost')
+    test("Close reason saved", 'Price' in (lost_proj.close_reason or ''))
+    test("Close category saved", lost_proj.close_category == 'price')
+    test("Competitor saved", lost_proj.competitor_name == 'Acme Controls')
+    test("Dollar amount saved", lost_proj.dollar_amount == 250000.0)
+    test("Closed_at stamped", lost_proj.closed_at is not None)
+
+    # Create a won project
+    client.post('/projects/new', data={'project_name': 'Won Deal', 'client_name': 'GoodCorp'}, follow_redirects=True)
+    won_proj = Project.query.filter_by(name='Won Deal').first()
+    client.post(f'/projects/{won_proj.id}/update-status', data={
+        'status': 'won',
+        'close_reason': 'Strong technical approach and past performance',
+        'close_category': 'technical',
+        'dollar_amount': '500000',
+    }, follow_redirects=True)
+    db.session.refresh(won_proj)
+    test("Won project saved", won_proj.status == 'won' and won_proj.close_category == 'technical')
+
+    # Update close details after the fact
+    resp = client.post(f'/projects/{won_proj.id}/close-details', data={
+        'close_reason': 'Updated reason',
+        'close_category': 'relationship',
+        'competitor_name': 'OtherCorp',
+        'dollar_amount': '550000',
+    }, follow_redirects=True)
+    test("Close-details update returns 200", resp.status_code == 200)
+    db.session.refresh(won_proj)
+    test("Close reason updated", won_proj.close_reason == 'Updated reason')
+    test("Close category updated", won_proj.close_category == 'relationship')
+    test("Competitor updated", won_proj.competitor_name == 'OtherCorp')
+    test("Dollar updated", won_proj.dollar_amount == 550000.0)
+
+    # Reports page
+    resp = client.get('/reports')
+    test("Reports page loads", resp.status_code == 200)
+    test("Reports shows Acme Controls", b'Acme Controls' in resp.data)
+    test("Reports shows OtherCorp", b'OtherCorp' in resp.data)
+    test("Reports has win rate", b'Win Rate' in resp.data)
+    test("Reports has trend chart", b'trend-chart' in resp.data)
+
+    # ===== PART 2: SEARCH =====
+    print("\n=== Part 2: Global Search ===")
+    resp = client.get('/search')
+    test("Empty search loads", resp.status_code == 200)
+
+    resp = client.get('/search?q=a')
+    test("Too-short search loads", resp.status_code == 200)
+
+    resp = client.get('/search?q=Deadline')
+    test("Search for project name", resp.status_code == 200 and b'Deadline Project' in resp.data)
+
+    resp = client.get('/search?q=Acme')
+    test("Search finds competitor", resp.status_code == 200 and b'Lost Deal' in resp.data)
+
+    resp = client.get('/search?q=BigCorp')
+    test("Search finds client name", resp.status_code == 200 and b'Lost Deal' in resp.data)
+
+    # ===== PART 2: PROPOSAL COMMENTS =====
+    print("\n=== Part 2: Proposal Comments ===")
+    # Use the existing proposal from earlier tests
+    prop_for_comments = Proposal.query.first()
+    test("Have a proposal to comment on", prop_for_comments is not None)
+
+    resp = client.post(f'/proposal/{prop_for_comments.id}/comments', data={
+        'body': 'Needs stronger pricing justification',
+        'section_anchor': 'Pricing',
+    }, follow_redirects=True)
+    test("Add comment returns 200", resp.status_code == 200)
+    test("Comment saved", ProposalComment.query.count() == 1)
+    c1 = ProposalComment.query.first()
+    test("Comment body correct", c1.body == 'Needs stronger pricing justification')
+    test("Comment anchor correct", c1.section_anchor == 'Pricing')
+    test("Comment not resolved initially", c1.is_resolved is False)
+    test("Comment author correct", c1.author_id == user.id)
+
+    # Empty comment rejected
+    resp = client.post(f'/proposal/{prop_for_comments.id}/comments', data={'body': ''}, follow_redirects=True)
+    test("Empty comment rejected", ProposalComment.query.count() == 1)
+
+    # Add second comment
+    client.post(f'/proposal/{prop_for_comments.id}/comments', data={'body': 'Second note'}, follow_redirects=True)
+    test("Second comment added", ProposalComment.query.count() == 2)
+
+    # Resolve comment
+    resp = client.post(f'/proposal/{prop_for_comments.id}/comments/{c1.id}/resolve', follow_redirects=True)
+    test("Resolve comment returns 200", resp.status_code == 200)
+    db.session.refresh(c1)
+    test("Comment marked resolved", c1.is_resolved is True)
+    test("Resolver recorded", c1.resolved_by == user.id)
+
+    # Unresolve
+    client.post(f'/proposal/{prop_for_comments.id}/comments/{c1.id}/resolve', follow_redirects=True)
+    db.session.refresh(c1)
+    test("Comment unresolved", c1.is_resolved is False)
+
+    # Proposal page shows comments
+    resp = client.get(f'/proposal/{prop_for_comments.id}')
+    test("Proposal page shows comments section", b'Review Comments' in resp.data)
+    test("Proposal page shows comment body", b'Needs stronger pricing' in resp.data)
+
+    # Delete comment (as author)
+    c2 = ProposalComment.query.filter(ProposalComment.id != c1.id).first()
+    resp = client.post(f'/proposal/{prop_for_comments.id}/comments/{c2.id}/delete', follow_redirects=True)
+    test("Delete comment returns 200", resp.status_code == 200)
+    test("Comment deleted", ProposalComment.query.count() == 1)
+
+    # Search finds comments
+    resp = client.get('/search?q=pricing')
+    test("Search finds comments", b'Needs stronger pricing' in resp.data)
+
+    # ===== PART 2: CROSS-USER COMMENT PROTECTION =====
+    print("\n=== Part 2: Cross-user Comment Protection ===")
+    client.get('/logout')
+    client.post('/signup', data={
+        'username': 'user3', 'email': 'u3@test.com', 'password': 'testpass123',
+    })
+    client.post('/login', data={'username': 'user3', 'password': 'testpass123'})
+
+    # user3 can't post comments on user1's proposal
+    resp = client.post(f'/proposal/{prop_for_comments.id}/comments', data={'body': 'Intrusion'})
+    test("Other user can't comment on proposal", resp.status_code == 404)
+
+    # user3 can't resolve user1's comment
+    resp = client.post(f'/proposal/{prop_for_comments.id}/comments/{c1.id}/resolve')
+    test("Other user can't resolve comment", resp.status_code == 404)
+
+    # user3 search doesn't leak user1's projects (user3 is not admin since they're not first user)
+    resp = client.get('/search?q=Deadline')
+    test("Other user can't find user1's projects in search", b'Deadline Project' not in resp.data)
 
     # ===== SUMMARY =====
     print(f"\n{'='*50}")

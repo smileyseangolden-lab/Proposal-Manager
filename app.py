@@ -61,6 +61,7 @@ from models import (
     Project,
     ProjectDocument,
     Proposal,
+    ProposalComment,
     ProposalCorrection,
     ProposalQuestion,
     ProposalVersion,
@@ -143,6 +144,21 @@ with app.app_context():
     if "assigned_to" not in _proj_cols:
         _cur.execute('ALTER TABLE projects ADD COLUMN assigned_to VARCHAR(32) DEFAULT NULL')
         _conn.commit()
+
+    # Part 2 migrations: deadlines and win/loss analysis columns
+    _cur.execute("PRAGMA table_info(projects)")
+    _proj_cols = {row[1] for row in _cur.fetchall()}
+    _project_migrations = [
+        ("due_date", "ALTER TABLE projects ADD COLUMN due_date DATETIME DEFAULT NULL"),
+        ("close_reason", 'ALTER TABLE projects ADD COLUMN close_reason TEXT DEFAULT ""'),
+        ("close_category", 'ALTER TABLE projects ADD COLUMN close_category VARCHAR(50) DEFAULT ""'),
+        ("competitor_name", 'ALTER TABLE projects ADD COLUMN competitor_name VARCHAR(300) DEFAULT ""'),
+        ("closed_at", "ALTER TABLE projects ADD COLUMN closed_at DATETIME DEFAULT NULL"),
+    ]
+    for col, sql in _project_migrations:
+        if col not in _proj_cols:
+            _cur.execute(sql)
+    _conn.commit()
 
     # Migrate users table to add role column if missing
     _cur.execute("PRAGMA table_info(users)")
@@ -386,6 +402,34 @@ def dashboard():
     # Proposal users list (for sales assignment dropdown)
     proposal_users = User.query.filter(User.role.in_(["proposal", "admin"])).order_by(User.display_name).all()
 
+    # Upcoming deadlines (next 7 days) and overdue — from active projects only
+    from datetime import timedelta
+    now_naive = datetime.utcnow()
+    upcoming_end = now_naive + timedelta(days=7)
+    upcoming_deadlines = []
+    overdue_projects = []
+    for p in active_projects:
+        if not p.due_date:
+            continue
+        due = p.due_date.replace(tzinfo=None) if p.due_date.tzinfo else p.due_date
+        if due < now_naive:
+            overdue_projects.append(p)
+        elif due <= upcoming_end:
+            upcoming_deadlines.append(p)
+    upcoming_deadlines.sort(key=lambda p: p.due_date)
+    overdue_projects.sort(key=lambda p: p.due_date)
+
+    # Close reason category labels (for the close-details form in past projects)
+    close_category_labels = {
+        "price": "Price",
+        "scope": "Scope",
+        "schedule": "Schedule / Timing",
+        "relationship": "Relationship / Incumbent",
+        "technical": "Technical Approach",
+        "compliance": "Compliance / Requirements",
+        "other": "Other",
+    }
+
     return render_template(
         "dashboard.html",
         active_projects=active_projects,
@@ -398,6 +442,9 @@ def dashboard():
         assigned_to_me=assigned_to_me,
         notifications=notifications,
         proposal_users=proposal_users,
+        upcoming_deadlines=upcoming_deadlines,
+        overdue_projects=overdue_projects,
+        close_category_labels=close_category_labels,
     )
 
 
@@ -788,6 +835,7 @@ def new_project():
 
     name = request.form.get("project_name", "").strip()
     client = request.form.get("client_name", "").strip()
+    due_date_raw = request.form.get("due_date", "").strip()
     if not name:
         flash("Project name is required.", "error")
         return redirect(url_for("new_project"))
@@ -797,10 +845,49 @@ def new_project():
         name=name,
         client_name=client,
     )
+
+    # Optional due date (YYYY-MM-DD or YYYY-MM-DDTHH:MM)
+    if due_date_raw:
+        try:
+            if "T" in due_date_raw:
+                project.due_date = datetime.fromisoformat(due_date_raw)
+            else:
+                project.due_date = datetime.strptime(due_date_raw, "%Y-%m-%d")
+        except ValueError:
+            pass  # ignore invalid dates, don't block creation
+
     db.session.add(project)
     db.session.commit()
     _log_activity("project_create", f"Created project: {name}", project.id)
     return redirect(url_for("project_upload", project_id=project.id))
+
+
+@app.route("/projects/<project_id>/set-due-date", methods=["POST"])
+@login_required
+def set_project_due_date(project_id):
+    """Update a project's due date (deadline)."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    due_date_raw = request.form.get("due_date", "").strip()
+    if not due_date_raw:
+        project.due_date = None
+        flash("Due date cleared.", "success")
+    else:
+        try:
+            if "T" in due_date_raw:
+                project.due_date = datetime.fromisoformat(due_date_raw)
+            else:
+                project.due_date = datetime.strptime(due_date_raw, "%Y-%m-%d")
+            flash(f"Due date set to {project.due_date.strftime('%Y-%m-%d')}.", "success")
+        except ValueError:
+            flash("Invalid date format.", "error")
+            return redirect(request.referrer or url_for("dashboard"))
+
+    db.session.commit()
+    _log_activity("project_due_date_set", f"Due: {project.due_date}", project_id)
+    return redirect(request.referrer or url_for("dashboard"))
 
 
 @app.route("/projects/<project_id>/upload", methods=["GET", "POST"])
@@ -1162,12 +1249,13 @@ def project_questions(project_id):
 @login_required
 def update_project_status(project_id):
     project = db.session.get(Project, project_id)
-    if not project or project.user_id != current_user.id:
+    if not _can_access_project(project):
         abort(404)
 
     new_status = request.form.get("status", project.status)
     dollar_amount = request.form.get("dollar_amount")
 
+    prev_status = project.status
     project.status = new_status
     if dollar_amount:
         try:
@@ -1178,10 +1266,52 @@ def update_project_status(project_id):
     if new_status == "submitted":
         project.submitted_at = datetime.now(timezone.utc)
 
+    # Capture win/loss analysis when closing
+    if new_status in ("won", "lost"):
+        close_reason = request.form.get("close_reason", "").strip()
+        close_category = request.form.get("close_category", "").strip()
+        competitor_name = request.form.get("competitor_name", "").strip()
+        if close_reason:
+            project.close_reason = close_reason
+        if close_category:
+            project.close_category = close_category
+        if competitor_name:
+            project.competitor_name = competitor_name
+        if prev_status not in ("won", "lost"):
+            project.closed_at = datetime.now(timezone.utc)
+
     db.session.commit()
     _log_activity("project_status_update", f"Status → {new_status}", project_id)
     flash(f"Project status updated to {new_status}.", "success")
-    return redirect(url_for("dashboard"))
+    return redirect(request.referrer or url_for("dashboard"))
+
+
+@app.route("/projects/<project_id>/close-details", methods=["POST"])
+@login_required
+def update_close_details(project_id):
+    """Update win/loss reason, category, and competitor for a closed project."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    if project.status not in ("won", "lost"):
+        flash("Close details can only be set on won/lost projects.", "error")
+        return redirect(request.referrer or url_for("dashboard"))
+
+    project.close_reason = request.form.get("close_reason", "").strip()
+    project.close_category = request.form.get("close_category", "").strip()
+    project.competitor_name = request.form.get("competitor_name", "").strip()
+    dollar_amount = request.form.get("dollar_amount", "").strip()
+    if dollar_amount:
+        try:
+            project.dollar_amount = float(dollar_amount.replace(",", "").replace("$", ""))
+        except ValueError:
+            pass
+    if not project.closed_at:
+        project.closed_at = datetime.now(timezone.utc)
+    db.session.commit()
+    _log_activity("close_details_update", f"Close details updated ({project.status})", project_id)
+    flash("Close details saved.", "success")
+    return redirect(request.referrer or url_for("reports"))
 
 
 # ---------------------------------------------------------------------------
@@ -1197,7 +1327,7 @@ def view_proposal(proposal_id):
         return redirect(url_for("dashboard"))
 
     project = db.session.get(Project, proposal.project_id)
-    if not project or (project.user_id != current_user.id and not current_user.is_admin):
+    if not _can_access_project(project):
         abort(404)
 
     md_path = GENERATED_DIR / proposal.md_file
@@ -1217,6 +1347,12 @@ def view_proposal(proposal_id):
         "generated_at": proposal.generated_at.isoformat() if proposal.generated_at else "",
     }
 
+    # Load comments — open first, then resolved
+    comments = ProposalComment.query.filter_by(proposal_id=proposal_id).order_by(
+        ProposalComment.is_resolved.asc(), ProposalComment.created_at.desc()
+    ).all()
+    open_comment_count = sum(1 for c in comments if not c.is_resolved)
+
     return render_template(
         "proposal.html",
         meta=meta,
@@ -1224,6 +1360,8 @@ def view_proposal(proposal_id):
         action_items=action_items,
         proposal=proposal,
         project=project,
+        comments=comments,
+        open_comment_count=open_comment_count,
     )
 
 
@@ -2146,6 +2284,421 @@ def assign_project(project_id):
         flash("Assignment removed.", "success")
 
     return redirect(request.referrer or url_for("dashboard"))
+
+
+# ---------------------------------------------------------------------------
+# Calendar & Deadlines (Part 2)
+# ---------------------------------------------------------------------------
+
+def _my_projects_filter():
+    """Filter for projects the current user owns or is assigned to."""
+    return db.or_(
+        Project.user_id == current_user.id,
+        Project.assigned_to == current_user.id,
+    )
+
+
+@app.route("/calendar")
+@login_required
+def calendar_view():
+    """Calendar view showing project deadlines for the current month (or requested month)."""
+    # Parse year/month from query string; default to current month
+    now = datetime.now(timezone.utc)
+    try:
+        year = int(request.args.get("year", now.year))
+        month = int(request.args.get("month", now.month))
+        if month < 1 or month > 12:
+            month = now.month
+    except ValueError:
+        year, month = now.year, now.month
+
+    import calendar as _cal
+    first_weekday, days_in_month = _cal.monthrange(year, month)
+
+    # Load projects with a due date (owned or assigned)
+    if current_user.is_admin:
+        all_with_due = Project.query.filter(Project.due_date.isnot(None)).all()
+    else:
+        all_with_due = Project.query.filter(
+            _my_projects_filter(), Project.due_date.isnot(None)
+        ).all()
+
+    # Bucket projects by day-of-month for the requested month
+    by_day = {}
+    for p in all_with_due:
+        if p.due_date and p.due_date.year == year and p.due_date.month == month:
+            by_day.setdefault(p.due_date.day, []).append(p)
+
+    # Previous/next month nav
+    prev_year, prev_month = (year - 1, 12) if month == 1 else (year, month - 1)
+    next_year, next_month = (year + 1, 1) if month == 12 else (year, month + 1)
+
+    # Upcoming deadlines (next 14 days) and overdue
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    from datetime import timedelta
+    window_end = today + timedelta(days=14)
+    upcoming = [p for p in all_with_due if p.due_date and p.due_date.replace(tzinfo=None) >= today.replace(tzinfo=None) and p.due_date.replace(tzinfo=None) <= window_end.replace(tzinfo=None) and p.status == "active"]
+    upcoming.sort(key=lambda p: p.due_date)
+    overdue = [p for p in all_with_due if p.due_date and p.due_date.replace(tzinfo=None) < today.replace(tzinfo=None) and p.status == "active"]
+    overdue.sort(key=lambda p: p.due_date)
+
+    month_name = _cal.month_name[month]
+
+    return render_template(
+        "calendar.html",
+        year=year,
+        month=month,
+        month_name=month_name,
+        first_weekday=first_weekday,
+        days_in_month=days_in_month,
+        by_day=by_day,
+        prev_year=prev_year,
+        prev_month=prev_month,
+        next_year=next_year,
+        next_month=next_month,
+        upcoming=upcoming,
+        overdue=overdue,
+        today_day=now.day if (year == now.year and month == now.month) else None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reports & Analytics (Part 2)
+# ---------------------------------------------------------------------------
+
+@app.route("/reports")
+@login_required
+def reports():
+    """Win/loss analysis, pipeline trends, vertical performance."""
+    from sqlalchemy import func
+    from collections import OrderedDict, Counter
+
+    # Admins see company-wide; other users see own + assigned
+    if current_user.is_admin:
+        base_query = Project.query
+    else:
+        base_query = Project.query.filter(_my_projects_filter())
+
+    all_projects = base_query.all()
+
+    # Overall stats
+    won_projects = [p for p in all_projects if p.status == "won"]
+    lost_projects = [p for p in all_projects if p.status == "lost"]
+    total_won = len(won_projects)
+    total_lost = len(lost_projects)
+    total_decided = total_won + total_lost
+    overall_win_rate = round((total_won / total_decided) * 100) if total_decided else 0
+    won_value = sum(p.dollar_amount or 0 for p in won_projects)
+    lost_value = sum(p.dollar_amount or 0 for p in lost_projects)
+
+    # Win/loss by vertical
+    vertical_stats = {}
+    for p in all_projects:
+        label = p.vertical_label or "General"
+        vs = vertical_stats.setdefault(label, {"won": 0, "lost": 0, "won_value": 0, "lost_value": 0, "active": 0})
+        if p.status == "won":
+            vs["won"] += 1
+            vs["won_value"] += p.dollar_amount or 0
+        elif p.status == "lost":
+            vs["lost"] += 1
+            vs["lost_value"] += p.dollar_amount or 0
+        elif p.status == "active":
+            vs["active"] += 1
+
+    for label, vs in vertical_stats.items():
+        decided = vs["won"] + vs["lost"]
+        vs["win_rate"] = round((vs["won"] / decided) * 100) if decided else 0
+        vs["total_value"] = vs["won_value"] + vs["lost_value"]
+
+    # Top competitors
+    competitor_counter = Counter()
+    competitor_wins = Counter()
+    for p in won_projects + lost_projects:
+        if p.competitor_name:
+            competitor_counter[p.competitor_name] += 1
+            if p.status == "won":
+                competitor_wins[p.competitor_name] += 1
+    top_competitors = []
+    for name, total in competitor_counter.most_common(10):
+        wins = competitor_wins.get(name, 0)
+        losses = total - wins
+        top_competitors.append({
+            "name": name,
+            "total": total,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round((wins / total) * 100) if total else 0,
+        })
+
+    # Close reason categories breakdown
+    category_labels = {
+        "price": "Price",
+        "scope": "Scope",
+        "schedule": "Schedule / Timing",
+        "relationship": "Relationship / Incumbent",
+        "technical": "Technical Approach",
+        "compliance": "Compliance / Requirements",
+        "other": "Other",
+    }
+    won_category_counts = {k: 0 for k in category_labels}
+    lost_category_counts = {k: 0 for k in category_labels}
+    for p in won_projects:
+        key = p.close_category or "other"
+        if key in won_category_counts:
+            won_category_counts[key] += 1
+    for p in lost_projects:
+        key = p.close_category or "other"
+        if key in lost_category_counts:
+            lost_category_counts[key] += 1
+
+    # Monthly trend (last 6 months of closures)
+    from datetime import timedelta
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    trend = OrderedDict()
+    for i in range(5, -1, -1):
+        # Approximate by calendar month
+        m = now.month - i
+        y = now.year
+        while m <= 0:
+            m += 12
+            y -= 1
+        key = f"{y}-{m:02d}"
+        trend[key] = {"won": 0, "lost": 0, "won_value": 0, "lost_value": 0}
+
+    for p in won_projects + lost_projects:
+        when = p.closed_at or p.submitted_at or p.updated_at
+        if not when:
+            continue
+        when = when.replace(tzinfo=None) if when.tzinfo else when
+        key = f"{when.year}-{when.month:02d}"
+        if key in trend:
+            if p.status == "won":
+                trend[key]["won"] += 1
+                trend[key]["won_value"] += p.dollar_amount or 0
+            else:
+                trend[key]["lost"] += 1
+                trend[key]["lost_value"] += p.dollar_amount or 0
+
+    # Recently closed projects with missing details (prompt user to fill in)
+    missing_details = [
+        p for p in (won_projects + lost_projects)
+        if not (p.close_reason or p.close_category or p.competitor_name)
+    ]
+    missing_details.sort(key=lambda p: p.closed_at or p.updated_at or now, reverse=True)
+
+    stats = {
+        "total_projects": len(all_projects),
+        "total_active": sum(1 for p in all_projects if p.status == "active"),
+        "total_submitted": sum(1 for p in all_projects if p.status == "submitted"),
+        "total_won": total_won,
+        "total_lost": total_lost,
+        "win_rate": overall_win_rate,
+        "won_value": won_value,
+        "lost_value": lost_value,
+    }
+
+    return render_template(
+        "reports.html",
+        stats=stats,
+        vertical_stats=vertical_stats,
+        top_competitors=top_competitors,
+        won_category_counts=won_category_counts,
+        lost_category_counts=lost_category_counts,
+        category_labels=category_labels,
+        trend=trend,
+        missing_details=missing_details[:10],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Global Search (Part 2)
+# ---------------------------------------------------------------------------
+
+@app.route("/search")
+@login_required
+def search():
+    """Unified search across projects, proposals, and documents."""
+    q = request.args.get("q", "").strip()
+    results = {"projects": [], "proposals": [], "documents": [], "comments": []}
+
+    if not q or len(q) < 2:
+        return render_template("search.html", q=q, results=results, total=0)
+
+    like = f"%{q}%"
+
+    # Projects (owned or assigned)
+    proj_query = Project.query.filter(
+        db.or_(
+            Project.name.ilike(like),
+            Project.client_name.ilike(like),
+            Project.close_reason.ilike(like),
+            Project.competitor_name.ilike(like),
+        )
+    )
+    if not current_user.is_admin:
+        proj_query = proj_query.filter(_my_projects_filter())
+    results["projects"] = proj_query.order_by(Project.updated_at.desc()).limit(25).all()
+
+    # Documents (under user's projects, or admin sees all)
+    if current_user.is_admin:
+        accessible_project_ids = [p.id for p in Project.query.all()]
+    else:
+        accessible_project_ids = [
+            p.id for p in Project.query.filter(_my_projects_filter()).all()
+        ]
+    doc_query = ProjectDocument.query.filter(
+        ProjectDocument.project_id.in_(accessible_project_ids),
+        db.or_(
+            ProjectDocument.original_filename.ilike(like),
+            ProjectDocument.notes.ilike(like),
+            ProjectDocument.version_label.ilike(like),
+        ),
+    )
+    results["documents"] = doc_query.order_by(ProjectDocument.uploaded_at.desc()).limit(25).all()
+
+    # Proposals — search within markdown content of their latest version
+    prop_query = Proposal.query.filter(Proposal.project_id.in_(accessible_project_ids))
+    proposal_matches = []
+    for prop in prop_query.limit(200).all():
+        latest = ProposalVersion.query.filter_by(proposal_id=prop.id).order_by(
+            ProposalVersion.version_number.desc()
+        ).first()
+        if latest and q.lower() in (latest.markdown_content or "").lower():
+            # Extract a small snippet around the match
+            content = latest.markdown_content
+            lower = content.lower()
+            idx = lower.find(q.lower())
+            start = max(0, idx - 60)
+            end = min(len(content), idx + len(q) + 60)
+            snippet = content[start:end].replace("\n", " ")
+            if start > 0:
+                snippet = "…" + snippet
+            if end < len(content):
+                snippet = snippet + "…"
+            proposal_matches.append({"proposal": prop, "snippet": snippet})
+    results["proposals"] = proposal_matches[:25]
+
+    # Comments
+    if current_user.is_admin:
+        comment_query = ProposalComment.query.filter(ProposalComment.body.ilike(like))
+    else:
+        accessible_proposal_ids = [
+            p.id for p in Proposal.query.filter(Proposal.project_id.in_(accessible_project_ids)).all()
+        ]
+        comment_query = ProposalComment.query.filter(
+            ProposalComment.proposal_id.in_(accessible_proposal_ids),
+            ProposalComment.body.ilike(like),
+        )
+    results["comments"] = comment_query.order_by(ProposalComment.created_at.desc()).limit(25).all()
+
+    total = (
+        len(results["projects"])
+        + len(results["proposals"])
+        + len(results["documents"])
+        + len(results["comments"])
+    )
+
+    # Build project lookup for display
+    project_lookup = {p.id: p for p in Project.query.filter(
+        Project.id.in_(accessible_project_ids)
+    ).all()}
+
+    return render_template(
+        "search.html",
+        q=q,
+        results=results,
+        total=total,
+        project_lookup=project_lookup,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Proposal Comments (Part 2)
+# ---------------------------------------------------------------------------
+
+@app.route("/proposal/<proposal_id>/comments", methods=["POST"])
+@login_required
+def add_proposal_comment(proposal_id):
+    """Add a review comment to a proposal."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    body = request.form.get("body", "").strip()
+    section_anchor = request.form.get("section_anchor", "").strip()
+    if not body:
+        flash("Comment cannot be empty.", "error")
+        return redirect(request.referrer or url_for("view_proposal", proposal_id=proposal_id))
+
+    comment = ProposalComment(
+        proposal_id=proposal_id,
+        author_id=current_user.id,
+        body=body,
+        section_anchor=section_anchor,
+    )
+    db.session.add(comment)
+    db.session.commit()
+    _log_activity("proposal_comment_add", f"Comment on {proposal.job_id}", project.id)
+
+    # Notify owner/assignee if they are not the author
+    notify_ids = set()
+    if project.user_id != current_user.id:
+        notify_ids.add(project.user_id)
+    if project.assigned_to and project.assigned_to != current_user.id:
+        notify_ids.add(project.assigned_to)
+    for uid in notify_ids:
+        _notify(
+            uid,
+            "proposal_comment",
+            f"New comment on {project.name}",
+            f"{current_user.display_name or current_user.username}: {body[:140]}",
+            link=f"/proposal/{proposal_id}#comment-{comment.id}",
+        )
+
+    flash("Comment posted.", "success")
+    return redirect(request.referrer or url_for("view_proposal", proposal_id=proposal_id))
+
+
+@app.route("/proposal/<proposal_id>/comments/<comment_id>/resolve", methods=["POST"])
+@login_required
+def resolve_proposal_comment(proposal_id, comment_id):
+    """Mark a comment as resolved or unresolve it."""
+    comment = db.session.get(ProposalComment, comment_id)
+    if not comment or comment.proposal_id != proposal_id:
+        abort(404)
+    proposal = db.session.get(Proposal, proposal_id)
+    project = db.session.get(Project, proposal.project_id) if proposal else None
+    if not _can_access_project(project):
+        abort(404)
+
+    if comment.is_resolved:
+        comment.is_resolved = False
+        comment.resolved_by = None
+        comment.resolved_at = None
+    else:
+        comment.is_resolved = True
+        comment.resolved_by = current_user.id
+        comment.resolved_at = datetime.now(timezone.utc)
+    db.session.commit()
+    return redirect(request.referrer or url_for("view_proposal", proposal_id=proposal_id))
+
+
+@app.route("/proposal/<proposal_id>/comments/<comment_id>/delete", methods=["POST"])
+@login_required
+def delete_proposal_comment(proposal_id, comment_id):
+    """Delete a comment (author or admin only)."""
+    comment = db.session.get(ProposalComment, comment_id)
+    if not comment or comment.proposal_id != proposal_id:
+        abort(404)
+    if comment.author_id != current_user.id and not current_user.is_admin:
+        abort(403)
+    db.session.delete(comment)
+    db.session.commit()
+    flash("Comment deleted.", "success")
+    return redirect(request.referrer or url_for("view_proposal", proposal_id=proposal_id))
 
 
 # ---------------------------------------------------------------------------

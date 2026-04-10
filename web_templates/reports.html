@@ -1,0 +1,237 @@
+{% extends "base.html" %}
+
+{% block title %}Reports &mdash; {{ app_name }}{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <div class="page-header-row">
+        <div>
+            <h1>Reports &amp; Win/Loss Analysis</h1>
+            <p class="page-subtitle">Performance metrics, vertical breakdown, and competitor intel.</p>
+        </div>
+    </div>
+</section>
+
+<!-- Overview stats -->
+<section class="stats-grid">
+    <div class="stat-card">
+        <span class="stat-number">{{ stats.total_projects }}</span>
+        <span class="stat-label">Total Projects</span>
+    </div>
+    <div class="stat-card stat-green">
+        <span class="stat-number">{{ stats.win_rate }}%</span>
+        <span class="stat-label">Win Rate</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-number">{{ stats.total_won }} / {{ stats.total_lost }}</span>
+        <span class="stat-label">Won / Lost</span>
+    </div>
+    <div class="stat-card stat-green">
+        <span class="stat-number">${{ "{:,.0f}".format(stats.won_value) }}</span>
+        <span class="stat-label">Revenue Won</span>
+    </div>
+    <div class="stat-card stat-red">
+        <span class="stat-number">${{ "{:,.0f}".format(stats.lost_value) }}</span>
+        <span class="stat-label">Revenue Lost</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-number">{{ stats.total_active }}</span>
+        <span class="stat-label">Active Pipeline</span>
+    </div>
+</section>
+
+<!-- Monthly trend (simple CSS bars) -->
+<div class="card">
+    <h2>Closed Projects — Last 6 Months</h2>
+    <div class="trend-chart">
+        {% set max_count = namespace(val=1) %}
+        {% for _, v in trend.items() %}
+        {% if v.won + v.lost > max_count.val %}{% set max_count.val = v.won + v.lost %}{% endif %}
+        {% endfor %}
+        {% for month_key, v in trend.items() %}
+        <div class="trend-col">
+            <div class="trend-bars">
+                {% set won_h = (v.won * 100 / max_count.val) | round(0, 'floor') %}
+                {% set lost_h = (v.lost * 100 / max_count.val) | round(0, 'floor') %}
+                <div class="trend-bar trend-bar-won" style="height: {{ won_h }}%;" title="Won: {{ v.won }} (${{ '{:,.0f}'.format(v.won_value) }})"></div>
+                <div class="trend-bar trend-bar-lost" style="height: {{ lost_h }}%;" title="Lost: {{ v.lost }} (${{ '{:,.0f}'.format(v.lost_value) }})"></div>
+            </div>
+            <div class="trend-label">{{ month_key }}</div>
+            <div class="trend-count">{{ v.won + v.lost }}</div>
+        </div>
+        {% endfor %}
+    </div>
+    <div class="trend-legend">
+        <span><span class="legend-swatch legend-won"></span> Won</span>
+        <span><span class="legend-swatch legend-lost"></span> Lost</span>
+    </div>
+</div>
+
+<!-- Vertical performance -->
+<div class="card">
+    <h2>Performance by Vertical</h2>
+    {% if vertical_stats %}
+    <table class="proposals-table">
+        <thead>
+            <tr>
+                <th>Vertical</th>
+                <th>Active</th>
+                <th>Won</th>
+                <th>Lost</th>
+                <th>Win Rate</th>
+                <th>Won Value</th>
+                <th>Lost Value</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for label, vs in vertical_stats.items() %}
+            <tr>
+                <td><span class="badge badge-vertical">{{ label }}</span></td>
+                <td>{{ vs.active }}</td>
+                <td class="text-success">{{ vs.won }}</td>
+                <td class="text-danger">{{ vs.lost }}</td>
+                <td>
+                    <div class="winrate-bar">
+                        <div class="winrate-fill" style="width: {{ vs.win_rate }}%;"></div>
+                        <span>{{ vs.win_rate }}%</span>
+                    </div>
+                </td>
+                <td>${{ "{:,.0f}".format(vs.won_value) }}</td>
+                <td>${{ "{:,.0f}".format(vs.lost_value) }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p class="empty-state">No projects yet.</p>
+    {% endif %}
+</div>
+
+<!-- Win/Loss reason categories -->
+<div class="card-grid">
+    <div class="card">
+        <h2>Reasons — Wins</h2>
+        {% set total_wins = namespace(v=0) %}
+        {% for _, c in won_category_counts.items() %}{% set total_wins.v = total_wins.v + c %}{% endfor %}
+        {% if total_wins.v > 0 %}
+        <ul class="reason-list">
+            {% for key, label in category_labels.items() %}
+            {% set count = won_category_counts[key] %}
+            {% if count > 0 %}
+            <li>
+                <div class="reason-row">
+                    <span class="reason-label">{{ label }}</span>
+                    <span class="reason-count">{{ count }}</span>
+                </div>
+                <div class="reason-bar">
+                    <div class="reason-fill reason-fill-won" style="width: {{ (count * 100 / total_wins.v) | round(0, 'floor') }}%"></div>
+                </div>
+            </li>
+            {% endif %}
+            {% endfor %}
+        </ul>
+        {% else %}
+        <p class="empty-state">No win reasons recorded yet.</p>
+        {% endif %}
+    </div>
+    <div class="card">
+        <h2>Reasons — Losses</h2>
+        {% set total_losses = namespace(v=0) %}
+        {% for _, c in lost_category_counts.items() %}{% set total_losses.v = total_losses.v + c %}{% endfor %}
+        {% if total_losses.v > 0 %}
+        <ul class="reason-list">
+            {% for key, label in category_labels.items() %}
+            {% set count = lost_category_counts[key] %}
+            {% if count > 0 %}
+            <li>
+                <div class="reason-row">
+                    <span class="reason-label">{{ label }}</span>
+                    <span class="reason-count">{{ count }}</span>
+                </div>
+                <div class="reason-bar">
+                    <div class="reason-fill reason-fill-lost" style="width: {{ (count * 100 / total_losses.v) | round(0, 'floor') }}%"></div>
+                </div>
+            </li>
+            {% endif %}
+            {% endfor %}
+        </ul>
+        {% else %}
+        <p class="empty-state">No loss reasons recorded yet.</p>
+        {% endif %}
+    </div>
+</div>
+
+<!-- Top competitors -->
+{% if top_competitors %}
+<div class="card">
+    <h2>Top Competitors</h2>
+    <table class="proposals-table">
+        <thead>
+            <tr>
+                <th>Competitor</th>
+                <th>Encounters</th>
+                <th>Wins Against</th>
+                <th>Losses To</th>
+                <th>Our Win Rate</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for c in top_competitors %}
+            <tr>
+                <td><strong>{{ c.name }}</strong></td>
+                <td>{{ c.total }}</td>
+                <td class="text-success">{{ c.wins }}</td>
+                <td class="text-danger">{{ c.losses }}</td>
+                <td>
+                    <div class="winrate-bar">
+                        <div class="winrate-fill" style="width: {{ c.win_rate }}%;"></div>
+                        <span>{{ c.win_rate }}%</span>
+                    </div>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+<!-- Missing details call-to-action -->
+{% if missing_details %}
+<div class="card card-highlight">
+    <h2>Fill in Missing Close Details</h2>
+    <p class="card-desc">These closed projects are missing win/loss reasons or competitor info. Add context to strengthen reports.</p>
+    <table class="proposals-table">
+        <thead>
+            <tr>
+                <th>Project</th>
+                <th>Status</th>
+                <th>Value</th>
+                <th>Close Details</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for p in missing_details %}
+            <tr>
+                <td><a href="{{ url_for('project_upload', project_id=p.id) }}">{{ p.name }}</a></td>
+                <td><span class="badge badge-status-{{ p.status }}">{{ p.status }}</span></td>
+                <td>{{ "${:,.0f}".format(p.dollar_amount) if p.dollar_amount else '—' }}</td>
+                <td>
+                    <form method="post" action="{{ url_for('update_close_details', project_id=p.id) }}" class="close-details-inline-form">
+                        <select name="close_category" class="status-select">
+                            <option value="">Category…</option>
+                            {% for key, label in category_labels.items() %}
+                            <option value="{{ key }}" {{ 'selected' if p.close_category == key }}>{{ label }}</option>
+                            {% endfor %}
+                        </select>
+                        <input type="text" name="competitor_name" placeholder="Competitor" value="{{ p.competitor_name }}" class="inline-text">
+                        <input type="text" name="close_reason" placeholder="Reason / notes" value="{{ p.close_reason }}" class="inline-text inline-text-wide">
+                        <button type="submit" class="btn btn-small btn-primary">Save</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+{% endblock %}

@@ -56,8 +56,21 @@ docker compose up -d
 3. **Analyze** — Requirements, evaluation criteria, deliverables, and constraints are identified.
 4. **Match** — Past proposals and reference documents are searched for relevant content.
 5. **Generate** — A complete proposal is drafted using your templates, tailored to the specific RFP/RFQ.
-6. **Review** — The generated proposal is presented with action items that require human input.
+6. **Review** — The generated proposal is presented with action items that require human input, plus inline team review comments.
 7. **Download** — The proposal can be downloaded as DOCX or Markdown.
+8. **Track & Analyze** — When the deal closes, capture win/loss reasons and competitor info for reporting.
+
+---
+
+## Part 2 Features — Sales Intelligence & Collaboration
+
+On top of the core proposal workflow, Proposal Manager includes:
+
+- **Deadlines & Calendar** — Assign due dates to projects; view them in a monthly calendar, with overdue and "due soon" widgets on the dashboard.
+- **Win/Loss Analysis** — When closing a project as won or lost, capture the reason, category (price, scope, schedule, relationship, technical, compliance), and competitor name. Data feeds into reports for retrospective analysis.
+- **Reports Dashboard** — `/reports` shows win rate, pipeline value, closed-project trend over the last 6 months, vertical performance breakdown, top competitors, and reason-category breakdowns for wins and losses.
+- **Proposal Review Comments** — Team members can post inline review comments on any proposal, optionally anchored to a specific section. Comments can be resolved, unresolved, or deleted. Comment authors and project owners/assignees are notified automatically.
+- **Global Search** — A top-bar search box at `/search` searches projects, proposal content (all versions), documents, notes, version labels, and review comments — all scoped to projects the user owns or is assigned to (admins see everything).
 
 ---
 

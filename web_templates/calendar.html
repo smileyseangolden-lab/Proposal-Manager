@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+
+{% block title %}Calendar &mdash; {{ app_name }}{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <div class="page-header-row">
+        <div>
+            <h1>Proposal Calendar</h1>
+            <p class="page-subtitle">Upcoming deadlines and due dates across your projects.</p>
+        </div>
+        <div class="header-actions">
+            <a href="{{ url_for('new_project') }}" class="btn btn-primary">+ New Project</a>
+        </div>
+    </div>
+</section>
+
+{% if overdue %}
+<div class="card card-danger">
+    <h2>Overdue ({{ overdue|length }})</h2>
+    <p class="card-desc">Active projects past their due date.</p>
+    <ul class="deadline-list">
+        {% for p in overdue %}
+        <li>
+            <span class="deadline-date">{{ p.due_date.strftime('%Y-%m-%d') }}</span>
+            <a href="{{ url_for('project_upload', project_id=p.id) }}">{{ p.name }}</a>
+            <span class="deadline-client">{{ p.client_name or '' }}</span>
+        </li>
+        {% endfor %}
+    </ul>
+</div>
+{% endif %}
+
+{% if upcoming %}
+<div class="card">
+    <h2>Upcoming (next 14 days)</h2>
+    <ul class="deadline-list">
+        {% for p in upcoming %}
+        <li>
+            <span class="deadline-date">{{ p.due_date.strftime('%Y-%m-%d') }}</span>
+            <a href="{{ url_for('project_upload', project_id=p.id) }}">{{ p.name }}</a>
+            <span class="deadline-client">{{ p.client_name or '' }}</span>
+        </li>
+        {% endfor %}
+    </ul>
+</div>
+{% endif %}
+
+<div class="card">
+    <div class="calendar-header">
+        <h2>{{ month_name }} {{ year }}</h2>
+        <div class="calendar-nav">
+            <a href="{{ url_for('calendar_view', year=prev_year, month=prev_month) }}" class="btn btn-small btn-secondary">&laquo; Prev</a>
+            <a href="{{ url_for('calendar_view') }}" class="btn btn-small btn-secondary">Today</a>
+            <a href="{{ url_for('calendar_view', year=next_year, month=next_month) }}" class="btn btn-small btn-secondary">Next &raquo;</a>
+        </div>
+    </div>
+
+    <table class="calendar-grid">
+        <thead>
+            <tr>
+                <th>Mon</th><th>Tue</th><th>Wed</th><th>Thu</th><th>Fri</th><th>Sat</th><th>Sun</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% set ns = namespace(day=1, started=false) %}
+            {% for week in range(6) %}
+            {% if ns.day <= days_in_month %}
+            <tr>
+                {% for weekday in range(7) %}
+                {% if not ns.started and weekday == first_weekday %}
+                {% set ns.started = true %}
+                {% endif %}
+                {% if ns.started and ns.day <= days_in_month %}
+                <td class="calendar-cell{% if today_day == ns.day %} calendar-today{% endif %}">
+                    <div class="calendar-day-number">{{ ns.day }}</div>
+                    {% if by_day[ns.day] %}
+                    <ul class="calendar-events">
+                        {% for p in by_day[ns.day] %}
+                        <li class="calendar-event calendar-event-{{ p.status }}">
+                            <a href="{{ url_for('project_upload', project_id=p.id) }}" title="{{ p.name }} — {{ p.client_name }}">
+                                {{ p.name[:26] }}{% if p.name|length > 26 %}…{% endif %}
+                            </a>
+                        </li>
+                        {% endfor %}
+                    </ul>
+                    {% endif %}
+                </td>
+                {% set ns.day = ns.day + 1 %}
+                {% else %}
+                <td class="calendar-cell calendar-cell-empty"></td>
+                {% endif %}
+                {% endfor %}
+            </tr>
+            {% endif %}
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

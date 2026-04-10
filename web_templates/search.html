@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+
+{% block title %}Search &mdash; {{ app_name }}{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <h1>Search</h1>
+    <p class="page-subtitle">Find projects, proposals, documents, and review comments.</p>
+</section>
+
+<div class="card">
+    <form method="get" action="{{ url_for('search') }}" class="search-form">
+        <input type="text" name="q" value="{{ q }}" placeholder="Type at least 2 characters…" autofocus class="search-input-large">
+        <button type="submit" class="btn btn-primary">Search</button>
+    </form>
+</div>
+
+{% if q and q|length < 2 %}
+<p class="empty-state">Enter at least 2 characters to search.</p>
+{% elif q %}
+
+{% if total == 0 %}
+<div class="card">
+    <p class="empty-state">No results found for <strong>&ldquo;{{ q }}&rdquo;</strong>.</p>
+</div>
+{% else %}
+<p class="search-summary">{{ total }} result{{ 's' if total != 1 }} for <strong>&ldquo;{{ q }}&rdquo;</strong></p>
+
+{% if results.projects %}
+<div class="card">
+    <h2>Projects ({{ results.projects|length }})</h2>
+    <table class="proposals-table">
+        <thead>
+            <tr><th>Name</th><th>Client</th><th>Status</th><th>Vertical</th><th>Updated</th></tr>
+        </thead>
+        <tbody>
+            {% for p in results.projects %}
+            <tr>
+                <td><a href="{{ url_for('project_upload', project_id=p.id) }}" class="project-link">{{ p.name }}</a></td>
+                <td>{{ p.client_name or '—' }}</td>
+                <td><span class="badge badge-status-{{ p.status }}">{{ p.status }}</span></td>
+                <td><span class="badge badge-vertical">{{ p.vertical_label }}</span></td>
+                <td>{{ p.updated_at.strftime('%Y-%m-%d') }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+{% if results.proposals %}
+<div class="card">
+    <h2>Proposals ({{ results.proposals|length }})</h2>
+    <ul class="search-result-list">
+        {% for item in results.proposals %}
+        {% set prop = item.proposal %}
+        {% set parent = project_lookup.get(prop.project_id) %}
+        <li>
+            <a href="{{ url_for('view_proposal', proposal_id=prop.id) }}" class="search-title">
+                {{ parent.name if parent else 'Proposal' }} —
+                <span class="badge badge-vertical">{{ prop.vertical_label }}</span>
+            </a>
+            <p class="search-snippet">{{ item.snippet }}</p>
+            <span class="search-meta">Generated {{ prop.generated_at.strftime('%Y-%m-%d') if prop.generated_at else '' }}</span>
+        </li>
+        {% endfor %}
+    </ul>
+</div>
+{% endif %}
+
+{% if results.documents %}
+<div class="card">
+    <h2>Documents ({{ results.documents|length }})</h2>
+    <ul class="search-result-list">
+        {% for doc in results.documents %}
+        {% set parent = project_lookup.get(doc.project_id) %}
+        <li>
+            <a href="{{ url_for('download_document', doc_id=doc.id) }}" class="search-title">{{ doc.original_filename }}</a>
+            <span class="search-meta">
+                <span class="badge">{{ doc.file_type }}</span>
+                {% if parent %}in <a href="{{ url_for('project_upload', project_id=parent.id) }}">{{ parent.name }}</a>{% endif %}
+                {% if doc.version_label %} — {{ doc.version_label }}{% endif %}
+            </span>
+            {% if doc.notes %}<p class="search-snippet">{{ doc.notes[:200] }}</p>{% endif %}
+        </li>
+        {% endfor %}
+    </ul>
+</div>
+{% endif %}
+
+{% if results.comments %}
+<div class="card">
+    <h2>Review Comments ({{ results.comments|length }})</h2>
+    <ul class="search-result-list">
+        {% for c in results.comments %}
+        <li>
+            <a href="{{ url_for('view_proposal', proposal_id=c.proposal_id) }}#comment-{{ c.id }}" class="search-title">
+                {{ c.author.display_name or c.author.username if c.author else 'User' }}
+                <span class="search-meta">on {{ c.created_at.strftime('%Y-%m-%d') }}</span>
+                {% if c.is_resolved %}<span class="badge">Resolved</span>{% endif %}
+            </a>
+            <p class="search-snippet">{{ c.body[:300] }}</p>
+        </li>
+        {% endfor %}
+    </ul>
+</div>
+{% endif %}
+
+{% endif %}
+{% endif %}
+{% endblock %}

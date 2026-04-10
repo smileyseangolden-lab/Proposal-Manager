@@ -69,6 +69,15 @@ class Project(db.Model):
     updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow)
     submitted_at = db.Column(db.DateTime, nullable=True)
 
+    # Deadline / calendar tracking
+    due_date = db.Column(db.DateTime, nullable=True)
+
+    # Win/Loss analysis (captured when project is marked won or lost)
+    close_reason = db.Column(db.Text, default="")  # Narrative reason for win/loss
+    close_category = db.Column(db.String(50), default="")  # price, scope, schedule, relationship, technical, compliance, other
+    competitor_name = db.Column(db.String(300), default="")
+    closed_at = db.Column(db.DateTime, nullable=True)
+
     # Relationships
     documents = db.relationship("ProjectDocument", backref="project", lazy="dynamic")
     proposals = db.relationship("Proposal", backref="project", lazy="dynamic")
@@ -310,3 +319,22 @@ class ActivityLog(db.Model):
     detail = db.Column(db.Text, default="")
     project_id = db.Column(db.String(32), nullable=True)
     created_at = db.Column(db.DateTime, default=_utcnow)
+
+
+class ProposalComment(db.Model):
+    """Team review comments on a proposal. Supports section anchors and resolution."""
+    __tablename__ = "proposal_comments"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    proposal_id = db.Column(db.String(32), db.ForeignKey("proposals.id"), nullable=False)
+    author_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    section_anchor = db.Column(db.String(300), default="")  # Heading text or selector the comment refers to
+    body = db.Column(db.Text, nullable=False)
+    is_resolved = db.Column(db.Boolean, default=False)
+    resolved_by = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    resolved_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=_utcnow)
+
+    proposal = db.relationship("Proposal", backref="comments")
+    author = db.relationship("User", foreign_keys=[author_id], backref="proposal_comments")
+    resolver = db.relationship("User", foreign_keys=[resolved_by])

@@ -53,6 +53,39 @@
 </div>
 {% endif %}
 
+<!-- Overdue + Upcoming Deadlines -->
+{% if overdue_projects or upcoming_deadlines %}
+<div class="card-grid deadline-card-grid">
+    {% if overdue_projects %}
+    <div class="card card-danger">
+        <h2>Overdue <span class="badge badge-danger">{{ overdue_projects|length }}</span></h2>
+        <ul class="deadline-list">
+            {% for p in overdue_projects %}
+            <li>
+                <span class="deadline-date">{{ p.due_date.strftime('%Y-%m-%d') }}</span>
+                <a href="{{ url_for('project_upload', project_id=p.id) }}">{{ p.name }}</a>
+            </li>
+            {% endfor %}
+        </ul>
+    </div>
+    {% endif %}
+    {% if upcoming_deadlines %}
+    <div class="card card-highlight">
+        <h2>Due Soon (7 days) <span class="badge">{{ upcoming_deadlines|length }}</span></h2>
+        <ul class="deadline-list">
+            {% for p in upcoming_deadlines %}
+            <li>
+                <span class="deadline-date">{{ p.due_date.strftime('%Y-%m-%d') }}</span>
+                <a href="{{ url_for('project_upload', project_id=p.id) }}">{{ p.name }}</a>
+            </li>
+            {% endfor %}
+        </ul>
+        <a href="{{ url_for('calendar_view') }}" class="btn btn-small btn-secondary">Open Calendar</a>
+    </div>
+    {% endif %}
+</div>
+{% endif %}
+
 <!-- Stats cards -->
 <section class="stats-grid">
     <div class="stat-card">
@@ -185,6 +218,7 @@
                 <th>Project Name</th>
                 <th>Client</th>
                 <th>Vertical</th>
+                <th>Due</th>
                 <th>Assigned To</th>
                 <th>Created</th>
                 <th>Status</th>
@@ -197,6 +231,11 @@
                 <td><a href="{{ url_for('project_upload', project_id=p.id) }}" class="project-link">{{ p.name }}</a></td>
                 <td>{{ p.client_name or '&mdash;' }}</td>
                 <td><span class="badge badge-vertical">{{ p.vertical_label or 'Not set' }}</span></td>
+                <td class="row-actions" onclick="event.stopPropagation()">
+                    <form method="post" action="{{ url_for('set_project_due_date', project_id=p.id) }}" class="inline-form">
+                        <input type="date" name="due_date" value="{{ p.due_date.strftime('%Y-%m-%d') if p.due_date else '' }}" onchange="this.form.submit()" class="date-input-small" title="Set due date">
+                    </form>
+                </td>
                 <td class="row-actions" onclick="event.stopPropagation()">
                     {% if p.user_id == current_user.id or current_user.is_admin %}
                     <form method="post" action="{{ url_for('assign_project', project_id=p.id) }}" class="inline-form">
@@ -214,14 +253,18 @@
                 <td>{{ p.created_at.strftime('%Y-%m-%d') }}</td>
                 <td><span class="badge badge-status-{{ p.status }}">{{ p.status }}</span></td>
                 <td class="row-actions" onclick="event.stopPropagation()">
-                    <form method="post" action="{{ url_for('update_project_status', project_id=p.id) }}" class="inline-form">
-                        <select name="status" onchange="this.form.submit()" class="status-select">
+                    <form method="post" action="{{ url_for('update_project_status', project_id=p.id) }}" class="inline-form js-status-form" data-project-name="{{ p.name }}">
+                        <select name="status" class="status-select">
                             <option value="active" {{ 'selected' if p.status == 'active' }}>Active</option>
                             <option value="submitted" {{ 'selected' if p.status == 'submitted' }}>Submitted</option>
                             <option value="won" {{ 'selected' if p.status == 'won' }}>Won</option>
                             <option value="lost" {{ 'selected' if p.status == 'lost' }}>Lost</option>
                             <option value="archived" {{ 'selected' if p.status == 'archived' }}>Archived</option>
                         </select>
+                        <input type="hidden" name="close_category" value="">
+                        <input type="hidden" name="competitor_name" value="">
+                        <input type="hidden" name="close_reason" value="">
+                        <input type="hidden" name="dollar_amount" value="{{ p.dollar_amount or '' }}">
                     </form>
                 </td>
             </tr>
@@ -276,6 +319,38 @@
     </table>
 </section>
 {% endif %}
+<!-- Close Details Modal -->
+<div id="close-details-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal-card">
+        <h2 id="close-modal-title">Capture Close Details</h2>
+        <p class="form-hint">Help build better win/loss reports by capturing what happened.</p>
+        <div class="form-group">
+            <label>Category</label>
+            <select id="close-modal-category">
+                <option value="">Select a category…</option>
+                {% for key, label in (close_category_labels or {}).items() %}
+                <option value="{{ key }}">{{ label }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="form-group">
+            <label>Competitor (if known)</label>
+            <input type="text" id="close-modal-competitor" placeholder="e.g., Acme Controls">
+        </div>
+        <div class="form-group">
+            <label>Reason / Notes</label>
+            <textarea id="close-modal-reason" rows="3" placeholder="Briefly, why was this won/lost?"></textarea>
+        </div>
+        <div class="form-group">
+            <label>Dollar value (optional)</label>
+            <input type="text" id="close-modal-amount" placeholder="e.g., 150000">
+        </div>
+        <div class="modal-actions">
+            <button type="button" class="btn btn-secondary" id="close-modal-cancel">Cancel</button>
+            <button type="button" class="btn btn-primary" id="close-modal-submit">Save &amp; Close Project</button>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -285,5 +360,60 @@ document.querySelectorAll(".clickable-row").forEach(function(row) {
         window.location.href = this.dataset.href;
     });
 });
+
+// Status change — if won/lost, show modal for close details; otherwise submit immediately
+(function(){
+    var modal = document.getElementById("close-details-modal");
+    var cancelBtn = document.getElementById("close-modal-cancel");
+    var submitBtn = document.getElementById("close-modal-submit");
+    var titleEl = document.getElementById("close-modal-title");
+    var categoryEl = document.getElementById("close-modal-category");
+    var competitorEl = document.getElementById("close-modal-competitor");
+    var reasonEl = document.getElementById("close-modal-reason");
+    var amountEl = document.getElementById("close-modal-amount");
+    var activeForm = null;
+
+    document.querySelectorAll(".js-status-form select[name='status']").forEach(function(sel){
+        sel.addEventListener("change", function(){
+            var form = sel.closest("form");
+            var status = sel.value;
+            if (status === "won" || status === "lost") {
+                // Populate modal defaults from current form
+                activeForm = form;
+                titleEl.textContent = "Close as " + status.charAt(0).toUpperCase() + status.slice(1) +
+                    ": " + form.dataset.projectName;
+                categoryEl.value = "";
+                competitorEl.value = "";
+                reasonEl.value = "";
+                amountEl.value = form.querySelector("input[name='dollar_amount']").value || "";
+                modal.style.display = "flex";
+            } else {
+                form.submit();
+            }
+        });
+    });
+
+    cancelBtn.addEventListener("click", function(){
+        modal.style.display = "none";
+        // Reset the select to the previously selected option — since we don't know it,
+        // reload the page to get fresh state.
+        window.location.reload();
+    });
+
+    submitBtn.addEventListener("click", function(){
+        if (!activeForm) return;
+        activeForm.querySelector("input[name='close_category']").value = categoryEl.value;
+        activeForm.querySelector("input[name='competitor_name']").value = competitorEl.value;
+        activeForm.querySelector("input[name='close_reason']").value = reasonEl.value;
+        activeForm.querySelector("input[name='dollar_amount']").value = amountEl.value;
+        activeForm.submit();
+    });
+
+    modal.addEventListener("click", function(e){
+        if (e.target === modal) {
+            cancelBtn.click();
+        }
+    });
+})();
 </script>
 {% endblock %}
