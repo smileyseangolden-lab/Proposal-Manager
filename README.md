@@ -49,6 +49,86 @@ docker compose up -d
 
 ---
 
+## Production Deployment Notes (Hostinger VPS reference setup)
+
+The production deployment at `srv1338704` runs this app alongside a separate
+CloserAI stack on the same Docker host. These notes document the network path
+end-to-end so the next developer doesn't hit the same pitfalls.
+
+### Port map
+
+| Layer | Binding | Purpose |
+|---|---|---|
+| Hostinger cloud firewall | TCP **5000** inbound allowed from `0.0.0.0/0` | Public entry point |
+| Host nginx | `listen 5000;` (public, all interfaces) | Reverse proxy |
+| Host nginx `proxy_pass` | `http://127.0.0.1:15010` | Forwards to Docker |
+| Docker published port | `127.0.0.1:15010:5000` | Host → container |
+| Container (gunicorn) | `0.0.0.0:5000` inside container | Flask app |
+
+The app is reachable in a browser at `http://<vps-ip>:5000`. **Port 15010 is
+loopback-only** and not directly reachable from outside.
+
+### nginx config location
+
+`/etc/nginx/sites-available/docker-apps` contains the `server` block for this
+app. If you change the `127.0.0.1:15010` published port in
+`docker-compose.yml`, update `proxy_pass` in that file too and run:
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Make sure nginx is enabled at boot: `sudo systemctl enable nginx`.
+
+### Hostinger cloud firewall
+
+Hostinger runs a cloud firewall in front of the VPS that is **separate** from
+`ufw`/`iptables` inside the VM. Any inbound port the app needs must be opened
+in **hPanel → VPS → Security/Networking → Firewall** and synchronized to the
+VPS. Currently TCP **5000** is allowed from `0.0.0.0/0`. `ufw` and `iptables`
+on the VPS itself are intentionally open — the cloud firewall is the
+authoritative perimeter.
+
+### Why port 15010 instead of 15000
+
+An earlier deployment published the container on `127.0.0.1:15000`. After an
+unclean container shutdown, `dockerd`'s internal port-reservation map kept
+holding 15000 even though no container was running, causing every subsequent
+`docker compose up -d` to fail with:
+
+```
+failed to bind host port 127.0.0.1:15000/tcp: address already in use
+```
+
+Neither `docker container prune`, `docker network prune`, nor `docker rm -f`
+released the reservation — only a full `sudo systemctl restart docker` would
+have cleared it. To avoid bouncing the co-located CloserAI stack, the
+published port was changed to **15010** as a sidestep. If you ever see this
+error recur, the fastest non-disruptive fix is another port change; the
+nuclear option is restarting the Docker daemon.
+
+### Diagnostic quick reference
+
+```bash
+# Is the container up and on the expected port?
+docker compose ps
+sudo ss -tlnp | grep 15010       # should show dockerd listening
+
+# Container-direct health check (bypasses nginx)
+curl -I http://127.0.0.1:15010/login
+
+# Through-nginx health check
+curl -I http://127.0.0.1:5000/login
+
+# Is nginx running and enabled?
+sudo systemctl status nginx --no-pager
+
+# Tail container logs
+docker compose logs -f --tail=50
+```
+
+---
+
 ## How It Works
 
 1. **Upload** — A team member uploads an RFP/RFQ document (PDF, DOCX, or TXT) through the web interface.
