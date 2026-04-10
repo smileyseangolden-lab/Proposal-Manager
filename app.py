@@ -104,6 +104,25 @@ def load_user(user_id):
 with app.app_context():
     db.create_all()
 
+    # Migrate existing project_documents table to add new columns if missing
+    import sqlite3 as _sqlite3
+    _db_path = str(Path(__file__).resolve().parent / "data" / "proposal_manager.db")
+    _conn = _sqlite3.connect(_db_path)
+    _cur = _conn.cursor()
+    _cur.execute("PRAGMA table_info(project_documents)")
+    _existing_cols = {row[1] for row in _cur.fetchall()}
+    _migrations = [
+        ("is_reference", "ALTER TABLE project_documents ADD COLUMN is_reference BOOLEAN DEFAULT 0"),
+        ("notes", 'ALTER TABLE project_documents ADD COLUMN notes TEXT DEFAULT ""'),
+        ("version_group", 'ALTER TABLE project_documents ADD COLUMN version_group VARCHAR(32) DEFAULT ""'),
+        ("version_label", 'ALTER TABLE project_documents ADD COLUMN version_label VARCHAR(100) DEFAULT ""'),
+    ]
+    for col, sql in _migrations:
+        if col not in _existing_cols:
+            _cur.execute(sql)
+    _conn.commit()
+    _conn.close()
+
 
 # ---------------------------------------------------------------------------
 # Helpers
