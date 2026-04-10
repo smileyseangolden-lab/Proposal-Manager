@@ -7,44 +7,430 @@
     <div class="page-header-row">
         <div>
             <h1>Document Library</h1>
-            <p class="page-subtitle">{{ total_docs }} document(s) across all projects</p>
+            <p class="page-subtitle">{{ total_docs }} document(s) &bull; {{ "%.1f"|format(total_size / 1048576) }} MB total &bull; {{ ref_count }} reference doc(s)</p>
         </div>
     </div>
 </section>
 
-{% if project_docs %}
-    {% for pd in project_docs %}
-    <div class="card">
-        <h2>
-            <a href="{{ url_for('project_upload', project_id=pd.project.id) }}" class="project-link">{{ pd.project.name }}</a>
-            <span class="badge badge-status-{{ pd.project.status }}" style="margin-left:8px; vertical-align: middle;">{{ pd.project.status }}</span>
-        </h2>
-        <p class="card-desc">{{ pd.project.client_name or 'No client' }} &mdash; {{ pd.documents | length }} document(s)</p>
-        <table class="mini-table">
+<!-- Storage Stats -->
+<div class="stats-grid">
+    <div class="stat-card">
+        <span class="stat-number">{{ total_docs }}</span>
+        <span class="stat-label">Total Documents</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-number">{% if total_size >= 1073741824 %}{{ "%.1f"|format(total_size / 1073741824) }} GB{% elif total_size >= 1048576 %}{{ "%.1f"|format(total_size / 1048576) }} MB{% elif total_size >= 1024 %}{{ "%.0f"|format(total_size / 1024) }} KB{% else %}{{ total_size }} B{% endif %}</span>
+        <span class="stat-label">Total Storage</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-number">{{ all_projects | length }}</span>
+        <span class="stat-label">Projects</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-number">{{ ref_count }}</span>
+        <span class="stat-label">Reference Docs</span>
+    </div>
+</div>
+
+<!-- Per-Project Storage Breakdown -->
+{% if project_stats %}
+<div class="card">
+    <h2>Storage by Project</h2>
+    <div class="storage-breakdown">
+        {% for ps in project_stats %}
+        <div class="storage-project-row">
+            <div class="storage-project-info">
+                <span class="storage-project-name">{{ ps.project.name }}</span>
+                <span class="storage-project-meta">{{ ps.doc_count }} doc(s) &bull; {% if ps.total_size >= 1048576 %}{{ "%.1f"|format(ps.total_size / 1048576) }} MB{% elif ps.total_size >= 1024 %}{{ "%.0f"|format(ps.total_size / 1024) }} KB{% else %}{{ ps.total_size }} B{% endif %}</span>
+            </div>
+            <div class="storage-bar-track">
+                <div class="storage-bar-fill" style="width: {{ ((ps.total_size / total_size) * 100) if total_size > 0 else 0 }}%"></div>
+            </div>
+            <form method="post" action="{{ url_for('bulk_download_documents') }}" class="inline-form">
+                <input type="hidden" name="project_id" value="{{ ps.project.id }}">
+                <button type="submit" class="btn btn-small btn-secondary" title="Download all as ZIP">ZIP</button>
+            </form>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
+
+<!-- Search & Filter Bar -->
+<div class="card doc-search-card">
+    <form method="get" action="{{ url_for('document_library') }}" class="doc-search-form">
+        <div class="doc-search-row">
+            <div class="doc-search-input-wrap">
+                <input type="text" name="q" value="{{ q }}" placeholder="Search file names and notes..." class="doc-search-input">
+            </div>
+            <button type="submit" class="btn btn-primary btn-small">Search</button>
+            {% if q or filter_type or filter_project or filter_tag or filter_status or show_reference %}
+            <a href="{{ url_for('document_library') }}" class="btn btn-secondary btn-small">Clear</a>
+            {% endif %}
+        </div>
+        <div class="doc-filters-row">
+            <div class="doc-filter">
+                <label>Type</label>
+                <select name="type">
+                    <option value="">All Types</option>
+                    <option value="rfp" {{ 'selected' if filter_type == 'rfp' }}>RFP / RFQ</option>
+                    <option value="drawing" {{ 'selected' if filter_type == 'drawing' }}>Drawings</option>
+                    <option value="legal" {{ 'selected' if filter_type == 'legal' }}>Legal / Contract</option>
+                    <option value="supporting" {{ 'selected' if filter_type == 'supporting' }}>Supporting</option>
+                    <option value="rate_sheet" {{ 'selected' if filter_type == 'rate_sheet' }}>Rate Sheet</option>
+                </select>
+            </div>
+            <div class="doc-filter">
+                <label>Project</label>
+                <select name="project">
+                    <option value="">All Projects</option>
+                    {% for p in all_projects %}
+                    <option value="{{ p.id }}" {{ 'selected' if filter_project == p.id }}>{{ p.name }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="doc-filter">
+                <label>Status</label>
+                <select name="status">
+                    <option value="">All Statuses</option>
+                    <option value="active" {{ 'selected' if filter_status == 'active' }}>Active</option>
+                    <option value="submitted" {{ 'selected' if filter_status == 'submitted' }}>Submitted</option>
+                    <option value="won" {{ 'selected' if filter_status == 'won' }}>Won</option>
+                    <option value="lost" {{ 'selected' if filter_status == 'lost' }}>Lost</option>
+                    <option value="archived" {{ 'selected' if filter_status == 'archived' }}>Archived</option>
+                </select>
+            </div>
+            {% if all_tags %}
+            <div class="doc-filter">
+                <label>Tag</label>
+                <select name="tag">
+                    <option value="">All Tags</option>
+                    {% for t in all_tags %}
+                    <option value="{{ t }}" {{ 'selected' if filter_tag == t }}>{{ t }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            {% endif %}
+            <div class="doc-filter">
+                <label>Sort</label>
+                <select name="sort">
+                    <option value="date_desc" {{ 'selected' if sort_by == 'date_desc' }}>Newest First</option>
+                    <option value="date_asc" {{ 'selected' if sort_by == 'date_asc' }}>Oldest First</option>
+                    <option value="name_asc" {{ 'selected' if sort_by == 'name_asc' }}>Name A-Z</option>
+                    <option value="name_desc" {{ 'selected' if sort_by == 'name_desc' }}>Name Z-A</option>
+                    <option value="size_desc" {{ 'selected' if sort_by == 'size_desc' }}>Largest First</option>
+                    <option value="size_asc" {{ 'selected' if sort_by == 'size_asc' }}>Smallest First</option>
+                </select>
+            </div>
+            <div class="doc-filter doc-filter-check">
+                <label>
+                    <input type="checkbox" name="reference" value="1" {{ 'checked' if show_reference }}> Reference Only
+                </label>
+            </div>
+        </div>
+    </form>
+</div>
+
+<!-- Documents Table -->
+{% if documents %}
+<div class="card">
+    <h2>Documents ({{ documents | length }})</h2>
+    <div class="doc-table-wrap">
+        <table class="doc-table">
             <thead>
                 <tr>
-                    <th>File Name</th>
+                    <th>File</th>
+                    <th>Project</th>
                     <th>Type</th>
                     <th>Size</th>
+                    <th>Tags</th>
+                    <th>Version</th>
                     <th>Uploaded</th>
+                    <th>Actions</th>
                 </tr>
             </thead>
             <tbody>
-            {% for d in pd.documents %}
-            <tr>
-                <td>{{ d.original_filename }}</td>
+            {% for d in documents %}
+            <tr class="{{ 'doc-row-ref' if d.is_reference }}">
+                <td>
+                    <div class="doc-filename">
+                        <span class="doc-file-icon">{% if d.original_filename.endswith('.pdf') %}&#128196;{% elif d.original_filename.endswith('.docx') or d.original_filename.endswith('.doc') %}&#128462;{% elif d.original_filename.endswith('.xlsx') or d.original_filename.endswith('.xls') %}&#128202;{% else %}&#128196;{% endif %}</span>
+                        <div>
+                            <span class="doc-name">{{ d.original_filename }}</span>
+                            {% if d.is_reference %}<span class="badge badge-ref">REF</span>{% endif %}
+                            {% if d.notes %}<span class="doc-note-indicator" title="{{ d.notes }}">&#128221;</span>{% endif %}
+                        </div>
+                    </div>
+                </td>
+                <td>
+                    {% set proj = project_map.get(d.project_id) %}
+                    {% if proj %}
+                    <a href="{{ url_for('project_upload', project_id=proj.id) }}" class="doc-project-link">{{ proj.name }}</a>
+                    <span class="badge badge-status-{{ proj.status }}" style="font-size:10px;">{{ proj.status }}</span>
+                    {% endif %}
+                </td>
                 <td><span class="badge badge-doc-{{ d.file_type }}">{{ d.file_type }}</span></td>
-                <td>{% if d.file_size >= 1048576 %}{{ "%.1f"|format(d.file_size / 1048576) }} MB{% elif d.file_size >= 1024 %}{{ "%.0f"|format(d.file_size / 1024) }} KB{% else %}{{ d.file_size }} B{% endif %}</td>
-                <td>{{ d.uploaded_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                <td class="doc-size">{% if d.file_size >= 1048576 %}{{ "%.1f"|format(d.file_size / 1048576) }} MB{% elif d.file_size >= 1024 %}{{ "%.0f"|format(d.file_size / 1024) }} KB{% else %}{{ d.file_size }} B{% endif %}</td>
+                <td>
+                    <div class="doc-tags-cell">
+                        {% for tag in d.tags.all() %}
+                        <span class="doc-tag-pill">{{ tag.tag }}</span>
+                        {% endfor %}
+                        <button type="button" class="doc-tag-add-btn" onclick="openTagModal('{{ d.id }}', '{{ d.tags.all()|map(attribute='tag')|join(', ') }}')" title="Edit tags">+</button>
+                    </div>
+                </td>
+                <td>
+                    <div class="doc-version-cell">
+                        {% if d.version_label %}
+                        <span class="doc-version-label">{{ d.version_label }}</span>
+                        {% endif %}
+                        <button type="button" class="doc-version-btn" onclick="openVersionModal('{{ d.id }}', '{{ d.version_label or '' }}')" title="Set version label">&#9998;</button>
+                    </div>
+                </td>
+                <td class="doc-date">{{ d.uploaded_at.strftime('%Y-%m-%d') }}</td>
+                <td>
+                    <div class="doc-actions">
+                        <a href="{{ url_for('preview_document', doc_id=d.id) }}" target="_blank" class="btn btn-small btn-secondary" title="Preview">&#128065;</a>
+                        <a href="{{ url_for('download_document', doc_id=d.id) }}" class="btn btn-small btn-secondary" title="Download">&#11015;</a>
+                        <form method="post" action="{{ url_for('toggle_document_reference', doc_id=d.id) }}" class="inline-form">
+                            <button type="submit" class="btn btn-small {{ 'btn-primary' if d.is_reference else 'btn-secondary' }}" title="{{ 'Unmark reference' if d.is_reference else 'Mark as reference' }}">&#9733;</button>
+                        </form>
+                        <button type="button" class="btn btn-small btn-secondary" onclick="openNoteModal('{{ d.id }}', {{ d.notes|tojson }})" title="Edit notes">&#128221;</button>
+                        <button type="button" class="btn btn-small btn-secondary" onclick="openCopyModal('{{ d.id }}')" title="Copy to project">&#128203;</button>
+                    </div>
+                </td>
             </tr>
             {% endfor %}
             </tbody>
         </table>
     </div>
-    {% endfor %}
+</div>
 {% else %}
 <div class="empty-state">
+    {% if q or filter_type or filter_project or filter_tag or filter_status or show_reference %}
+    <p>No documents match your search/filter criteria. <a href="{{ url_for('document_library') }}">Clear filters</a></p>
+    {% else %}
     <p>No documents uploaded yet. <a href="{{ url_for('new_project') }}">Create a project</a> and upload your RFP/RFQ documents to get started.</p>
+    {% endif %}
 </div>
 {% endif %}
+
+<!-- Generated Proposals Section -->
+{% if proposals %}
+<div class="card">
+    <h2>Generated Proposals ({{ proposals | length }})</h2>
+    <table class="doc-table">
+        <thead>
+            <tr>
+                <th>Project</th>
+                <th>Type</th>
+                <th>Vertical</th>
+                <th>Confidence</th>
+                <th>Generated</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for prop in proposals %}
+        <tr>
+            <td>
+                {% set proj = project_map.get(prop.project_id) %}
+                {% if proj %}
+                <a href="{{ url_for('project_upload', project_id=proj.id) }}" class="doc-project-link">{{ proj.name }}</a>
+                <span class="badge badge-status-{{ proj.status }}" style="font-size:10px;">{{ proj.status }}</span>
+                {% else %}
+                <span class="text-muted">Unknown project</span>
+                {% endif %}
+            </td>
+            <td><span class="badge badge-{{ prop.document_type|lower }}">{{ prop.document_type }}</span></td>
+            <td><span class="badge badge-vertical">{{ prop.vertical_label }}</span></td>
+            <td>
+                <div class="confidence-bar">
+                    <div><div class="confidence-fill" style="width: {{ prop.confidence_score }}%"></div></div>
+                    <span>{{ prop.confidence_score }}%</span>
+                </div>
+            </td>
+            <td class="doc-date">{{ prop.generated_at.strftime('%Y-%m-%d %H:%M') if prop.generated_at else 'N/A' }}</td>
+            <td>
+                <div class="doc-actions">
+                    <a href="{{ url_for('view_proposal', proposal_id=prop.id) }}" class="btn btn-small btn-primary">View</a>
+                    {% if prop.docx_file %}<a href="{{ url_for('download', proposal_id=prop.id, fmt='docx') }}" class="btn btn-small btn-secondary">DOCX</a>{% endif %}
+                    {% if prop.pdf_file %}<a href="{{ url_for('download', proposal_id=prop.id, fmt='pdf') }}" class="btn btn-small btn-secondary">PDF</a>{% endif %}
+                </div>
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+<!-- Projects Without Proposals -->
+{% set proposal_project_ids = proposals|map(attribute='project_id')|list %}
+{% set has_pending = [] %}
+{% for p in all_projects %}
+    {% if p.id not in proposal_project_ids %}
+        {% for ps in project_stats if ps.project.id == p.id %}
+            {% if has_pending.append(1) %}{% endif %}
+        {% endfor %}
+    {% endif %}
+{% endfor %}
+{% if has_pending %}
+<div class="card">
+    <h2>Projects Pending Proposals</h2>
+    <p class="card-desc">These projects have documents but no AI-generated proposal yet.</p>
+    <div class="pending-projects-grid">
+        {% for p in all_projects %}
+        {% if p.id not in proposal_project_ids %}
+        {% set ns = namespace(doc_count=0) %}
+        {% for ps in project_stats if ps.project.id == p.id %}{% set ns.doc_count = ps.doc_count %}{% endfor %}
+        {% if ns.doc_count > 0 %}
+        <div class="pending-project-card">
+            <div class="pending-project-name">{{ p.name }}</div>
+            <div class="pending-project-meta">
+                <span class="badge badge-status-{{ p.status }}">{{ p.status }}</span>
+                <span>{{ ns.doc_count }} doc(s)</span>
+            </div>
+            <a href="{{ url_for('project_upload', project_id=p.id) }}" class="btn btn-small btn-primary" style="margin-top:8px;">Generate</a>
+        </div>
+        {% endif %}
+        {% endif %}
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
+
+<!-- Modals -->
+<!-- Tag Edit Modal -->
+<div class="doc-modal-overlay" id="tag-modal" style="display:none;">
+    <div class="doc-modal">
+        <div class="doc-modal-header">
+            <h3>Edit Tags</h3>
+            <button type="button" class="doc-modal-close" onclick="closeModal('tag-modal')">&times;</button>
+        </div>
+        <form method="post" id="tag-form">
+            <div class="doc-modal-body">
+                <p class="form-hint">Separate multiple tags with commas (e.g., reference, reusable, client-approved)</p>
+                <input type="text" name="tags" id="tag-input" placeholder="tag1, tag2, tag3" class="doc-modal-input">
+            </div>
+            <div class="doc-modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('tag-modal')">Cancel</button>
+                <button type="submit" class="btn btn-primary">Save Tags</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Notes Edit Modal -->
+<div class="doc-modal-overlay" id="note-modal" style="display:none;">
+    <div class="doc-modal">
+        <div class="doc-modal-header">
+            <h3>Edit Notes</h3>
+            <button type="button" class="doc-modal-close" onclick="closeModal('note-modal')">&times;</button>
+        </div>
+        <form method="post" id="note-form">
+            <div class="doc-modal-body">
+                <p class="form-hint">Add annotations or reminders about this document</p>
+                <textarea name="notes" id="note-input" rows="4" placeholder="e.g., Use section 3 as boilerplate for future bids" class="doc-modal-textarea"></textarea>
+            </div>
+            <div class="doc-modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('note-modal')">Cancel</button>
+                <button type="submit" class="btn btn-primary">Save Notes</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Version Label Modal -->
+<div class="doc-modal-overlay" id="version-modal" style="display:none;">
+    <div class="doc-modal">
+        <div class="doc-modal-header">
+            <h3>Set Version Label</h3>
+            <button type="button" class="doc-modal-close" onclick="closeModal('version-modal')">&times;</button>
+        </div>
+        <form method="post" id="version-form">
+            <div class="doc-modal-body">
+                <p class="form-hint">e.g., Addendum 1, Rev B, Final Draft</p>
+                <input type="text" name="version_label" id="version-input" placeholder="Version label" class="doc-modal-input">
+            </div>
+            <div class="doc-modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('version-modal')">Cancel</button>
+                <button type="submit" class="btn btn-primary">Save</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Copy to Project Modal -->
+<div class="doc-modal-overlay" id="copy-modal" style="display:none;">
+    <div class="doc-modal">
+        <div class="doc-modal-header">
+            <h3>Copy to Project</h3>
+            <button type="button" class="doc-modal-close" onclick="closeModal('copy-modal')">&times;</button>
+        </div>
+        <form method="post" id="copy-form">
+            <div class="doc-modal-body">
+                <p class="form-hint">Select the target project to copy this document to</p>
+                <select name="target_project_id" id="copy-project-select" class="doc-modal-input">
+                    {% for p in all_projects %}
+                    <option value="{{ p.id }}">{{ p.name }} ({{ p.status }})</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="doc-modal-footer">
+                <button type="button" class="btn btn-secondary" onclick="closeModal('copy-modal')">Cancel</button>
+                <button type="submit" class="btn btn-primary">Copy Document</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+    function openModal(id){ document.getElementById(id).style.display="flex"; }
+    window.closeModal = function(id){ document.getElementById(id).style.display="none"; };
+
+    window.openTagModal = function(docId, currentTags){
+        document.getElementById("tag-form").action = "/documents/" + docId + "/tags";
+        document.getElementById("tag-input").value = currentTags;
+        openModal("tag-modal");
+    };
+
+    window.openNoteModal = function(docId, currentNotes){
+        document.getElementById("note-form").action = "/documents/" + docId + "/notes";
+        document.getElementById("note-input").value = currentNotes || "";
+        openModal("note-modal");
+    };
+
+    window.openVersionModal = function(docId, currentLabel){
+        document.getElementById("version-form").action = "/documents/" + docId + "/version-label";
+        document.getElementById("version-input").value = currentLabel || "";
+        openModal("version-modal");
+    };
+
+    window.openCopyModal = function(docId){
+        document.getElementById("copy-form").action = "/documents/" + docId + "/copy-to-project";
+        openModal("copy-modal");
+    };
+
+    // Close modals on overlay click
+    document.querySelectorAll(".doc-modal-overlay").forEach(function(overlay){
+        overlay.addEventListener("click", function(e){
+            if(e.target === overlay) overlay.style.display = "none";
+        });
+    });
+
+    // Auto-submit filters on change
+    document.querySelectorAll(".doc-filters-row select").forEach(function(sel){
+        sel.addEventListener("change", function(){ sel.closest("form").submit(); });
+    });
+    var refCheck = document.querySelector('.doc-filter-check input[type="checkbox"]');
+    if(refCheck){
+        refCheck.addEventListener("change", function(){ this.closest("form").submit(); });
+    }
+})();
+</script>
 {% endblock %}

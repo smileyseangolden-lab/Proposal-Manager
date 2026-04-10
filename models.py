@@ -85,6 +85,22 @@ class ProjectDocument(db.Model):
     file_path = db.Column(db.String(1000), nullable=False)
     file_size = db.Column(db.Integer, default=0)
     uploaded_at = db.Column(db.DateTime, default=_utcnow)
+    is_reference = db.Column(db.Boolean, default=False)  # True = available across all projects
+    notes = db.Column(db.Text, default="")
+    version_group = db.Column(db.String(32), default="")  # Groups document versions together
+    version_label = db.Column(db.String(100), default="")  # e.g., "Addendum 1", "Rev B"
+
+    tags = db.relationship("DocumentTag", backref="document", lazy="dynamic", cascade="all, delete-orphan")
+
+
+class DocumentTag(db.Model):
+    """Tags for organizing and filtering documents."""
+    __tablename__ = "document_tags"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    document_id = db.Column(db.String(32), db.ForeignKey("project_documents.id"), nullable=False)
+    tag = db.Column(db.String(100), nullable=False)
+    created_at = db.Column(db.DateTime, default=_utcnow)
 
 
 class Proposal(db.Model):

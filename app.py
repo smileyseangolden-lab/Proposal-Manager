@@ -51,6 +51,7 @@ from document_parser import parse_document
 from models import (
     ActivityLog,
     CompanyStandard,
+    DocumentTag,
     EquipmentItem,
     Project,
     ProjectDocument,
@@ -1550,18 +1551,304 @@ def toggle_admin(user_id):
 @app.route("/documents")
 @login_required
 def document_library():
-    """All documents across all user projects, grouped by project."""
-    projects = Project.query.filter_by(user_id=current_user.id).order_by(Project.updated_at.desc()).all()
+    """Full-featured document library with search, filter, stats, and proposals."""
+    from sqlalchemy import func
 
-    project_docs = []
-    total_docs = 0
-    for p in projects:
-        docs = ProjectDocument.query.filter_by(project_id=p.id).order_by(ProjectDocument.uploaded_at.desc()).all()
-        if docs:
-            project_docs.append({"project": p, "documents": docs})
-            total_docs += len(docs)
+    # Query params for search/filter
+    q = request.args.get("q", "").strip()
+    filter_type = request.args.get("type", "")
+    filter_project = request.args.get("project", "")
+    filter_tag = request.args.get("tag", "")
+    filter_status = request.args.get("status", "")
+    sort_by = request.args.get("sort", "date_desc")
+    show_reference = request.args.get("reference", "")
 
-    return render_template("document_library.html", project_docs=project_docs, total_docs=total_docs)
+    # All user projects for filter dropdown
+    all_projects = Project.query.filter_by(user_id=current_user.id).order_by(Project.name).all()
+    project_ids = [p.id for p in all_projects]
+
+    # Base document query
+    doc_query = ProjectDocument.query.filter(ProjectDocument.project_id.in_(project_ids))
+
+    # Apply search
+    if q:
+        doc_query = doc_query.filter(
+            db.or_(
+                ProjectDocument.original_filename.ilike(f"%{q}%"),
+                ProjectDocument.notes.ilike(f"%{q}%"),
+            )
+        )
+
+    # Apply filters
+    if filter_type:
+        doc_query = doc_query.filter(ProjectDocument.file_type == filter_type)
+    if filter_project:
+        doc_query = doc_query.filter(ProjectDocument.project_id == filter_project)
+    if show_reference:
+        doc_query = doc_query.filter(ProjectDocument.is_reference == True)
+    if filter_tag:
+        tagged_ids = db.session.query(DocumentTag.document_id).filter(DocumentTag.tag == filter_tag).subquery()
+        doc_query = doc_query.filter(ProjectDocument.id.in_(tagged_ids))
+    if filter_status:
+        status_project_ids = [p.id for p in all_projects if p.status == filter_status]
+        doc_query = doc_query.filter(ProjectDocument.project_id.in_(status_project_ids))
+
+    # Apply sort
+    if sort_by == "name_asc":
+        doc_query = doc_query.order_by(ProjectDocument.original_filename.asc())
+    elif sort_by == "name_desc":
+        doc_query = doc_query.order_by(ProjectDocument.original_filename.desc())
+    elif sort_by == "size_desc":
+        doc_query = doc_query.order_by(ProjectDocument.file_size.desc())
+    elif sort_by == "size_asc":
+        doc_query = doc_query.order_by(ProjectDocument.file_size.asc())
+    elif sort_by == "date_asc":
+        doc_query = doc_query.order_by(ProjectDocument.uploaded_at.asc())
+    else:
+        doc_query = doc_query.order_by(ProjectDocument.uploaded_at.desc())
+
+    documents = doc_query.all()
+
+    # Build project lookup
+    project_map = {p.id: p for p in all_projects}
+
+    # All unique tags for filter
+    all_tags = db.session.query(DocumentTag.tag).join(ProjectDocument).filter(
+        ProjectDocument.project_id.in_(project_ids)
+    ).distinct().order_by(DocumentTag.tag).all()
+    all_tags = [t[0] for t in all_tags]
+
+    # Storage stats
+    total_size = db.session.query(func.sum(ProjectDocument.file_size)).filter(
+        ProjectDocument.project_id.in_(project_ids)
+    ).scalar() or 0
+    total_docs = ProjectDocument.query.filter(ProjectDocument.project_id.in_(project_ids)).count()
+
+    # Per-project stats
+    project_stats = []
+    for p in all_projects:
+        p_docs = ProjectDocument.query.filter_by(project_id=p.id).count()
+        p_size = db.session.query(func.sum(ProjectDocument.file_size)).filter(
+            ProjectDocument.project_id == p.id
+        ).scalar() or 0
+        if p_docs > 0:
+            project_stats.append({"project": p, "doc_count": p_docs, "total_size": p_size})
+
+    # Generated proposals
+    proposals = Proposal.query.join(Project).filter(
+        Project.user_id == current_user.id
+    ).order_by(Proposal.generated_at.desc()).all()
+
+    # Reference documents count
+    ref_count = ProjectDocument.query.filter(
+        ProjectDocument.project_id.in_(project_ids),
+        ProjectDocument.is_reference == True,
+    ).count()
+
+    return render_template(
+        "document_library.html",
+        documents=documents,
+        project_map=project_map,
+        all_projects=all_projects,
+        all_tags=all_tags,
+        project_stats=project_stats,
+        proposals=proposals,
+        total_docs=total_docs,
+        total_size=total_size,
+        ref_count=ref_count,
+        q=q,
+        filter_type=filter_type,
+        filter_project=filter_project,
+        filter_tag=filter_tag,
+        filter_status=filter_status,
+        sort_by=sort_by,
+        show_reference=show_reference,
+    )
+
+
+@app.route("/documents/<doc_id>/download")
+@login_required
+def download_document(doc_id):
+    """Download a single document."""
+    doc = db.session.get(ProjectDocument, doc_id)
+    if not doc:
+        abort(404)
+    project = db.session.get(Project, doc.project_id)
+    if not project or project.user_id != current_user.id:
+        abort(404)
+    return send_file(doc.file_path, as_attachment=True, download_name=doc.original_filename)
+
+
+@app.route("/documents/<doc_id>/preview")
+@login_required
+def preview_document(doc_id):
+    """Preview a document inline (returns file for browser rendering)."""
+    doc = db.session.get(ProjectDocument, doc_id)
+    if not doc:
+        abort(404)
+    project = db.session.get(Project, doc.project_id)
+    if not project or project.user_id != current_user.id:
+        abort(404)
+    return send_file(doc.file_path, as_attachment=False)
+
+
+@app.route("/documents/<doc_id>/tags", methods=["POST"])
+@login_required
+def update_document_tags(doc_id):
+    """Add or update tags on a document."""
+    doc = db.session.get(ProjectDocument, doc_id)
+    if not doc:
+        abort(404)
+    project = db.session.get(Project, doc.project_id)
+    if not project or project.user_id != current_user.id:
+        abort(404)
+
+    tags_str = request.form.get("tags", "").strip()
+    new_tags = [t.strip() for t in tags_str.split(",") if t.strip()]
+
+    # Clear existing tags and set new ones
+    DocumentTag.query.filter_by(document_id=doc.id).delete()
+    for tag in new_tags:
+        db.session.add(DocumentTag(document_id=doc.id, tag=tag[:100]))
+    db.session.commit()
+    flash(f"Tags updated for '{doc.original_filename}'.", "success")
+    return redirect(url_for("document_library"))
+
+
+@app.route("/documents/<doc_id>/notes", methods=["POST"])
+@login_required
+def update_document_notes(doc_id):
+    """Update notes on a document."""
+    doc = db.session.get(ProjectDocument, doc_id)
+    if not doc:
+        abort(404)
+    project = db.session.get(Project, doc.project_id)
+    if not project or project.user_id != current_user.id:
+        abort(404)
+
+    doc.notes = request.form.get("notes", "").strip()
+    db.session.commit()
+    flash(f"Notes updated for '{doc.original_filename}'.", "success")
+    return redirect(url_for("document_library"))
+
+
+@app.route("/documents/<doc_id>/toggle-reference", methods=["POST"])
+@login_required
+def toggle_document_reference(doc_id):
+    """Toggle a document as a reference document (available across projects)."""
+    doc = db.session.get(ProjectDocument, doc_id)
+    if not doc:
+        abort(404)
+    project = db.session.get(Project, doc.project_id)
+    if not project or project.user_id != current_user.id:
+        abort(404)
+
+    doc.is_reference = not doc.is_reference
+    db.session.commit()
+    status = "marked as reference" if doc.is_reference else "unmarked as reference"
+    flash(f"'{doc.original_filename}' {status}.", "success")
+    return redirect(url_for("document_library"))
+
+
+@app.route("/documents/<doc_id>/copy-to-project", methods=["POST"])
+@login_required
+def copy_document_to_project(doc_id):
+    """Copy a document to another project."""
+    import shutil
+
+    doc = db.session.get(ProjectDocument, doc_id)
+    if not doc:
+        abort(404)
+    src_project = db.session.get(Project, doc.project_id)
+    if not src_project or src_project.user_id != current_user.id:
+        abort(404)
+
+    target_project_id = request.form.get("target_project_id", "").strip()
+    target_project = db.session.get(Project, target_project_id)
+    if not target_project or target_project.user_id != current_user.id:
+        flash("Invalid target project.", "error")
+        return redirect(url_for("document_library"))
+
+    # Copy the physical file
+    src_path = Path(doc.file_path)
+    if not src_path.exists():
+        flash("Source file not found.", "error")
+        return redirect(url_for("document_library"))
+
+    dest_dir = UPLOADS_DIR / "projects" / target_project_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    new_filename = f"{uuid.uuid4().hex[:8]}_{doc.original_filename}"
+    dest_path = dest_dir / new_filename
+    shutil.copy2(str(src_path), str(dest_path))
+
+    new_doc = ProjectDocument(
+        project_id=target_project_id,
+        filename=new_filename,
+        original_filename=doc.original_filename,
+        file_type=doc.file_type,
+        file_path=str(dest_path),
+        file_size=doc.file_size,
+        notes=doc.notes,
+        is_reference=doc.is_reference,
+    )
+    db.session.add(new_doc)
+
+    # Copy tags
+    for tag in doc.tags.all():
+        db.session.add(DocumentTag(document_id=new_doc.id, tag=tag.tag))
+
+    db.session.commit()
+    _log_activity("document_copy", f"Copied '{doc.original_filename}' to project '{target_project.name}'")
+    flash(f"Document copied to '{target_project.name}'.", "success")
+    return redirect(url_for("document_library"))
+
+
+@app.route("/documents/<doc_id>/version-label", methods=["POST"])
+@login_required
+def update_document_version(doc_id):
+    """Update version label for a document."""
+    doc = db.session.get(ProjectDocument, doc_id)
+    if not doc:
+        abort(404)
+    project = db.session.get(Project, doc.project_id)
+    if not project or project.user_id != current_user.id:
+        abort(404)
+
+    doc.version_label = request.form.get("version_label", "").strip()
+    if not doc.version_group:
+        doc.version_group = uuid.uuid4().hex
+    db.session.commit()
+    flash(f"Version label updated for '{doc.original_filename}'.", "success")
+    return redirect(url_for("document_library"))
+
+
+@app.route("/documents/bulk-download", methods=["POST"])
+@login_required
+def bulk_download_documents():
+    """Download all documents for a project as a ZIP."""
+    import zipfile
+    import tempfile
+
+    project_id = request.form.get("project_id", "").strip()
+    project = db.session.get(Project, project_id)
+    if not project or project.user_id != current_user.id:
+        abort(404)
+
+    docs = ProjectDocument.query.filter_by(project_id=project_id).all()
+    if not docs:
+        flash("No documents to download.", "error")
+        return redirect(url_for("document_library"))
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
+        for doc in docs:
+            src = Path(doc.file_path)
+            if src.exists():
+                zf.write(str(src), doc.original_filename)
+    tmp.close()
+
+    safe_name = secure_filename(project.name) or "project"
+    return send_file(tmp.name, as_attachment=True, download_name=f"{safe_name}_documents.zip")
 
 
 # ---------------------------------------------------------------------------
