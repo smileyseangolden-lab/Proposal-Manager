@@ -7,11 +7,51 @@
     <div class="page-header-row">
         <div>
             <h1>Dashboard</h1>
-            <p class="page-subtitle">Welcome back, {{ current_user.display_name or current_user.username }}</p>
+            <p class="page-subtitle">Welcome back, {{ current_user.display_name or current_user.username }}
+                <span class="role-badge role-{{ user_role }}">{{ user_role | title }}</span>
+            </p>
         </div>
-        <a href="{{ url_for('new_project') }}" class="btn btn-primary">+ New Project</a>
+        <div class="header-actions">
+            <a href="{{ url_for('new_project') }}" class="btn btn-primary">+ New Project</a>
+            {% if notifications %}
+            <a href="{{ url_for('notifications_page') }}" class="btn btn-secondary notif-btn">
+                Notifications <span class="notif-badge">{{ notifications|length }}</span>
+            </a>
+            {% endif %}
+        </div>
     </div>
 </section>
+
+<!-- Notifications Banner -->
+{% if notifications %}
+<div class="card notif-card">
+    <div class="notif-card-header">
+        <h2>Recent Notifications</h2>
+        <form method="post" action="{{ url_for('mark_all_notifications_read') }}" class="inline-form">
+            <button type="submit" class="btn btn-small btn-secondary">Mark All Read</button>
+        </form>
+    </div>
+    <div class="notif-list">
+        {% for n in notifications[:5] %}
+        <div class="notif-item notif-{{ n.category }}">
+            <div class="notif-icon">
+                {% if n.category == 'proposal_generated' %}&#128196;{% elif n.category == 'rfp_uploaded' %}&#128228;{% elif n.category == 'assignment' %}&#128100;{% else %}&#128276;{% endif %}
+            </div>
+            <div class="notif-content">
+                <span class="notif-title">{{ n.title }}</span>
+                <span class="notif-time">{{ n.created_at.strftime('%b %d, %H:%M') }}</span>
+            </div>
+            {% if n.link %}
+            <a href="{{ n.link }}" class="btn btn-small btn-secondary">View</a>
+            {% endif %}
+        </div>
+        {% endfor %}
+    </div>
+    {% if notifications|length > 5 %}
+    <a href="{{ url_for('notifications_page') }}" class="btn btn-small btn-secondary" style="margin-top:8px;">View all {{ notifications|length }} notifications</a>
+    {% endif %}
+</div>
+{% endif %}
 
 <!-- Stats cards -->
 <section class="stats-grid">
@@ -41,6 +81,100 @@
     </div>
 </section>
 
+<!-- SALES ROLE: Pipeline Breakdown -->
+{% if user_role == 'sales' and pipeline_by_status %}
+<div class="card">
+    <h2>Pipeline Breakdown</h2>
+    <div class="pipeline-grid">
+        {% for status, data in pipeline_by_status.items() %}
+        <div class="pipeline-card pipeline-{{ status }}">
+            <span class="pipeline-status badge badge-status-{{ status }}">{{ status | title }}</span>
+            <span class="pipeline-count">{{ data.count }} project(s)</span>
+            <span class="pipeline-value">${{ "{:,.0f}".format(data.value) }}</span>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
+
+<!-- PROPOSAL ROLE: Pending Work Queue -->
+{% if user_role == 'proposal' and pending_docs_projects %}
+<div class="card card-highlight">
+    <h2>Awaiting Proposal Generation</h2>
+    <p class="card-desc">Projects with uploaded documents but no generated proposal yet.</p>
+    <div class="pending-projects-grid">
+        {% for item in pending_docs_projects %}
+        <div class="pending-project-card">
+            <div class="pending-project-name">{{ item.project.name }}</div>
+            <div class="pending-project-meta">
+                <span>{{ item.project.client_name or 'No client' }}</span>
+                <span>{{ item.doc_count }} doc(s)</span>
+            </div>
+            <a href="{{ url_for('project_upload', project_id=item.project.id) }}" class="btn btn-small btn-primary" style="margin-top:8px;">Generate Proposal</a>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
+
+<!-- PROPOSAL ROLE: Recent Proposals -->
+{% if user_role == 'proposal' and recent_proposals %}
+<div class="card">
+    <h2>Recently Generated Proposals</h2>
+    <table class="mini-table">
+        <thead><tr><th>Project</th><th>Vertical</th><th>Confidence</th><th>Generated</th><th></th></tr></thead>
+        <tbody>
+        {% for prop in recent_proposals %}
+        <tr>
+            <td>{{ prop.project.name if prop.project else 'Unknown' }}</td>
+            <td><span class="badge badge-vertical">{{ prop.vertical_label }}</span></td>
+            <td>
+                <div class="confidence-bar">
+                    <div><div class="confidence-fill" style="width:{{ prop.confidence_score }}%"></div></div>
+                    <span>{{ prop.confidence_score }}%</span>
+                </div>
+            </td>
+            <td>{{ prop.generated_at.strftime('%Y-%m-%d %H:%M') if prop.generated_at else 'N/A' }}</td>
+            <td><a href="{{ url_for('view_proposal', proposal_id=prop.id) }}" class="btn btn-small btn-primary">View</a></td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+<!-- Assigned to Me -->
+{% if assigned_to_me %}
+<div class="card card-highlight">
+    <h2>Assigned to Me</h2>
+    <p class="card-desc">Projects that have been assigned to you for proposal work.</p>
+    <table class="proposals-table">
+        <thead>
+            <tr>
+                <th>Project Name</th>
+                <th>Client</th>
+                <th>Owner</th>
+                <th>Status</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for p in assigned_to_me %}
+        <tr class="clickable-row" data-href="{{ url_for('project_upload', project_id=p.id) }}">
+            <td><a href="{{ url_for('project_upload', project_id=p.id) }}" class="project-link">{{ p.name }}</a></td>
+            <td>{{ p.client_name or '&mdash;' }}</td>
+            <td>{{ p.owner.display_name or p.owner.username if p.owner else '&mdash;' }}</td>
+            <td><span class="badge badge-status-{{ p.status }}">{{ p.status }}</span></td>
+            <td class="row-actions" onclick="event.stopPropagation()">
+                <a href="{{ url_for('project_upload', project_id=p.id) }}" class="btn btn-small btn-primary">Open</a>
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
 <!-- Active Projects -->
 <section class="section">
     <h2>Active Projects</h2>
@@ -51,6 +185,7 @@
                 <th>Project Name</th>
                 <th>Client</th>
                 <th>Vertical</th>
+                <th>Assigned To</th>
                 <th>Created</th>
                 <th>Status</th>
                 <th>Actions</th>
@@ -62,6 +197,20 @@
                 <td><a href="{{ url_for('project_upload', project_id=p.id) }}" class="project-link">{{ p.name }}</a></td>
                 <td>{{ p.client_name or '&mdash;' }}</td>
                 <td><span class="badge badge-vertical">{{ p.vertical_label or 'Not set' }}</span></td>
+                <td class="row-actions" onclick="event.stopPropagation()">
+                    {% if p.user_id == current_user.id or current_user.is_admin %}
+                    <form method="post" action="{{ url_for('assign_project', project_id=p.id) }}" class="inline-form">
+                        <select name="assigned_to" onchange="this.form.submit()" class="status-select" title="Assign to user">
+                            <option value="">Unassigned</option>
+                            {% for pu in proposal_users %}
+                            <option value="{{ pu.id }}" {{ 'selected' if p.assigned_to == pu.id }}>{{ pu.display_name or pu.username }}</option>
+                            {% endfor %}
+                        </select>
+                    </form>
+                    {% else %}
+                    {{ p.assignee.display_name or p.assignee.username if p.assignee else '&mdash;' }}
+                    {% endif %}
+                </td>
                 <td>{{ p.created_at.strftime('%Y-%m-%d') }}</td>
                 <td><span class="badge badge-status-{{ p.status }}">{{ p.status }}</span></td>
                 <td class="row-actions" onclick="event.stopPropagation()">

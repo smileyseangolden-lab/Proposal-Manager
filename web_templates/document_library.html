@@ -190,13 +190,23 @@
                 <td class="doc-date">{{ d.uploaded_at.strftime('%Y-%m-%d') }}</td>
                 <td>
                     <div class="doc-actions">
-                        <a href="{{ url_for('preview_document', doc_id=d.id) }}" target="_blank" class="btn btn-small btn-secondary" title="Preview">&#128065;</a>
-                        <a href="{{ url_for('download_document', doc_id=d.id) }}" class="btn btn-small btn-secondary" title="Download">&#11015;</a>
+                        <a href="{{ url_for('preview_document', doc_id=d.id) }}" target="_blank" class="btn btn-small btn-secondary doc-action-btn" title="Preview in browser">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                        </a>
+                        <a href="{{ url_for('download_document', doc_id=d.id) }}" class="btn btn-small btn-secondary doc-action-btn" title="Download file">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                        </a>
                         <form method="post" action="{{ url_for('toggle_document_reference', doc_id=d.id) }}" class="inline-form">
-                            <button type="submit" class="btn btn-small {{ 'btn-primary' if d.is_reference else 'btn-secondary' }}" title="{{ 'Unmark reference' if d.is_reference else 'Mark as reference' }}">&#9733;</button>
+                            <button type="submit" class="btn btn-small {{ 'btn-primary' if d.is_reference else 'btn-secondary' }} doc-action-btn" title="{{ 'Unmark as reference' if d.is_reference else 'Mark as reference (available across projects)' }}">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="{{ 'currentColor' if d.is_reference else 'none' }}" stroke="currentColor" stroke-width="2"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+                            </button>
                         </form>
-                        <button type="button" class="btn btn-small btn-secondary" onclick="openNoteModal('{{ d.id }}', {{ d.notes|tojson }})" title="Edit notes">&#128221;</button>
-                        <button type="button" class="btn btn-small btn-secondary" onclick="openCopyModal('{{ d.id }}')" title="Copy to project">&#128203;</button>
+                        <button type="button" class="btn btn-small btn-secondary doc-action-btn" onclick="openNoteModal('{{ d.id }}', {{ d.notes|tojson }})" title="Add or edit notes">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                        </button>
+                        <button type="button" class="btn btn-small btn-secondary doc-action-btn" onclick="openCopyModal('{{ d.id }}')" title="Copy document to another project">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                        </button>
                     </div>
                 </td>
             </tr>

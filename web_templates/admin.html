@@ -133,6 +133,9 @@
             <a href="{{ url_for('admin_panel', activity_role='admin') }}" class="btn btn-small {{ 'btn-primary' if activity_filter == 'admin' else 'btn-secondary' }}">Admin</a>
             <a href="{{ url_for('admin_panel', activity_role='sales') }}" class="btn btn-small {{ 'btn-primary' if activity_filter == 'sales' else 'btn-secondary' }}">Sales</a>
             <a href="{{ url_for('admin_panel', activity_role='proposal') }}" class="btn btn-small {{ 'btn-primary' if activity_filter == 'proposal' else 'btn-secondary' }}">Proposal</a>
+            <span style="margin-left:8px; border-left:1px solid var(--gray-200); padding-left:8px;">
+                <a href="{{ url_for('export_activity_csv', role=activity_filter) }}" class="btn btn-small btn-secondary">Export CSV</a>
+            </span>
         </div>
     </div>
     <table class="mini-table">

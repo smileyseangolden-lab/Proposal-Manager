@@ -32,6 +32,10 @@
                 <span class="sidebar-icon">&#9881;</span>
                 <span>Settings</span>
             </a>
+            <a href="{{ url_for('notifications_page') }}" class="sidebar-link{% if request.endpoint == 'notifications_page' %} active{% endif %}">
+                <span class="sidebar-icon">&#128276;</span>
+                <span>Notifications{% if unread_notifications %} <span class="sidebar-notif-badge">{{ unread_notifications }}</span>{% endif %}</span>
+            </a>
             <a href="{{ url_for('faq_page') }}" class="sidebar-link{% if request.endpoint == 'faq_page' %} active{% endif %}">
                 <span class="sidebar-icon">?</span>
                 <span>FAQ</span>

@@ -57,6 +57,7 @@ from models import (
     CompanyStandard,
     DocumentTag,
     EquipmentItem,
+    Notification,
     Project,
     ProjectDocument,
     Proposal,
@@ -136,6 +137,13 @@ with app.app_context():
             _cur.execute(sql)
     _conn.commit()
 
+    # Migrate projects table to add assigned_to column if missing
+    _cur.execute("PRAGMA table_info(projects)")
+    _proj_cols = {row[1] for row in _cur.fetchall()}
+    if "assigned_to" not in _proj_cols:
+        _cur.execute('ALTER TABLE projects ADD COLUMN assigned_to VARCHAR(32) DEFAULT NULL')
+        _conn.commit()
+
     # Migrate users table to add role column if missing
     _cur.execute("PRAGMA table_info(users)")
     _user_cols = {row[1] for row in _cur.fetchall()}
@@ -166,6 +174,42 @@ def _log_activity(action: str, detail: str = "", project_id: str = None):
     )
     db.session.add(log)
     db.session.commit()
+
+
+def _notify(user_id: str, category: str, title: str, message: str = "", link: str = ""):
+    """Create an in-app notification for a user."""
+    n = Notification(user_id=user_id, category=category, title=title, message=message, link=link)
+    db.session.add(n)
+    db.session.commit()
+
+
+def _notify_role(role: str, category: str, title: str, message: str = "", link: str = "", exclude_user_id: str = None):
+    """Send a notification to all users with a given role."""
+    users = User.query.filter_by(role=role).all()
+    for u in users:
+        if exclude_user_id and u.id == exclude_user_id:
+            continue
+        db.session.add(Notification(user_id=u.id, category=category, title=title, message=message, link=link))
+    db.session.commit()
+
+
+@app.context_processor
+def inject_notifications():
+    if hasattr(current_user, "id") and current_user.is_authenticated:
+        unread = Notification.query.filter_by(user_id=current_user.id, is_read=False).count()
+        return dict(unread_notifications=unread)
+    return dict(unread_notifications=0)
+
+
+def _can_access_project(project) -> bool:
+    """Check if current user can access a project (owner, assigned, or admin)."""
+    if not project:
+        return False
+    return (
+        project.user_id == current_user.id
+        or project.assigned_to == current_user.id
+        or current_user.is_admin
+    )
 
 
 def _save_upload(file, subdir: str = "") -> tuple[str, str, int]:
@@ -263,29 +307,37 @@ def logout():
 @app.route("/")
 @login_required
 def dashboard():
-    active_projects = Project.query.filter_by(user_id=current_user.id, status="active").order_by(Project.updated_at.desc()).all()
-    past_projects = Project.query.filter(
+    from sqlalchemy import func
+
+    user_role = getattr(current_user, "role", None) or ("admin" if current_user.is_admin else "proposal")
+
+    # Projects owned by user OR assigned to user
+    my_project_filter = db.or_(
         Project.user_id == current_user.id,
+        Project.assigned_to == current_user.id,
+    )
+    active_projects = Project.query.filter(my_project_filter, Project.status == "active").order_by(Project.updated_at.desc()).all()
+    past_projects = Project.query.filter(
+        my_project_filter,
         Project.status.in_(["submitted", "won", "lost", "archived"]),
     ).order_by(Project.updated_at.desc()).all()
 
     # Stats
-    total = Project.query.filter_by(user_id=current_user.id).count()
-    won = Project.query.filter_by(user_id=current_user.id, status="won").count()
-    lost = Project.query.filter_by(user_id=current_user.id, status="lost").count()
+    total = Project.query.filter(my_project_filter).count()
+    won = Project.query.filter(my_project_filter, Project.status == "won").count()
+    lost = Project.query.filter(my_project_filter, Project.status == "lost").count()
     decided = won + lost
     win_rate = round((won / decided) * 100) if decided > 0 else 0
     loss_rate = round((lost / decided) * 100) if decided > 0 else 0
 
-    from sqlalchemy import func
     avg_dollar = db.session.query(func.avg(Project.dollar_amount)).filter(
-        Project.user_id == current_user.id, Project.dollar_amount > 0
+        my_project_filter, Project.dollar_amount > 0
     ).scalar() or 0
     total_dollar = db.session.query(func.sum(Project.dollar_amount)).filter(
-        Project.user_id == current_user.id, Project.dollar_amount > 0
+        my_project_filter, Project.dollar_amount > 0
     ).scalar() or 0
 
-    total_proposals = Proposal.query.join(Project).filter(Project.user_id == current_user.id).count()
+    total_proposals = Proposal.query.join(Project).filter(my_project_filter).count()
 
     stats = {
         "total_projects": total,
@@ -298,11 +350,54 @@ def dashboard():
         "total_dollar": total_dollar,
     }
 
+    # Sales-focused extras: pipeline by status, recent proposals across team
+    pipeline_by_status = {}
+    if user_role == "sales":
+        for status in ["active", "submitted", "won", "lost"]:
+            cnt = Project.query.filter(my_project_filter, Project.status == status).count()
+            val = db.session.query(func.sum(Project.dollar_amount)).filter(
+                my_project_filter, Project.status == status, Project.dollar_amount > 0
+            ).scalar() or 0
+            pipeline_by_status[status] = {"count": cnt, "value": val}
+
+    # Proposal-focused extras: docs needing proposals, recent generations
+    pending_docs_projects = []
+    recent_proposals = []
+    if user_role == "proposal":
+        # Projects with docs but no proposals
+        my_projects = Project.query.filter(my_project_filter, Project.status == "active").all()
+        for p in my_projects:
+            doc_count = ProjectDocument.query.filter_by(project_id=p.id).count()
+            prop_count = Proposal.query.filter_by(project_id=p.id).count()
+            if doc_count > 0 and prop_count == 0:
+                pending_docs_projects.append({"project": p, "doc_count": doc_count})
+        recent_proposals = Proposal.query.join(Project).filter(
+            my_project_filter
+        ).order_by(Proposal.generated_at.desc()).limit(5).all()
+
+    # Assigned to me (for proposal users)
+    assigned_to_me = Project.query.filter_by(assigned_to=current_user.id, status="active").order_by(Project.updated_at.desc()).all()
+
+    # Notifications
+    notifications = Notification.query.filter_by(
+        user_id=current_user.id, is_read=False
+    ).order_by(Notification.created_at.desc()).limit(10).all()
+
+    # Proposal users list (for sales assignment dropdown)
+    proposal_users = User.query.filter(User.role.in_(["proposal", "admin"])).order_by(User.display_name).all()
+
     return render_template(
         "dashboard.html",
         active_projects=active_projects,
         past_projects=past_projects,
         stats=stats,
+        user_role=user_role,
+        pipeline_by_status=pipeline_by_status,
+        pending_docs_projects=pending_docs_projects,
+        recent_proposals=recent_proposals,
+        assigned_to_me=assigned_to_me,
+        notifications=notifications,
+        proposal_users=proposal_users,
     )
 
 
@@ -712,7 +807,7 @@ def new_project():
 @login_required
 def project_upload(project_id):
     project = db.session.get(Project, project_id)
-    if not project or project.user_id != current_user.id:
+    if not _can_access_project(project):
         abort(404)
 
     if request.method == "POST":
@@ -734,6 +829,14 @@ def project_upload(project_id):
 
         db.session.commit()
         _log_activity("document_upload", f"Uploaded {len(files)} document(s)", project_id)
+        # Notify proposal users when RFPs are uploaded
+        _notify_role(
+            "proposal", "rfp_uploaded",
+            f"New documents uploaded: {project.name}",
+            f"{current_user.display_name or current_user.username} uploaded {len(files)} document(s) to '{project.name}'.",
+            link=f"/projects/{project_id}",
+            exclude_user_id=current_user.id,
+        )
         flash(f"{len(files)} document(s) uploaded.", "success")
         return redirect(url_for("project_upload", project_id=project_id))
 
@@ -772,7 +875,7 @@ def project_upload(project_id):
 @login_required
 def project_generate(project_id):
     project = db.session.get(Project, project_id)
-    if not project or project.user_id != current_user.id:
+    if not _can_access_project(project):
         abort(404)
 
     vertical = request.form.get("vertical", "auto")
@@ -997,6 +1100,22 @@ def project_generate(project_id):
         db.session.add(v1)
         db.session.commit()
         _log_activity("proposal_generate", f"Generated {result['vertical_label']} proposal", project_id)
+        # Notify sales users when proposals are generated
+        _notify_role(
+            "sales", "proposal_generated",
+            f"Proposal generated: {project.name}",
+            f"{current_user.display_name or current_user.username} generated a {result['vertical_label']} proposal for '{project.name}'.",
+            link=f"/proposal/{proposal.id}",
+            exclude_user_id=current_user.id,
+        )
+        # Also notify the project owner if different from generator
+        if project.user_id != current_user.id:
+            _notify(
+                project.user_id, "proposal_generated",
+                f"Proposal generated for your project: {project.name}",
+                f"{current_user.display_name or current_user.username} generated a proposal for '{project.name}'.",
+                link=f"/proposal/{proposal.id}",
+            )
 
         return redirect(url_for("view_proposal", proposal_id=proposal.id))
 
@@ -1956,6 +2075,125 @@ def bulk_download_documents():
 
     safe_name = secure_filename(project.name) or "project"
     return send_file(tmp.name, as_attachment=True, download_name=f"{safe_name}_documents.zip")
+
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+
+@app.route("/notifications")
+@login_required
+def notifications_page():
+    """View all notifications."""
+    notes = Notification.query.filter_by(user_id=current_user.id).order_by(Notification.created_at.desc()).limit(100).all()
+    # Mark all as read
+    Notification.query.filter_by(user_id=current_user.id, is_read=False).update({"is_read": True})
+    db.session.commit()
+    return render_template("notifications.html", notifications=notes)
+
+
+@app.route("/notifications/<notif_id>/read", methods=["POST"])
+@login_required
+def mark_notification_read(notif_id):
+    n = db.session.get(Notification, notif_id)
+    if n and n.user_id == current_user.id:
+        n.is_read = True
+        db.session.commit()
+    return redirect(request.referrer or url_for("dashboard"))
+
+
+@app.route("/notifications/mark-all-read", methods=["POST"])
+@login_required
+def mark_all_notifications_read():
+    Notification.query.filter_by(user_id=current_user.id, is_read=False).update({"is_read": True})
+    db.session.commit()
+    flash("All notifications marked as read.", "success")
+    return redirect(request.referrer or url_for("dashboard"))
+
+
+# ---------------------------------------------------------------------------
+# Team Assignments
+# ---------------------------------------------------------------------------
+
+@app.route("/projects/<project_id>/assign", methods=["POST"])
+@login_required
+def assign_project(project_id):
+    """Assign a project to a proposal user."""
+    project = db.session.get(Project, project_id)
+    if not project or (project.user_id != current_user.id and not current_user.is_admin):
+        abort(404)
+
+    assignee_id = request.form.get("assigned_to", "").strip()
+    if assignee_id:
+        assignee = db.session.get(User, assignee_id)
+        if not assignee:
+            flash("User not found.", "error")
+            return redirect(request.referrer or url_for("dashboard"))
+        project.assigned_to = assignee_id
+        db.session.commit()
+        _log_activity("project_assign", f"Assigned '{project.name}' to {assignee.display_name or assignee.username}", project_id=project.id)
+        _notify(
+            assignee_id,
+            "assignment",
+            f"Project assigned to you: {project.name}",
+            f"{current_user.display_name or current_user.username} assigned you to project '{project.name}' ({project.client_name or 'no client'}).",
+            link=f"/projects/{project.id}",
+        )
+        flash(f"Project assigned to {assignee.display_name or assignee.username}.", "success")
+    else:
+        project.assigned_to = None
+        db.session.commit()
+        flash("Assignment removed.", "success")
+
+    return redirect(request.referrer or url_for("dashboard"))
+
+
+# ---------------------------------------------------------------------------
+# CSV Activity Report
+# ---------------------------------------------------------------------------
+
+@app.route("/admin/export-activity")
+@login_required
+def export_activity_csv():
+    """Export activity log as CSV, optionally filtered by role."""
+    import csv
+    import io
+
+    if not current_user.is_admin:
+        abort(403)
+
+    role_filter = request.args.get("role", "")
+    logs_query = ActivityLog.query.order_by(ActivityLog.created_at.desc())
+
+    if role_filter in ("admin", "sales", "proposal"):
+        role_user_ids = [u.id for u in User.query.filter_by(role=role_filter).all()]
+        logs_query = logs_query.filter(ActivityLog.user_id.in_(role_user_ids))
+
+    logs = logs_query.limit(5000).all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Date", "Time", "User", "Role", "Action", "Detail", "Project ID"])
+    for log in logs:
+        user = db.session.get(User, log.user_id)
+        writer.writerow([
+            log.created_at.strftime("%Y-%m-%d"),
+            log.created_at.strftime("%H:%M:%S"),
+            (user.display_name or user.username) if user else "Unknown",
+            (user.role or "proposal") if user else "",
+            log.action,
+            log.detail,
+            log.project_id or "",
+        ])
+
+    output.seek(0)
+    from flask import Response
+    filename = f"activity_report{'_' + role_filter if role_filter else ''}.csv"
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 # ---------------------------------------------------------------------------

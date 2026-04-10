@@ -1135,6 +1135,16 @@ body {
 
 /* Actions */
 .doc-actions { display: flex; gap: 4px; align-items: center; flex-wrap: nowrap; }
+.doc-action-btn {
+    display: inline-flex !important;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    padding: 0 !important;
+    border-radius: 6px;
+}
+.doc-action-btn svg { flex-shrink: 0; }
 
 /* Storage breakdown */
 .storage-breakdown { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
@@ -1246,6 +1256,104 @@ body {
     background: var(--gray-50);
 }
 
+/* ---- Notifications ---- */
+
+/* Sidebar badge */
+.sidebar-notif-badge {
+    display: inline-block;
+    background: var(--danger);
+    color: var(--white);
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 10px;
+    margin-left: 4px;
+    min-width: 18px;
+    text-align: center;
+}
+
+/* Dashboard notification button */
+.notif-btn { position: relative; }
+.notif-badge {
+    display: inline-block;
+    background: var(--danger);
+    color: var(--white);
+    font-size: 11px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 10px;
+    margin-left: 4px;
+}
+
+/* Dashboard notification card */
+.notif-card { border-left: 4px solid var(--primary); }
+.notif-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+}
+.notif-card-header h2 { margin-bottom: 0; }
+.notif-list { display: flex; flex-direction: column; gap: 8px; }
+.notif-item {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    background: var(--gray-50);
+    border-radius: var(--radius);
+    border-left: 3px solid var(--gray-300);
+}
+.notif-proposal_generated { border-left-color: var(--success); }
+.notif-rfp_uploaded { border-left-color: var(--primary); }
+.notif-assignment { border-left-color: #f59e0b; }
+.notif-icon { font-size: 20px; flex-shrink: 0; }
+.notif-content { flex: 1; min-width: 0; }
+.notif-title { font-size: 14px; font-weight: 500; display: block; }
+.notif-time { font-size: 11px; color: var(--gray-500); }
+
+/* Full notifications page */
+.notif-full-list { display: flex; flex-direction: column; gap: 8px; }
+.notif-full-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 14px;
+    padding: 16px 20px;
+    background: var(--white);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+}
+.notif-unread { border-left: 3px solid var(--primary); background: #f0f5ff; }
+.notif-full-icon { font-size: 24px; flex-shrink: 0; padding-top: 2px; }
+.notif-full-body { flex: 1; min-width: 0; }
+.notif-full-title { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+.notif-full-msg { font-size: 13px; color: var(--gray-700); margin-bottom: 4px; }
+.notif-full-time { font-size: 12px; color: var(--gray-500); }
+.notif-full-actions { display: flex; gap: 6px; flex-shrink: 0; padding-top: 2px; }
+
+/* ---- Pipeline cards (Sales dashboard) ---- */
+.pipeline-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-top: 8px;
+}
+.pipeline-card {
+    border: 1px solid var(--gray-200);
+    border-radius: var(--radius);
+    padding: 16px;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.pipeline-active { border-top: 3px solid #3b82f6; }
+.pipeline-submitted { border-top: 3px solid #f59e0b; }
+.pipeline-won { border-top: 3px solid #10b981; }
+.pipeline-lost { border-top: 3px solid #ef4444; }
+.pipeline-count { font-size: 13px; color: var(--gray-500); }
+.pipeline-value { font-size: 20px; font-weight: 700; color: var(--gray-900); }
+
 /* ---- Footer ---- */
 .footer {
     margin-top: auto;
@@ -1276,4 +1384,7 @@ body {
     .pending-projects-grid { grid-template-columns: 1fr; }
     .role-summary-grid { grid-template-columns: 1fr; }
     .activity-header { flex-direction: column; }
+    .pipeline-grid { grid-template-columns: repeat(2, 1fr); }
+    .notif-full-item { flex-direction: column; }
+    .notif-full-actions { align-self: flex-start; }
 }

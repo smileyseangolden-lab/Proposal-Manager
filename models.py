@@ -38,7 +38,7 @@ class User(UserMixin, db.Model):
     api_key_encrypted = db.Column(db.Text, default="")
 
     # Relationships
-    projects = db.relationship("Project", backref="owner", lazy="dynamic")
+    projects = db.relationship("Project", backref="owner", lazy="dynamic", foreign_keys="Project.user_id")
     activity_logs = db.relationship("ActivityLog", backref="user", lazy="dynamic")
 
     def set_password(self, password: str):
@@ -64,6 +64,7 @@ class Project(db.Model):
     status = db.Column(db.String(30), default="active")  # active, submitted, won, lost, archived
     dollar_amount = db.Column(db.Float, default=0.0)
     output_format = db.Column(db.String(20), default="docx")  # docx, pdf, both
+    assigned_to = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
     created_at = db.Column(db.DateTime, default=_utcnow)
     updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow)
     submitted_at = db.Column(db.DateTime, nullable=True)
@@ -71,6 +72,7 @@ class Project(db.Model):
     # Relationships
     documents = db.relationship("ProjectDocument", backref="project", lazy="dynamic")
     proposals = db.relationship("Proposal", backref="project", lazy="dynamic")
+    assignee = db.relationship("User", foreign_keys=[assigned_to], backref="assigned_projects")
     questions = db.relationship("ProposalQuestion", backref="project", lazy="dynamic")
 
 
@@ -280,6 +282,22 @@ class ProposalVersion(db.Model):
 
     proposal = db.relationship("Proposal", backref="versions")
     editor = db.relationship("User")
+
+
+class Notification(db.Model):
+    """In-app notifications for role-based alerts."""
+    __tablename__ = "notifications"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    category = db.Column(db.String(50), nullable=False)  # proposal_generated, rfp_uploaded, assignment, role_change
+    title = db.Column(db.String(300), nullable=False)
+    message = db.Column(db.Text, default="")
+    link = db.Column(db.String(500), default="")
+    is_read = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=_utcnow)
+
+    user = db.relationship("User", backref="notifications")
 
 
 class ActivityLog(db.Model):
