@@ -41,6 +41,10 @@ from werkzeug.utils import secure_filename
 
 from config.settings import (
     ALLOWED_EXTENSIONS,
+    APP_COMPANY,
+    APP_FOOTER,
+    APP_NAME,
+    APP_SHORT_NAME,
     FLASK_SECRET_KEY,
     GENERATED_DIR,
     MAX_UPLOAD_SIZE_MB,
@@ -94,6 +98,16 @@ login_manager.login_message_category = "error"
 
 RATE_SHEET_EXTENSIONS = {"xlsx", "xls"}
 TEMPLATE_EXTENSIONS = {"pdf", "docx", "doc"}
+
+
+@app.context_processor
+def inject_branding():
+    return dict(
+        app_name=APP_NAME,
+        app_short_name=APP_SHORT_NAME,
+        app_company=APP_COMPANY,
+        app_footer=APP_FOOTER,
+    )
 
 
 @login_manager.user_loader

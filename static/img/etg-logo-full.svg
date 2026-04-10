@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 100" fill="none">
+  <!-- Blue background square with rounded corners (icon) -->
+  <rect x="4" y="4" width="92" height="92" rx="10" fill="#2B6CB5"/>
+  <!-- Starburst pattern -->
+  <g stroke="#fff" stroke-width="5.5" stroke-linecap="round">
+    <line x1="50" y1="16" x2="50" y2="40"/>
+    <line x1="50" y1="60" x2="50" y2="84"/>
+    <line x1="16" y1="50" x2="40" y2="50"/>
+    <line x1="60" y1="50" x2="84" y2="50"/>
+    <line x1="25" y1="25" x2="41" y2="41"/>
+    <line x1="75" y1="25" x2="59" y2="41"/>
+    <line x1="25" y1="75" x2="41" y2="59"/>
+    <line x1="75" y1="75" x2="59" y2="59"/>
+  </g>
+  <circle cx="50" cy="50" r="5" fill="#fff"/>
+  <!-- Small red diamond -->
+  <rect x="16" y="70" width="11" height="11" rx="2" fill="#C53030" transform="rotate(-15 21.5 75.5)"/>
+  <!-- E TECH GROUP text -->
+  <text x="115" y="42" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="28" font-weight="800" fill="#1A365D" letter-spacing="2">E TECH</text>
+  <text x="115" y="78" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="28" font-weight="800" fill="#1A365D" letter-spacing="2">GROUP</text>
+</svg>

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% block title %}Proposal Manager{% endblock %}</title>
+    <title>{% block title %}{{ app_name }}{% endblock %}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
 <body{% if not current_user.is_authenticated %} class="auth-page"{% endif %}>
@@ -11,8 +11,8 @@
     <aside class="sidebar">
         <div class="sidebar-brand">
             <a href="{{ url_for('dashboard') }}">
-                <span class="brand-icon">P</span>
-                <span class="brand-text">Proposal Manager</span>
+                <img src="{{ url_for('static', filename='img/etg-logo-mark.svg') }}" alt="{{ app_short_name }}" class="brand-logo">
+                <span class="brand-text">{{ app_name }}</span>
             </a>
         </div>
         <nav class="sidebar-nav">
@@ -76,7 +76,7 @@
             {% block content %}{% endblock %}
         </main>
         <footer class="footer">
-            <p>Proposal Manager Agent &mdash; Internal Use Only &mdash; Powered by Claude</p>
+            <p>{{ app_footer }}</p>
         </footer>
     </div>
 
@@ -88,7 +88,7 @@
             <button class="chatbot-close" id="chatbot-close" type="button">&times;</button>
         </div>
         <div class="chatbot-messages" id="chatbot-messages">
-            <div class="chat-msg chat-msg-bot">Hi! I can help you with using Proposal Manager. Ask me about generating proposals, uploading files, cost estimation, version history, and more.</div>
+            <div class="chat-msg chat-msg-bot">Hi! I can help you with using {{ app_name }}. Ask me about generating proposals, uploading files, cost estimation, version history, and more.</div>
         </div>
         <div class="chatbot-input">
             <input type="text" id="chatbot-input" placeholder="Type a question..." autocomplete="off">

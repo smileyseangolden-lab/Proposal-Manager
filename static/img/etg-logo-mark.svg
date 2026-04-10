@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" fill="none">
+  <!-- Blue background square with rounded corners -->
+  <rect x="4" y="4" width="112" height="112" rx="12" fill="#2B6CB5"/>
+  <!-- Starburst/asterisk pattern - white lines radiating from center -->
+  <g stroke="#fff" stroke-width="7" stroke-linecap="round">
+    <!-- Vertical -->
+    <line x1="60" y1="18" x2="60" y2="52"/>
+    <line x1="60" y1="68" x2="60" y2="102"/>
+    <!-- Horizontal -->
+    <line x1="18" y1="60" x2="52" y2="60"/>
+    <line x1="68" y1="60" x2="102" y2="60"/>
+    <!-- Diagonal top-left to center -->
+    <line x1="28" y1="28" x2="49" y2="49"/>
+    <!-- Diagonal top-right to center -->
+    <line x1="92" y1="28" x2="71" y2="49"/>
+    <!-- Diagonal bottom-left to center -->
+    <line x1="28" y1="92" x2="49" y2="71"/>
+    <!-- Diagonal bottom-right to center -->
+    <line x1="92" y1="92" x2="71" y2="71"/>
+  </g>
+  <!-- Center circle -->
+  <circle cx="60" cy="60" r="6" fill="#fff"/>
+  <!-- Small red diamond accent (bottom-left) -->
+  <rect x="18" y="86" width="14" height="14" rx="2" fill="#C53030" transform="rotate(-15 25 93)"/>
+</svg>
