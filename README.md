@@ -143,3 +143,4 @@ The web interface highlights these in a summary panel so the proposal team knows
 | `FLASK_DEBUG` | Debug mode | `false` |
 | `MAX_UPLOAD_SIZE_MB` | Max upload size | `50` |
 | `DEFAULT_OUTPUT_FORMAT` | Output format | `docx` |
+# CloserAI
