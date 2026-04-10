@@ -36,6 +36,39 @@
     </div>
 </section>
 
+<!-- Role Breakdown -->
+<div class="card">
+    <h2>Users by Role</h2>
+    <div class="role-summary-grid">
+        {% for role_key, rp in role_performance.items() %}
+        <div class="role-summary-card role-card-{{ role_key }}">
+            <div class="role-summary-header">
+                <span class="role-badge role-{{ role_key }}">{{ role_key | title }}</span>
+                <span class="role-user-count">{{ rp.user_count }} user(s)</span>
+            </div>
+            <div class="role-summary-stats">
+                <div class="role-stat">
+                    <span class="role-stat-val">{{ rp.projects }}</span>
+                    <span class="role-stat-lbl">Projects</span>
+                </div>
+                <div class="role-stat">
+                    <span class="role-stat-val">{{ rp.proposals }}</span>
+                    <span class="role-stat-lbl">Proposals</span>
+                </div>
+                <div class="role-stat">
+                    <span class="role-stat-val">{{ rp.win_rate }}%</span>
+                    <span class="role-stat-lbl">Win Rate</span>
+                </div>
+                <div class="role-stat">
+                    <span class="role-stat-val">${{ "{:,.0f}".format(rp.pipeline) }}</span>
+                    <span class="role-stat-lbl">Pipeline</span>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+
 <!-- User / Rep Metrics -->
 <div class="card">
     <h2>Rep Performance</h2>
@@ -45,6 +78,7 @@
             <tr>
                 <th>Rep Name</th>
                 <th>Email</th>
+                <th>Role</th>
                 <th>Projects</th>
                 <th>Proposals</th>
                 <th>Won</th>
@@ -52,7 +86,6 @@
                 <th>Win Rate</th>
                 <th>Pipeline Value</th>
                 <th>Last Active</th>
-                <th>Role</th>
             </tr>
         </thead>
         <tbody>
@@ -60,6 +93,20 @@
             <tr>
                 <td><strong>{{ us.user.display_name or us.user.username }}</strong></td>
                 <td>{{ us.user.email }}</td>
+                <td>
+                    {% if us.user.id == current_user.id %}
+                    <span class="role-badge role-{{ us.user.role or 'proposal' }}">{{ (us.user.role or 'proposal') | title }}</span>
+                    <span class="form-hint">(you)</span>
+                    {% else %}
+                    <form method="post" action="{{ url_for('update_user_role', user_id=us.user.id) }}" class="inline-form role-form">
+                        <select name="role" class="role-select role-select-{{ us.user.role or 'proposal' }}" onchange="this.form.submit()">
+                            <option value="admin" {{ 'selected' if us.user.role == 'admin' }}>Admin</option>
+                            <option value="sales" {{ 'selected' if us.user.role == 'sales' }}>Sales</option>
+                            <option value="proposal" {{ 'selected' if (us.user.role or 'proposal') == 'proposal' }}>Proposal</option>
+                        </select>
+                    </form>
+                    {% endif %}
+                </td>
                 <td>{{ us.total_projects }}</td>
                 <td>{{ us.proposal_count }}</td>
                 <td>{{ us.won }}</td>
@@ -67,14 +114,6 @@
                 <td>{{ us.win_rate }}%</td>
                 <td>${{ "{:,.0f}".format(us.total_dollar) }}</td>
                 <td>{{ us.last_active or '&mdash;' }}</td>
-                <td>
-                    <form method="post" action="{{ url_for('toggle_admin', user_id=us.user.id) }}" class="inline-form">
-                        <button type="submit" class="btn btn-small {{ 'btn-danger' if us.user.is_admin else 'btn-secondary' }}"
-                                {{ 'disabled' if us.user.id == current_user.id }}>
-                            {{ 'Admin' if us.user.is_admin else 'User' }}
-                        </button>
-                    </form>
-                </td>
             </tr>
             {% endfor %}
         </tbody>
@@ -83,17 +122,29 @@
 
 <!-- Recent Activity Log -->
 <div class="card">
-    <h2>Activity Log</h2>
-    <p class="card-desc">Recent actions across all users, sorted by most recent.</p>
+    <div class="activity-header">
+        <div>
+            <h2>Activity Log</h2>
+            <p class="card-desc">Recent actions across all users, sorted by most recent.</p>
+        </div>
+        <div class="activity-filter">
+            <label>Filter by role:</label>
+            <a href="{{ url_for('admin_panel') }}" class="btn btn-small {{ 'btn-primary' if not activity_filter else 'btn-secondary' }}">All</a>
+            <a href="{{ url_for('admin_panel', activity_role='admin') }}" class="btn btn-small {{ 'btn-primary' if activity_filter == 'admin' else 'btn-secondary' }}">Admin</a>
+            <a href="{{ url_for('admin_panel', activity_role='sales') }}" class="btn btn-small {{ 'btn-primary' if activity_filter == 'sales' else 'btn-secondary' }}">Sales</a>
+            <a href="{{ url_for('admin_panel', activity_role='proposal') }}" class="btn btn-small {{ 'btn-primary' if activity_filter == 'proposal' else 'btn-secondary' }}">Proposal</a>
+        </div>
+    </div>
     <table class="mini-table">
-        <thead><tr><th>User</th><th>Action</th><th>Detail</th><th>Time</th></tr></thead>
+        <thead><tr><th>User</th><th>Role</th><th>Action</th><th>Detail</th><th>Time</th></tr></thead>
         <tbody>
         {% for log in recent_activity %}
         <tr>
             <td><strong>{{ log.user.display_name or log.user.username if log.user else 'Unknown' }}</strong></td>
+            <td><span class="role-badge role-{{ log.user.role or 'proposal' }}">{{ (log.user.role or 'proposal') | title }}</span></td>
             <td><span class="badge badge-activity">{{ log.action }}</span></td>
-            <td>{{ log.detail[:100] }}{{ '...' if log.detail|length > 100 }}</td>
-            <td>{{ log.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+            <td class="td-desc">{{ log.detail[:100] }}{{ '...' if log.detail|length > 100 }}</td>
+            <td style="white-space:nowrap;">{{ log.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
         </tr>
         {% endfor %}
         </tbody>

@@ -29,6 +29,7 @@ class User(UserMixin, db.Model):
     company_name = db.Column(db.String(200), default="")
     font_preference = db.Column(db.String(100), default="Calibri")
     is_admin = db.Column(db.Boolean, default=False)
+    role = db.Column(db.String(20), default="proposal")  # admin, sales, proposal
     created_at = db.Column(db.DateTime, default=_utcnow)
 
     # LLM settings — per-user overrides

@@ -135,6 +135,16 @@ with app.app_context():
         if col not in _existing_cols:
             _cur.execute(sql)
     _conn.commit()
+
+    # Migrate users table to add role column if missing
+    _cur.execute("PRAGMA table_info(users)")
+    _user_cols = {row[1] for row in _cur.fetchall()}
+    if "role" not in _user_cols:
+        _cur.execute('ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT "proposal"')
+        # Backfill: set existing admins to admin role
+        _cur.execute('UPDATE users SET role = "admin" WHERE is_admin = 1')
+        _conn.commit()
+
     _conn.close()
 
 
@@ -208,6 +218,7 @@ def signup():
     # First user becomes admin
     if User.query.count() == 0:
         user.is_admin = True
+        user.role = "admin"
 
     db.session.add(user)
     db.session.commit()
@@ -1498,14 +1509,51 @@ def admin_panel():
         "total_dollar": company_total_dollar,
     }
 
-    recent_activity = ActivityLog.query.order_by(ActivityLog.created_at.desc()).limit(50).all()
+    # Role counts
+    role_counts = {"admin": 0, "sales": 0, "proposal": 0}
+    for u in users:
+        r = getattr(u, "role", None) or ("admin" if u.is_admin else "proposal")
+        role_counts[r] = role_counts.get(r, 0) + 1
+
+    # Per-role performance breakdown
+    role_performance = {}
+    for role_key in ("admin", "sales", "proposal"):
+        role_users = [us for us in user_stats if (getattr(us["user"], "role", None) or ("admin" if us["user"].is_admin else "proposal")) == role_key]
+        r_projects = sum(us["total_projects"] for us in role_users)
+        r_proposals = sum(us["proposal_count"] for us in role_users)
+        r_won = sum(us["won"] for us in role_users)
+        r_lost = sum(us["lost"] for us in role_users)
+        r_decided = r_won + r_lost
+        r_dollar = sum(us["total_dollar"] for us in role_users)
+        role_performance[role_key] = {
+            "user_count": len(role_users),
+            "projects": r_projects,
+            "proposals": r_proposals,
+            "won": r_won,
+            "lost": r_lost,
+            "win_rate": round((r_won / r_decided) * 100) if r_decided > 0 else 0,
+            "pipeline": r_dollar,
+        }
+
+    # Activity filter
+    activity_filter = request.args.get("activity_role", "")
+    if activity_filter and activity_filter in ("admin", "sales", "proposal"):
+        role_user_ids = [u.id for u in users if (getattr(u, "role", None) or ("admin" if u.is_admin else "proposal")) == activity_filter]
+        recent_activity = ActivityLog.query.filter(
+            ActivityLog.user_id.in_(role_user_ids)
+        ).order_by(ActivityLog.created_at.desc()).limit(50).all()
+    else:
+        recent_activity = ActivityLog.query.order_by(ActivityLog.created_at.desc()).limit(50).all()
 
     return render_template(
         "admin.html",
         users=users,
         user_stats=user_stats,
         company_stats=company_stats,
+        role_counts=role_counts,
+        role_performance=role_performance,
         recent_activity=recent_activity,
+        activity_filter=activity_filter,
     )
 
 
@@ -1560,20 +1608,46 @@ def delete_company_template(template_id):
 @app.route("/admin/toggle-admin/<user_id>", methods=["POST"])
 @login_required
 def toggle_admin(user_id):
+    """Legacy route — redirects to update_user_role."""
     if not current_user.is_admin:
         abort(403)
     if user_id == current_user.id:
-        flash("You cannot remove your own admin access.", "error")
+        flash("You cannot change your own role.", "error")
+        return redirect(url_for("admin_panel"))
+    user = db.session.get(User, user_id)
+    if not user:
+        abort(404)
+    user.is_admin = not user.is_admin
+    user.role = "admin" if user.is_admin else "proposal"
+    db.session.commit()
+    flash(f"Role updated for {user.username}.", "success")
+    return redirect(url_for("admin_panel"))
+
+
+@app.route("/admin/update-role/<user_id>", methods=["POST"])
+@login_required
+def update_user_role(user_id):
+    """Update a user's role (admin, sales, proposal)."""
+    if not current_user.is_admin:
+        abort(403)
+    if user_id == current_user.id:
+        flash("You cannot change your own role.", "error")
         return redirect(url_for("admin_panel"))
 
     user = db.session.get(User, user_id)
     if not user:
         abort(404)
 
-    user.is_admin = not user.is_admin
+    new_role = request.form.get("role", "").strip().lower()
+    if new_role not in ("admin", "sales", "proposal"):
+        flash("Invalid role.", "error")
+        return redirect(url_for("admin_panel"))
+
+    user.role = new_role
+    user.is_admin = (new_role == "admin")
     db.session.commit()
-    status = "granted" if user.is_admin else "revoked"
-    flash(f"Admin access {status} for {user.username}.", "success")
+    _log_activity("role_change", f"Changed {user.username} role to {new_role}")
+    flash(f"Role for {user.display_name or user.username} updated to {new_role.title()}.", "success")
     return redirect(url_for("admin_panel"))
 
 
