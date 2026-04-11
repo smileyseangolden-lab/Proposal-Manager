@@ -138,53 +138,75 @@ def load_user(user_id):
 
 
 with app.app_context():
-    db.create_all()
+    # Cross-worker schema bootstrap lock. Under gunicorn, every worker imports
+    # this module and runs db.create_all() + migrations. Without a lock, two
+    # workers race to CREATE TABLE for a brand-new table and the loser crashes
+    # with "table already exists". A simple file lock (fcntl.flock) serializes
+    # the bootstrap so only one worker at a time touches the schema.
+    import fcntl as _fcntl
+    _data_dir = Path(__file__).resolve().parent / "data"
+    _data_dir.mkdir(exist_ok=True)
+    _lock_path = _data_dir / ".schema.lock"
+    with open(_lock_path, "w") as _lock_fh:
+        _fcntl.flock(_lock_fh, _fcntl.LOCK_EX)
+        try:
+            # Tolerate the race even if the lock somehow fails: if another
+            # worker already created a table between our check and create,
+            # swallow the "already exists" error. All other DDL errors
+            # still propagate.
+            try:
+                db.create_all()
+            except Exception as _e:
+                if "already exists" not in str(_e):
+                    raise
 
-    # Migrate existing project_documents table to add new columns if missing
-    import sqlite3 as _sqlite3
-    _db_path = str(Path(__file__).resolve().parent / "data" / "proposal_manager.db")
-    _conn = _sqlite3.connect(_db_path)
-    _cur = _conn.cursor()
-    _cur.execute("PRAGMA table_info(project_documents)")
-    _existing_cols = {row[1] for row in _cur.fetchall()}
-    _migrations = [
-        ("is_reference", "ALTER TABLE project_documents ADD COLUMN is_reference BOOLEAN DEFAULT 0"),
-        ("notes", 'ALTER TABLE project_documents ADD COLUMN notes TEXT DEFAULT ""'),
-        ("version_group", 'ALTER TABLE project_documents ADD COLUMN version_group VARCHAR(32) DEFAULT ""'),
-        ("version_label", 'ALTER TABLE project_documents ADD COLUMN version_label VARCHAR(100) DEFAULT ""'),
-    ]
-    for col, sql in _migrations:
-        if col not in _existing_cols:
-            _cur.execute(sql)
-    _conn.commit()
+            # Migrate existing project_documents table to add new columns if missing
+            import sqlite3 as _sqlite3
+            _db_path = str(_data_dir / "proposal_manager.db")
+            _conn = _sqlite3.connect(_db_path)
+            _cur = _conn.cursor()
+            _cur.execute("PRAGMA table_info(project_documents)")
+            _existing_cols = {row[1] for row in _cur.fetchall()}
+            _migrations = [
+                ("is_reference", "ALTER TABLE project_documents ADD COLUMN is_reference BOOLEAN DEFAULT 0"),
+                ("notes", 'ALTER TABLE project_documents ADD COLUMN notes TEXT DEFAULT ""'),
+                ("version_group", 'ALTER TABLE project_documents ADD COLUMN version_group VARCHAR(32) DEFAULT ""'),
+                ("version_label", 'ALTER TABLE project_documents ADD COLUMN version_label VARCHAR(100) DEFAULT ""'),
+            ]
+            for col, sql in _migrations:
+                if col not in _existing_cols:
+                    _cur.execute(sql)
+            _conn.commit()
 
-    # Migrate projects table to add assigned_to column if missing
-    _cur.execute("PRAGMA table_info(projects)")
-    _proj_cols = {row[1] for row in _cur.fetchall()}
-    if "assigned_to" not in _proj_cols:
-        _cur.execute('ALTER TABLE projects ADD COLUMN assigned_to VARCHAR(32) DEFAULT NULL')
-        _conn.commit()
+            # Migrate projects table to add assigned_to column if missing
+            _cur.execute("PRAGMA table_info(projects)")
+            _proj_cols = {row[1] for row in _cur.fetchall()}
+            if "assigned_to" not in _proj_cols:
+                _cur.execute('ALTER TABLE projects ADD COLUMN assigned_to VARCHAR(32) DEFAULT NULL')
+                _conn.commit()
 
-    # Migrate users table to add role column if missing
-    _cur.execute("PRAGMA table_info(users)")
-    _user_cols = {row[1] for row in _cur.fetchall()}
-    if "role" not in _user_cols:
-        _cur.execute('ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT "proposal"')
-        # Backfill: set existing admins to admin role
-        _cur.execute('UPDATE users SET role = "admin" WHERE is_admin = 1')
-        _conn.commit()
+            # Migrate users table to add role column if missing
+            _cur.execute("PRAGMA table_info(users)")
+            _user_cols = {row[1] for row in _cur.fetchall()}
+            if "role" not in _user_cols:
+                _cur.execute('ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT "proposal"')
+                # Backfill: set existing admins to admin role
+                _cur.execute('UPDATE users SET role = "admin" WHERE is_admin = 1')
+                _conn.commit()
 
-    # Migrate proposals table for Part 3 review lifecycle
-    _cur.execute("PRAGMA table_info(proposals)")
-    _prop_cols = {row[1] for row in _cur.fetchall()}
-    if "review_status" not in _prop_cols:
-        _cur.execute('ALTER TABLE proposals ADD COLUMN review_status VARCHAR(40) DEFAULT "draft"')
-        _conn.commit()
-    if "review_deadline" not in _prop_cols:
-        _cur.execute('ALTER TABLE proposals ADD COLUMN review_deadline DATETIME DEFAULT NULL')
-        _conn.commit()
+            # Migrate proposals table for Part 3 review lifecycle
+            _cur.execute("PRAGMA table_info(proposals)")
+            _prop_cols = {row[1] for row in _cur.fetchall()}
+            if "review_status" not in _prop_cols:
+                _cur.execute('ALTER TABLE proposals ADD COLUMN review_status VARCHAR(40) DEFAULT "draft"')
+                _conn.commit()
+            if "review_deadline" not in _prop_cols:
+                _cur.execute('ALTER TABLE proposals ADD COLUMN review_deadline DATETIME DEFAULT NULL')
+                _conn.commit()
 
-    _conn.close()
+            _conn.close()
+        finally:
+            _fcntl.flock(_lock_fh, _fcntl.LOCK_UN)
 
 
 # ---------------------------------------------------------------------------
