@@ -123,6 +123,13 @@ class Proposal(db.Model):
     pdf_file = db.Column(db.String(500), default="")
     generated_at = db.Column(db.DateTime, default=_utcnow)
 
+    # Multi-stakeholder review lifecycle (Part 3)
+    # States: draft, in_review, revision_requested, internally_approved,
+    #         submitted_to_customer, customer_feedback, customer_approved,
+    #         customer_declined, won, lost
+    review_status = db.Column(db.String(40), default="draft")
+    review_deadline = db.Column(db.DateTime, nullable=True)
+
 
 class ProposalQuestion(db.Model):
     """Questions the AI asks the user during proposal generation."""
@@ -310,3 +317,142 @@ class ActivityLog(db.Model):
     detail = db.Column(db.Text, default="")
     project_id = db.Column(db.String(32), nullable=True)
     created_at = db.Column(db.DateTime, default=_utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Part 3: Multi-Stakeholder Review & Revision Workflow
+# ---------------------------------------------------------------------------
+
+
+class ProposalReviewer(db.Model):
+    """A stakeholder assigned to review a specific proposal.
+
+    Review roles are per-proposal labels (engineering, accounting, sales, legal, custom),
+    NOT global User roles. Any user can be assigned with any review_role on a given
+    proposal. A user may only appear once per proposal; to wear multiple hats,
+    use 'other' or pick the most relevant role.
+    """
+    __tablename__ = "proposal_reviewers"
+    __table_args__ = (
+        db.UniqueConstraint("proposal_id", "user_id",
+                            name="uq_proposal_reviewer"),
+    )
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    proposal_id = db.Column(db.String(32), db.ForeignKey("proposals.id"), nullable=False)
+    user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    # engineering, accounting, sales, legal, operations, other
+    review_role = db.Column(db.String(40), nullable=False, default="engineering")
+    is_required = db.Column(db.Boolean, default=True)
+    assigned_at = db.Column(db.DateTime, default=_utcnow)
+    assigned_by = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    deadline = db.Column(db.DateTime, nullable=True)
+    notes = db.Column(db.Text, default="")
+
+    proposal = db.relationship("Proposal", backref="reviewers")
+    user = db.relationship("User", foreign_keys=[user_id], backref="review_assignments")
+    assigner = db.relationship("User", foreign_keys=[assigned_by])
+
+
+class ProposalApproval(db.Model):
+    """An approval/request-changes decision a reviewer files against a specific
+    proposal version. Approvals are tied to version_id so re-reviews of new
+    versions are unambiguous and the audit history is preserved."""
+    __tablename__ = "proposal_approvals"
+    __table_args__ = (
+        db.UniqueConstraint("proposal_id", "version_id", "user_id",
+                            name="uq_proposal_approval"),
+    )
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    proposal_id = db.Column(db.String(32), db.ForeignKey("proposals.id"), nullable=False)
+    version_id = db.Column(db.String(32), db.ForeignKey("proposal_versions.id"), nullable=False)
+    user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    review_role = db.Column(db.String(40), default="engineering")
+    decision = db.Column(db.String(30), nullable=False)  # approved, requested_changes
+    note = db.Column(db.Text, default="")
+    decided_at = db.Column(db.DateTime, default=_utcnow)
+
+    proposal = db.relationship("Proposal", backref="approvals")
+    version = db.relationship("ProposalVersion", backref="approvals")
+    user = db.relationship("User")
+
+
+class RevisionRequest(db.Model):
+    """A structured revision request filed by an internal reviewer or sourced
+    from a customer. The AI consumes these in batch when the owner triggers
+    a new version generation."""
+    __tablename__ = "revision_requests"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    proposal_id = db.Column(db.String(32), db.ForeignKey("proposals.id"), nullable=False)
+    author_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    # internal_engineering, internal_accounting, internal_sales, internal_legal,
+    # internal_other, customer, other
+    source = db.Column(db.String(40), nullable=False, default="internal_other")
+    # pricing, scope, resources, schedule, terms, compliance, tone, structure, other
+    category = db.Column(db.String(40), default="other")
+    directive = db.Column(db.Text, nullable=False)
+    target_section = db.Column(db.String(200), default="")
+    # pending, applied, deferred, withdrawn
+    status = db.Column(db.String(30), default="pending")
+    applied_in_version_id = db.Column(db.String(32), db.ForeignKey("proposal_versions.id"), nullable=True)
+    created_at = db.Column(db.DateTime, default=_utcnow)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow)
+
+    proposal = db.relationship("Proposal", backref="revision_requests")
+    author = db.relationship("User")
+    applied_in_version = db.relationship("ProposalVersion", foreign_keys=[applied_in_version_id])
+
+
+class ProposalRevisionBatch(db.Model):
+    """Groups the revision requests that were applied in a single AI revision
+    run. Provides auditability: 'v3 was generated by applying these N requests.'"""
+    __tablename__ = "proposal_revision_batches"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    proposal_id = db.Column(db.String(32), db.ForeignKey("proposals.id"), nullable=False)
+    from_version_id = db.Column(db.String(32), db.ForeignKey("proposal_versions.id"), nullable=False)
+    to_version_id = db.Column(db.String(32), db.ForeignKey("proposal_versions.id"), nullable=False)
+    triggered_by = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    request_count = db.Column(db.Integer, default=0)
+    ai_change_summary = db.Column(db.Text, default="")
+    created_at = db.Column(db.DateTime, default=_utcnow)
+
+    proposal = db.relationship("Proposal", backref="revision_batches")
+    from_version = db.relationship("ProposalVersion", foreign_keys=[from_version_id])
+    to_version = db.relationship("ProposalVersion", foreign_keys=[to_version_id])
+    user = db.relationship("User")
+
+
+class ProposalStatusHistory(db.Model):
+    """Audit trail of every lifecycle transition on a proposal's review_status."""
+    __tablename__ = "proposal_status_history"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    proposal_id = db.Column(db.String(32), db.ForeignKey("proposals.id"), nullable=False)
+    from_status = db.Column(db.String(40), default="")
+    to_status = db.Column(db.String(40), nullable=False)
+    actor_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    note = db.Column(db.Text, default="")
+    created_at = db.Column(db.DateTime, default=_utcnow)
+
+    proposal = db.relationship("Proposal", backref="status_history")
+    actor = db.relationship("User")
+
+
+class RevisionTemplate(db.Model):
+    """Per-user parameterized revision request templates (e.g., 'Bump margins by X%').
+    Used as presets so reviewers don't retype common directives."""
+    __tablename__ = "revision_templates"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    name = db.Column(db.String(200), nullable=False)
+    category = db.Column(db.String(40), default="other")
+    # Directive body, may contain {placeholder} tokens
+    directive_template = db.Column(db.Text, nullable=False)
+    description = db.Column(db.Text, default="")
+    created_at = db.Column(db.DateTime, default=_utcnow)
+
+    user = db.relationship("User", backref="revision_templates")

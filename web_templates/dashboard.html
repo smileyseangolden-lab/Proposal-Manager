@@ -143,6 +143,102 @@
 </div>
 {% endif %}
 
+<!-- Part 3: Pending My Review -->
+{% if my_reviews_pending %}
+<div class="card card-highlight">
+    <h2>Pending My Review <span class="pill">{{ my_reviews_pending|length }}</span></h2>
+    <p class="card-desc">Proposals where you've been assigned as a reviewer and haven't yet recorded your decision on the latest version.</p>
+    <table class="proposals-table">
+        <thead>
+            <tr>
+                <th>Project</th>
+                <th>Review Role</th>
+                <th>Version</th>
+                <th>Deadline</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for item in my_reviews_pending %}
+        <tr>
+            <td>{{ item.project.name if item.project else 'Unknown' }}</td>
+            <td><span class="badge badge-vertical">{{ item.reviewer.review_role | title }}</span></td>
+            <td>v{{ item.version_number }}</td>
+            <td>
+                {% if item.deadline %}
+                    <span {% if item.overdue %}class="overdue"{% endif %}>
+                        {{ item.deadline.strftime('%b %d') }}{% if item.overdue %} (overdue){% endif %}
+                    </span>
+                {% else %}
+                    &mdash;
+                {% endif %}
+            </td>
+            <td><a href="{{ url_for('proposal_review_page', proposal_id=item.proposal.id) }}" class="btn btn-small btn-primary">Review</a></td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+<!-- Part 3: Out for Review (owner-side) -->
+{% if out_for_review %}
+<div class="card">
+    <h2>Out for Review <span class="pill">{{ out_for_review|length }}</span></h2>
+    <p class="card-desc">Your proposals currently in the internal review cycle.</p>
+    <table class="proposals-table">
+        <thead>
+            <tr>
+                <th>Project</th>
+                <th>Status</th>
+                <th>Approvals</th>
+                <th>Pending Requests</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for item in out_for_review %}
+        <tr>
+            <td>{{ item.project.name }}</td>
+            <td><span class="badge badge-review badge-review-{{ item.proposal.review_status }}">{{ lifecycle_labels.get(item.proposal.review_status, item.proposal.review_status) }}</span></td>
+            <td>{{ item.state.approved_count }}/{{ item.state.required_count }}</td>
+            <td>{{ item.pending_req_count }}</td>
+            <td><a href="{{ url_for('view_proposal', proposal_id=item.proposal.id) }}" class="btn btn-small btn-primary">Open</a></td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+<!-- Part 3: Awaiting Customer Response -->
+{% if awaiting_customer_items %}
+<div class="card">
+    <h2>Awaiting Customer Response <span class="pill">{{ awaiting_customer_items|length }}</span></h2>
+    <p class="card-desc">Proposals currently with the customer.</p>
+    <table class="proposals-table">
+        <thead>
+            <tr>
+                <th>Project</th>
+                <th>Client</th>
+                <th>Status</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for item in awaiting_customer_items %}
+        <tr>
+            <td>{{ item.project.name }}</td>
+            <td>{{ item.project.client_name or '&mdash;' }}</td>
+            <td><span class="badge badge-review badge-review-{{ item.proposal.review_status }}">{{ lifecycle_labels.get(item.proposal.review_status, item.proposal.review_status) }}</span></td>
+            <td><a href="{{ url_for('view_proposal', proposal_id=item.proposal.id) }}" class="btn btn-small btn-primary">Open</a></td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
 <!-- Assigned to Me -->
 {% if assigned_to_me %}
 <div class="card card-highlight">

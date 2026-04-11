@@ -447,6 +447,60 @@
         <p class="empty-hint">No travel rates defined yet. Add rates above so the AI can estimate travel costs.</p>
         {% endif %}
     </div>
+
+    <!-- Part 3: Revision Request Templates -->
+    <div class="card" id="revision-templates">
+        <h2>Revision Request Templates</h2>
+        <p class="card-desc">Parameterized presets for common revision requests. When you (or your team) are reviewing a proposal, these appear as quick-fill options so you don't retype the same directives (e.g., "Bump buyout margins by 1%").</p>
+
+        <form method="post" action="{{ url_for('add_revision_template') }}">
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Template Name</label>
+                    <input type="text" name="template_name" placeholder="e.g., Bump buyout margin 1%" required>
+                </div>
+                <div class="form-group">
+                    <label>Category</label>
+                    <select name="template_category">
+                        {% for key, label in revision_categories %}
+                        <option value="{{ key }}">{{ label }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Directive</label>
+                <textarea name="template_directive" rows="3" placeholder="e.g., Increase buyout margin by 1 percentage point across all line items and recalculate totals." required></textarea>
+            </div>
+            <div class="form-group">
+                <label>Description <span class="form-hint">(optional — shown in picker)</span></label>
+                <input type="text" name="template_description">
+            </div>
+            <button type="submit" class="btn btn-secondary">Add Template</button>
+        </form>
+
+        {% if revision_templates %}
+        <table class="mini-table">
+            <thead><tr><th>Name</th><th>Category</th><th>Directive</th><th></th></tr></thead>
+            <tbody>
+            {% for t in revision_templates %}
+            <tr>
+                <td>{{ t.name }}</td>
+                <td><span class="badge badge-vertical">{{ t.category | title }}</span></td>
+                <td class="td-desc">{{ t.directive_template }}</td>
+                <td>
+                    <form method="post" action="{{ url_for('delete_revision_template', template_id=t.id) }}" class="inline-form">
+                        <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this template?')">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p class="empty-hint">No revision templates yet. Add common revision directives above so reviewers can apply them with one click.</p>
+        {% endif %}
+    </div>
 </div>
 {% endblock %}
 

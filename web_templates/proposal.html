@@ -33,12 +33,22 @@
                 </span>
             </div>
             <div class="meta-item">
+                <span class="meta-label">Review Status</span>
+                <span class="meta-value">
+                    <span class="badge badge-review badge-review-{{ proposal.review_status }}">
+                        {{ lifecycle_labels.get(proposal.review_status, proposal.review_status) }}
+                    </span>
+                </span>
+            </div>
+            <div class="meta-item">
                 <span class="meta-label">Generated</span>
                 <span class="meta-value">{{ meta.generated_at[:19] }}</span>
             </div>
         </div>
         <div class="proposal-actions">
+            {% if is_owner %}
             <a href="{{ url_for('edit_proposal', proposal_id=proposal.id) }}" class="btn btn-primary">Edit Proposal</a>
+            {% endif %}
             <a href="{{ url_for('download', proposal_id=proposal.id, fmt='docx') }}" class="btn btn-secondary">Download DOCX</a>
             <a href="{{ url_for('download_redline', proposal_id=proposal.id) }}" class="btn btn-secondary">Download Redline DOCX</a>
             <a href="{{ url_for('download', proposal_id=proposal.id, fmt='md') }}" class="btn btn-secondary">Download Markdown</a>
@@ -48,6 +58,84 @@
             <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Dashboard</a>
         </div>
     </div>
+</section>
+
+<!-- Review Lifecycle Banner -->
+<section class="card review-banner review-banner-{{ proposal.review_status }}">
+    <div class="review-banner-main">
+        <div>
+            <h2>Review Lifecycle &mdash; {{ lifecycle_labels.get(proposal.review_status, 'Draft') }}</h2>
+            {% if proposal.review_status == 'draft' %}
+            <p>This proposal has not yet been sent for internal review.</p>
+            {% elif proposal.review_status == 'in_review' %}
+            <p>Out for internal review &mdash; <strong>{{ state.approved_count }} of {{ state.required_count }}</strong> required reviewers have approved v{{ state.version_number }}.</p>
+            {% elif proposal.review_status == 'revision_requested' %}
+            <p><strong>{{ pending_req_count }}</strong> pending revision request(s). Apply them to generate the next version.</p>
+            {% elif proposal.review_status == 'internally_approved' %}
+            <p class="review-banner-ok"><strong>Internally approved.</strong> Ready to send to the customer.</p>
+            {% elif proposal.review_status == 'submitted_to_customer' %}
+            <p>Submitted to the customer. Awaiting feedback or final decision.</p>
+            {% elif proposal.review_status == 'customer_feedback' %}
+            <p>Customer requested changes. <strong>{{ pending_req_count }}</strong> pending request(s).</p>
+            {% elif proposal.review_status == 'won' or proposal.review_status == 'customer_approved' %}
+            <p class="review-banner-ok">Customer accepted the proposal &mdash; project won.</p>
+            {% elif proposal.review_status == 'lost' or proposal.review_status == 'customer_declined' %}
+            <p class="review-banner-lost">Customer declined the proposal &mdash; project lost.</p>
+            {% endif %}
+        </div>
+        <div class="review-banner-actions">
+            {% if is_owner %}
+                {% if proposal.review_status == 'draft' %}
+                <a href="{{ url_for('send_for_review', proposal_id=proposal.id) }}" class="btn btn-primary">Send for Internal Review</a>
+                {% elif proposal.review_status in ('in_review', 'revision_requested', 'customer_feedback') and pending_req_count > 0 %}
+                <a href="{{ url_for('apply_feedback', proposal_id=proposal.id) }}" class="btn btn-primary">Apply Feedback &amp; Generate v{{ (state.version_number or 1) + 1 }}</a>
+                {% endif %}
+                {% if proposal.review_status == 'internally_approved' %}
+                <form method="post" action="{{ url_for('submit_to_customer', proposal_id=proposal.id) }}" class="inline-form">
+                    <button type="submit" class="btn btn-primary">Submit to Customer</button>
+                </form>
+                <button type="button" class="btn btn-secondary" id="run-preflight">Run Pre-flight Check</button>
+                {% endif %}
+                {% if proposal.review_status in ('submitted_to_customer', 'customer_feedback') %}
+                <a href="{{ url_for('customer_feedback', proposal_id=proposal.id) }}" class="btn btn-secondary">Log Customer Feedback</a>
+                <form method="post" action="{{ url_for('customer_decision', proposal_id=proposal.id) }}" class="inline-form">
+                    <input type="hidden" name="decision" value="accepted">
+                    <button type="submit" class="btn btn-primary">Mark Accepted (Won)</button>
+                </form>
+                <form method="post" action="{{ url_for('customer_decision', proposal_id=proposal.id) }}" class="inline-form">
+                    <input type="hidden" name="decision" value="declined">
+                    <button type="submit" class="btn btn-secondary">Mark Declined (Lost)</button>
+                </form>
+                {% endif %}
+            {% endif %}
+            {% if my_reviewer %}
+            <a href="{{ url_for('proposal_review_page', proposal_id=proposal.id) }}" class="btn btn-primary">My Review</a>
+            {% endif %}
+        </div>
+    </div>
+    <div id="preflight-results" class="preflight-box" style="display:none;"></div>
+
+    {% if reviewers %}
+    <div class="reviewer-roster">
+        <h3>Reviewer Roster</h3>
+        <ul class="reviewer-list">
+            {% for r in reviewers %}
+            {% set decided = namespace(found=none) %}
+            {% for ap in state.approved_reviewers %}{% if ap.user_id == r.user_id %}{% set decided.found = 'approved' %}{% endif %}{% endfor %}
+            {% for ap in state.requested_changes_reviewers %}{% if ap.user_id == r.user_id %}{% set decided.found = 'changes' %}{% endif %}{% endfor %}
+            <li class="reviewer-item reviewer-{{ decided.found or 'pending' }}">
+                <span class="reviewer-check">
+                    {% if decided.found == 'approved' %}&#10003;{% elif decided.found == 'changes' %}&#9888;{% else %}&#8230;{% endif %}
+                </span>
+                <span class="reviewer-name">{{ r.user.display_name or r.user.username }}</span>
+                <span class="reviewer-role badge badge-vertical">{{ r.review_role | title }}</span>
+                {% if not r.is_required %}<span class="reviewer-optional">optional</span>{% endif %}
+                {% if r.deadline %}<span class="reviewer-deadline">due {{ r.deadline.strftime('%b %d') }}</span>{% endif %}
+            </li>
+            {% endfor %}
+        </ul>
+    </div>
+    {% endif %}
 </section>
 
 {% if action_items %}
@@ -62,9 +150,65 @@
 </section>
 {% endif %}
 
+<!-- Status history (audit trail) -->
+{% if status_history %}
+<details class="card">
+    <summary><strong>Lifecycle History</strong> ({{ status_history|length }} entries)</summary>
+    <ul class="status-history-list">
+        {% for h in status_history %}
+        <li>
+            <span class="status-from">{{ lifecycle_labels.get(h.from_status, h.from_status or '—') }}</span>
+            &rarr;
+            <span class="status-to">{{ lifecycle_labels.get(h.to_status, h.to_status) }}</span>
+            <span class="status-meta">by {{ h.actor.display_name if h.actor else 'system' }} at {{ h.created_at.strftime('%Y-%m-%d %H:%M') }}</span>
+            {% if h.note %}<div class="status-note">{{ h.note }}</div>{% endif %}
+        </li>
+        {% endfor %}
+    </ul>
+</details>
+{% endif %}
+
 <section class="proposal-content">
     <div class="proposal-body">
         {{ proposal_html|safe }}
     </div>
 </section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+    var btn = document.getElementById("run-preflight");
+    var box = document.getElementById("preflight-results");
+    if (!btn || !box) return;
+    btn.addEventListener("click", function(){
+        btn.disabled = true;
+        btn.textContent = "Running…";
+        box.style.display = "block";
+        box.innerHTML = "<p>Running pre-flight check…</p>";
+        fetch("{{ url_for('proposal_preflight', proposal_id=proposal.id) }}")
+            .then(function(r){ return r.json(); })
+            .then(function(data){
+                var html = "<h3>Pre-flight Check</h3>";
+                if (data.ready && (!data.warnings || !data.warnings.length)) {
+                    html += "<p class='preflight-ok'>All clear &mdash; no issues detected.</p>";
+                } else {
+                    html += "<ul>";
+                    (data.warnings || []).forEach(function(w){
+                        html += "<li>" + w + "</li>";
+                    });
+                    html += "</ul>";
+                }
+                box.innerHTML = html;
+                btn.disabled = false;
+                btn.textContent = "Re-run Pre-flight Check";
+            })
+            .catch(function(err){
+                box.innerHTML = "<p>Pre-flight check failed: " + err + "</p>";
+                btn.disabled = false;
+                btn.textContent = "Run Pre-flight Check";
+            });
+    });
+})();
+</script>
 {% endblock %}

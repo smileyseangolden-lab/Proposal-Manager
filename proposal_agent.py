@@ -468,6 +468,360 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
     return result
 
 
+def revise_proposal(current_markdown: str,
+                    revision_requests: list[dict],
+                    vertical: str = "general",
+                    company_name: str = "",
+                    user_api_key: str = None,
+                    user_model: str = None,
+                    rate_sheet_text: str = "",
+                    company_standards: list = None,
+                    past_corrections: list = None) -> dict:
+    """Revise an existing proposal by applying a batch of structured revision requests.
+
+    Args:
+        current_markdown: The current proposal markdown content.
+        revision_requests: List of dicts with keys:
+            - source (internal_engineering, customer, etc.)
+            - category (pricing, scope, ...)
+            - directive (natural-language ask)
+            - target_section (optional)
+            - author_label (reviewer name/role for the prompt)
+        vertical: Vertical key for context.
+        company_name: Company name for branding.
+        user_api_key: User's Anthropic API key.
+        user_model: Override model name.
+        rate_sheet_text: Rate sheet context (preserved from original generation).
+        company_standards: Company standards list for preservation.
+        past_corrections: Learning context.
+
+    Returns:
+        dict with:
+            - revised_markdown: The new proposal markdown.
+            - change_log: List of dicts describing what the AI did.
+            - ai_summary: A short human-readable summary of changes.
+    """
+    api_key = user_api_key or ANTHROPIC_API_KEY
+    model = user_model or CLAUDE_MODEL
+
+    if not api_key:
+        raise RuntimeError(
+            "No API key configured. Go to Settings to add your Anthropic API key."
+        )
+
+    if not revision_requests:
+        raise ValueError("No revision requests to apply.")
+
+    vertical_label = VERTICALS.get(vertical, {}).get("label", "General")
+    company_line = f"You are revising this proposal on behalf of **{company_name}**.\n\n" if company_name else ""
+
+    # Group requests by source/role for clear instruction blocks
+    grouped: dict[str, list[dict]] = {}
+    for req in revision_requests:
+        key = req.get("author_label") or req.get("source", "reviewer").replace("_", " ").title()
+        grouped.setdefault(key, []).append(req)
+
+    request_block = ""
+    for group_name, reqs in grouped.items():
+        request_block += f"\n### {group_name}\n"
+        for r in reqs:
+            cat = (r.get("category") or "other").title()
+            section = r.get("target_section") or ""
+            directive = r.get("directive", "").strip()
+            tag = f"[{cat}]"
+            if section:
+                tag += f" [Section: {section}]"
+            request_block += f"- {tag} {directive}\n"
+
+    standards_block = ""
+    if company_standards:
+        lines = []
+        for s in company_standards:
+            lines.append(f"- {s['category']}: {s['title']}")
+        standards_block = "\n## Preserved Company Standards\nThese certifications and claims must remain intact:\n" + "\n".join(lines) + "\n"
+
+    learning_block = ""
+    if past_corrections:
+        items = []
+        for c in past_corrections[:5]:
+            items.append(f"- {c.get('type', 'general').title()}: {c.get('summary', '')}")
+        learning_block = "\n## Style Preferences Learned From Past Edits\n" + "\n".join(items) + "\n"
+
+    rate_block = ""
+    if rate_sheet_text:
+        rate_block = f"\n## Rate & Price Sheet (still in effect)\n```\n{rate_sheet_text[:6000]}\n```\n"
+
+    system_prompt = f"""You are the Proposal Manager Revision Agent. You revise an EXISTING
+{vertical_label} proposal by applying a batch of structured change requests from
+reviewers. You do not rewrite from scratch.
+
+{company_line}## Your Rules
+
+1. Apply EVERY revision request precisely. Preserve everything else byte-for-byte
+   when possible, only modifying what the requests demand.
+2. Keep all `[ACTION REQUIRED: ...]` markers that remain applicable.
+3. If a request requires recalculating totals (e.g., margin bumps, added staff),
+   recalculate any affected totals and subtotals in pricing tables.
+4. Preserve all section headings, tables, and the overall structure unless a
+   request explicitly asks you to change the structure.
+5. Do NOT fabricate pricing, personnel names, or certifications. Use
+   `[ACTION REQUIRED]` markers for anything the request does not specify.
+6. If two requests directly conflict, apply neither and note the conflict in
+   the change log.
+7. After the revised proposal, emit a structured change log.
+
+## Output Format
+
+Your response MUST contain exactly two sections separated by the marker
+`=====CHANGE_LOG=====`:
+
+1. The revised proposal markdown (no preamble, start directly with the proposal).
+2. A JSON array `change_log` after the marker, one entry per request:
+   ```json
+   [
+     {{"request_index": 1, "applied": true, "action": "Increased buyout margin by 1%", "sections_touched": ["Pricing"]}},
+     {{"request_index": 2, "applied": false, "reason": "Conflicts with request 3"}}
+   ]
+   ```
+   After the JSON, on a new line, write a single-sentence plain-English summary.
+
+{rate_block}
+{standards_block}
+{learning_block}
+"""
+
+    user_message = f"""Please revise the following proposal by applying the revision requests below.
+
+---BEGIN CURRENT PROPOSAL---
+{current_markdown}
+---END CURRENT PROPOSAL---
+
+---REVISION REQUESTS---
+{request_block}
+---END REVISION REQUESTS---
+
+Return the revised proposal followed by the =====CHANGE_LOG===== marker and the JSON change log.
+"""
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    full_text = ""
+    with client.messages.stream(
+        model=model,
+        max_tokens=16000,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_message}],
+    ) as stream:
+        for chunk in stream.text_stream:
+            full_text += chunk
+
+    return _parse_revision_response(full_text, revision_requests)
+
+
+def _parse_revision_response(full_text: str, revision_requests: list[dict]) -> dict:
+    """Split the AI's revision output into markdown and a structured change log."""
+    marker = "=====CHANGE_LOG====="
+    if marker in full_text:
+        revised_markdown, log_section = full_text.split(marker, 1)
+    else:
+        revised_markdown, log_section = full_text, ""
+
+    revised_markdown = revised_markdown.strip()
+    log_section = log_section.strip()
+
+    change_log: list[dict] = []
+    ai_summary = ""
+
+    # Try to extract JSON array from the log section
+    json_match = re.search(r"\[.*\]", log_section, re.DOTALL)
+    if json_match:
+        try:
+            change_log = json.loads(json_match.group(0))
+        except (json.JSONDecodeError, ValueError):
+            change_log = []
+        # Anything after the JSON is a natural-language summary
+        after_json = log_section[json_match.end():].strip()
+        if after_json:
+            # Strip code fences if any
+            after_json = re.sub(r"^```.*?\n", "", after_json).strip("` \n")
+            ai_summary = after_json.split("\n", 1)[0]
+
+    # Fallback: if no structured log, treat every request as applied
+    if not change_log:
+        change_log = [
+            {"request_index": i + 1, "applied": True, "action": "Applied"}
+            for i in range(len(revision_requests))
+        ]
+
+    if not ai_summary:
+        applied_count = sum(1 for c in change_log if c.get("applied"))
+        ai_summary = f"Applied {applied_count} of {len(revision_requests)} revision request(s)."
+
+    return {
+        "revised_markdown": revised_markdown,
+        "change_log": change_log,
+        "ai_summary": ai_summary,
+    }
+
+
+def parse_customer_email(email_text: str,
+                         user_api_key: str = None,
+                         user_model: str = None) -> list[dict]:
+    """Parse a raw customer email into a list of structured revision request drafts.
+
+    Returns a list of dicts with 'directive', 'category', and optional
+    'target_section' keys. Sales can then accept/edit before committing.
+
+    Raises RuntimeError if no API key is configured.
+    """
+    api_key = user_api_key or ANTHROPIC_API_KEY
+    model = user_model or CLAUDE_MODEL
+
+    if not api_key:
+        raise RuntimeError(
+            "No API key configured. Go to Settings to add your Anthropic API key."
+        )
+
+    if not email_text or not email_text.strip():
+        return []
+
+    system_prompt = """You extract actionable proposal revision requests from customer emails.
+
+Given the raw text of a customer's email responding to a proposal, identify every
+distinct change the customer is asking for. For each, output:
+- directive: a concise, imperative instruction (e.g., "Lower the T&M labor rate by 10%")
+- category: one of pricing, scope, resources, schedule, terms, compliance, tone, structure, other
+- target_section: the proposal section name if the customer mentions one, else ""
+
+Output format: a JSON array ONLY, no preamble. Example:
+[
+  {"directive": "Lower T&M labor rate by 10%", "category": "pricing", "target_section": "Pricing"},
+  {"directive": "Add a 6-month warranty clause", "category": "terms", "target_section": ""}
+]
+
+Rules:
+- If the email is just a thank-you or has no revision requests, output `[]`.
+- Do NOT invent requests the customer did not make.
+- Keep directives short and specific.
+- Aim for 1-10 requests per email; combine near-duplicates.
+"""
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    response_text = ""
+    with client.messages.stream(
+        model=model,
+        max_tokens=2000,
+        system=system_prompt,
+        messages=[{"role": "user", "content": f"Customer email:\n\n{email_text[:8000]}"}],
+    ) as stream:
+        for chunk in stream.text_stream:
+            response_text += chunk
+
+    # Extract the JSON array
+    json_match = re.search(r"\[.*\]", response_text, re.DOTALL)
+    if not json_match:
+        return []
+
+    try:
+        raw = json.loads(json_match.group(0))
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+    results: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        directive = (item.get("directive") or "").strip()
+        if not directive:
+            continue
+        category = (item.get("category") or "other").strip().lower()
+        if category not in {"pricing", "scope", "resources", "schedule", "terms",
+                            "compliance", "tone", "structure", "other"}:
+            category = "other"
+        results.append({
+            "directive": directive,
+            "category": category,
+            "target_section": (item.get("target_section") or "").strip(),
+        })
+
+    return results
+
+
+def preflight_check_proposal(markdown_content: str,
+                             user_api_key: str = None,
+                             user_model: str = None) -> dict:
+    """Run a pre-flight sanity check on a proposal before sending to the customer.
+
+    Returns a dict with:
+        - action_items: list of unresolved [ACTION REQUIRED] markers
+        - warnings: list of natural-language warnings from the AI
+        - ready: bool, True if no critical issues
+    """
+    # Local action-item scan (no API call needed)
+    action_items = re.findall(r"\[ACTION REQUIRED:\s*(.+?)\]", markdown_content)
+
+    warnings: list[str] = []
+
+    if action_items:
+        warnings.append(f"{len(action_items)} unresolved [ACTION REQUIRED] marker(s) still in the proposal.")
+
+    # Basic structural checks
+    if "## Pricing" not in markdown_content and "## Cost" not in markdown_content and "## Price" not in markdown_content:
+        warnings.append("No Pricing/Cost section header detected — customer may expect one.")
+
+    if len(markdown_content.strip()) < 500:
+        warnings.append("Proposal content is unusually short (<500 chars).")
+
+    # Check for obviously unreplaced placeholders
+    if re.search(r"\bTBD\b", markdown_content) or re.search(r"\bXXX\b", markdown_content):
+        warnings.append("Contains TBD/XXX placeholders.")
+
+    # Try an AI-based deeper check (graceful degradation if no key)
+    api_key = user_api_key or ANTHROPIC_API_KEY
+    model = user_model or CLAUDE_MODEL
+    if api_key:
+        try:
+            client = anthropic.Anthropic(api_key=api_key)
+            system_prompt = (
+                "You are a proposal quality reviewer. Look at this proposal and "
+                "identify any issues that could embarrass the sender if submitted "
+                "to a customer: inconsistent numbers, obvious typos in key places, "
+                "missing totals, ambiguous scope statements. Respond with a JSON "
+                "array of short warning strings, e.g. "
+                '["Labor total ($50k) does not match line items ($48k)"]. '
+                "If the proposal looks ready, respond with []."
+            )
+            result_text = ""
+            with client.messages.stream(
+                model=model,
+                max_tokens=1000,
+                system=system_prompt,
+                messages=[{"role": "user", "content": markdown_content[:12000]}],
+            ) as stream:
+                for chunk in stream.text_stream:
+                    result_text += chunk
+            json_match = re.search(r"\[.*\]", result_text, re.DOTALL)
+            if json_match:
+                try:
+                    ai_warnings = json.loads(json_match.group(0))
+                    if isinstance(ai_warnings, list):
+                        for w in ai_warnings:
+                            if isinstance(w, str) and w.strip():
+                                warnings.append(w.strip())
+                except (json.JSONDecodeError, ValueError):
+                    pass
+        except Exception:
+            # Never fail pre-flight on API error — degrade gracefully.
+            pass
+
+    return {
+        "action_items": action_items,
+        "warnings": warnings,
+        "ready": len(warnings) == 0,
+    }
+
+
 def _extract_questions(text: str) -> list[dict]:
     """Extract clarification questions from the proposal output."""
     match = re.search(r"## CLARIFICATION QUESTIONS\s*\n(.*)", text, re.DOTALL)

@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+
+{% block title %}Apply Feedback &mdash; {{ project.name }}{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <h1>Apply Feedback &amp; Generate Next Version</h1>
+    <p class="page-subtitle">{{ project.name }} &middot; current status: <span class="badge badge-review badge-review-{{ proposal.review_status }}">{{ lifecycle_labels.get(proposal.review_status, proposal.review_status) }}</span></p>
+</section>
+
+{% if not pending %}
+<div class="card">
+    <p>No pending revision requests.</p>
+    <a href="{{ url_for('view_proposal', proposal_id=proposal.id) }}" class="btn btn-secondary">Back to Proposal</a>
+</div>
+{% else %}
+<form method="post" action="{{ url_for('apply_feedback', proposal_id=proposal.id) }}">
+    <div class="card">
+        <h2>Pending Revision Requests ({{ pending|length }})</h2>
+        <p class="card-desc">Uncheck any requests you want to defer. Edit the directive text to sharpen the phrasing before the AI sees it. Click Generate to produce the next version.</p>
+
+        <table class="mini-table">
+            <thead>
+                <tr>
+                    <th class="text-center">Apply</th>
+                    <th>Source</th>
+                    <th>Category</th>
+                    <th>Directive</th>
+                    <th>Section</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for r in pending %}
+                <tr class="revision-row revision-source-{{ r.source }}">
+                    <td class="text-center">
+                        <input type="checkbox" name="apply_request_id" value="{{ r.id }}" checked>
+                    </td>
+                    <td>
+                        {% if r.source == 'customer' %}
+                        <span class="badge badge-status-submitted">&#128101; Customer</span>
+                        {% else %}
+                        <span class="badge badge-vertical">{{ r.source.replace('internal_', '')|title }}</span>
+                        {% endif %}
+                        <div class="revision-author">
+                            {% if r.author %}{{ r.author.display_name or r.author.username }}{% endif %}
+                        </div>
+                    </td>
+                    <td>{{ r.category | title }}</td>
+                    <td>
+                        <textarea name="directive_{{ r.id }}" rows="3" class="directive-edit">{{ r.directive }}</textarea>
+                    </td>
+                    <td>{{ r.target_section or '—' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <div class="proposal-actions">
+            <button type="submit" class="btn btn-primary">Generate New Version</button>
+            <a href="{{ url_for('view_proposal', proposal_id=proposal.id) }}" class="btn btn-secondary">Cancel</a>
+        </div>
+    </div>
+</form>
+{% endif %}
+{% endblock %}
