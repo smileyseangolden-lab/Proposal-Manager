@@ -14,4 +14,11 @@ RUN mkdir -p uploads generated_proposals
 
 EXPOSE 5000
 
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--timeout", "300", "app:app"]
+# Proposal generation with Claude Opus on a big RFP can legitimately take
+# 5-10 minutes of streaming. Set gunicorn --timeout to 900s (15 min) so
+# long-running jobs finish cleanly. The host nginx proxy_read_timeout
+# MUST be >= this value or nginx will cut the connection first.
+# --graceful-timeout lets an in-flight request finish during worker reload.
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", \
+     "--timeout", "900", "--graceful-timeout", "900", \
+     "--keep-alive", "75", "app:app"]
