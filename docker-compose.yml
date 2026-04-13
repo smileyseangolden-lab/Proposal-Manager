@@ -5,7 +5,7 @@ services:
     security_opt:
       - apparmor:unconfined
     ports:
-      - "127.0.0.1:15000:5000"
+      - "127.0.0.1:${HOST_PORT:-15000}:5000"
     env_file:
       - .env
     volumes:
