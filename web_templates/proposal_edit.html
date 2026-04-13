@@ -85,6 +85,25 @@
         <p class="empty-hint">No version history yet.</p>
         {% endif %}
 
+        <!-- Targeted Section Regeneration (Phase 4) -->
+        <div style="margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--gray-200);">
+            <details>
+                <summary style="cursor:pointer;font-weight:600;font-size:13px;">AI Section Regeneration</summary>
+                <form method="post" action="{{ url_for('regenerate_proposal_section', proposal_id=proposal.id) }}" style="margin-top:8px;">
+                    <div class="form-group" style="margin-bottom:6px;">
+                        <label style="font-size:11px;">Section Heading</label>
+                        <input type="text" name="section_heading" placeholder="## Section Name" style="font-size:12px;">
+                    </div>
+                    <div class="form-group" style="margin-bottom:6px;">
+                        <label style="font-size:11px;">New Information</label>
+                        <textarea name="clarification_answer" rows="3" placeholder="Describe the clarification or new info to incorporate..." style="font-size:12px;" required></textarea>
+                    </div>
+                    <button type="submit" class="btn btn-primary btn-small" style="width:100%;" onclick="return confirm('Regenerate this section using AI? A new version will be created.')">Regenerate Section</button>
+                    <p style="font-size:10px; color:var(--gray-500); margin-top:4px;">AI will rewrite only the specified section with the new information.</p>
+                </form>
+            </details>
+        </div>
+
         {% if versions|length > 1 %}
         <div style="margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--gray-200);">
             <form method="post" action="{{ url_for('finalize_proposal', proposal_id=proposal.id) }}">

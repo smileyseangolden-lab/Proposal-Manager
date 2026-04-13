@@ -1,0 +1,202 @@
+{% extends "base.html" %}
+
+{% block title %}Review &mdash; {{ project.name }}{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <div class="page-header-row">
+        <div>
+            <h1>Proposal Review</h1>
+            <p class="page-subtitle">{{ project.name }} &mdash; {{ proposal.vertical_label }}
+                {% if active_cycle %}
+                <span class="badge badge-status-active">{{ active_cycle.name }}</span>
+                {% endif %}
+            </p>
+        </div>
+        <div class="header-actions">
+            <a href="{{ url_for('view_proposal', proposal_id=proposal.id) }}" class="btn btn-small btn-secondary">View Proposal</a>
+            <a href="{{ url_for('edit_proposal', proposal_id=proposal.id) }}" class="btn btn-small btn-secondary">Edit Proposal</a>
+            <a href="{{ url_for('clarification_register', project_id=project.id) }}" class="btn btn-small btn-secondary">Clarification Register</a>
+        </div>
+    </div>
+</section>
+
+<!-- Stats -->
+<section class="stats-grid">
+    <div class="stat-card">
+        <span class="stat-number">{{ total_comments }}</span>
+        <span class="stat-label">Total Comments</span>
+    </div>
+    <div class="stat-card stat-red">
+        <span class="stat-number">{{ open_comments }}</span>
+        <span class="stat-label">Open</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-number">{{ questions }}</span>
+        <span class="stat-label">Open Questions</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-number">{{ change_requests }}</span>
+        <span class="stat-label">Change Requests</span>
+    </div>
+    <div class="stat-card stat-green">
+        <span class="stat-number">{{ approvals }}</span>
+        <span class="stat-label">Approvals</span>
+    </div>
+    {% if active_cycle and total_comments > 0 %}
+    <div class="stat-card">
+        <span class="stat-number">{{ ((total_comments - open_comments) / total_comments * 100) | int }}%</span>
+        <span class="stat-label">Resolved</span>
+    </div>
+    {% endif %}
+</section>
+
+<!-- Review Cycle Controls -->
+<div class="card" style="margin-bottom:16px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;">
+        <div>
+            <strong>Review Cycles:</strong>
+            {% for cycle in cycles %}
+            <span class="badge badge-status-{{ cycle.status }}" style="margin-left:4px;">
+                {{ cycle.name }} ({{ cycle.status }})
+            </span>
+            {% endfor %}
+            {% if not cycles %}
+            <span style="color:var(--gray-500);">No review cycles started yet</span>
+            {% endif %}
+        </div>
+        <div style="display:flex;gap:8px;">
+            {% if not active_cycle %}
+            <form method="post" action="{{ url_for('start_review_cycle', proposal_id=proposal.id) }}" class="inline-form">
+                <input type="text" name="cycle_name" placeholder="Cycle name (e.g. Review 1)" style="width:180px;" class="change-summary-input">
+                <button type="submit" class="btn btn-small btn-primary">Start Review Cycle</button>
+            </form>
+            {% else %}
+            <form method="post" action="{{ url_for('complete_review_cycle', proposal_id=proposal.id) }}" class="inline-form">
+                <button type="submit" class="btn btn-small btn-secondary" onclick="return confirm('Complete this review cycle?')">Complete Cycle</button>
+            </form>
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+<!-- Add Comment -->
+<div class="card" style="margin-bottom:16px;">
+    <details{% if not comments %} open{% endif %}>
+        <summary style="cursor:pointer;font-weight:600;margin-bottom:12px;">+ Add Review Comment</summary>
+        <form method="post" action="{{ url_for('add_review_comment', proposal_id=proposal.id) }}">
+            <div class="form-grid-3">
+                <div class="form-group">
+                    <label>Comment Type</label>
+                    <select name="comment_type" class="status-select">
+                        <option value="comment">Comment (informational)</option>
+                        <option value="question">Question (needs answer)</option>
+                        <option value="change_request">Change Request (needs revision)</option>
+                        <option value="approval">Approval (section sign-off)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Section</label>
+                    <select name="section_heading" class="status-select">
+                        <option value="">General / Whole Proposal</option>
+                        {% for s in sections %}
+                        <option value="{{ s }}">{{ s }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Assign to</label>
+                    <select name="assigned_to_user_id" class="status-select">
+                        <option value="">Unassigned</option>
+                        {% for u in users %}
+                        <option value="{{ u.id }}">{{ u.display_name or u.username }} ({{ u.role }})</option>
+                        {% endfor %}
+                    </select>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Referenced Text (optional)</label>
+                <input type="text" name="line_reference" placeholder="Paste the specific text you're commenting on...">
+            </div>
+            <div class="form-group">
+                <label>Comment</label>
+                <textarea name="content" rows="3" required placeholder="Your review comment..."></textarea>
+            </div>
+            <div class="form-group">
+                <label>Assign to Role</label>
+                <select name="assigned_to_role" class="status-select" style="width:auto;">
+                    <option value="">None</option>
+                    <option value="proposal">Proposal Team</option>
+                    <option value="sales">Sales</option>
+                    <option value="admin">Admin</option>
+                </select>
+            </div>
+            <button type="submit" class="btn btn-primary">Add Comment</button>
+        </form>
+    </details>
+</div>
+
+<!-- Comments List -->
+{% if comments %}
+<div class="card">
+    <h2>Review Comments</h2>
+    <div class="review-comments-list">
+        {% for c in comments %}
+        <div class="review-comment review-comment-{{ c.comment_type }} {{ 'review-resolved' if c.status == 'resolved' }}">
+            <div class="review-comment-header">
+                <span class="badge badge-comment-{{ c.comment_type }}">
+                    {% if c.comment_type == 'comment' %}Comment
+                    {% elif c.comment_type == 'question' %}Question
+                    {% elif c.comment_type == 'change_request' %}Change Request
+                    {% elif c.comment_type == 'approval' %}Approval
+                    {% endif %}
+                </span>
+                <span class="badge badge-status-{{ c.status }}">{{ c.status | title }}</span>
+                {% if c.section_heading %}
+                <span style="color:var(--gray-500);font-size:12px;">{{ c.section_heading }}</span>
+                {% endif %}
+                <span style="margin-left:auto;color:var(--gray-500);font-size:12px;">
+                    {{ c.author.display_name or c.author.username }} &mdash; {{ c.created_at.strftime('%Y-%m-%d %H:%M') }}
+                </span>
+            </div>
+
+            {% if c.line_reference %}
+            <div class="review-quote">{{ c.line_reference }}</div>
+            {% endif %}
+
+            <div class="review-comment-body">{{ c.content }}</div>
+
+            {% if c.assignee %}
+            <div style="font-size:12px;color:var(--gray-500);margin-top:4px;">
+                Assigned to: {{ c.assignee.display_name or c.assignee.username }}
+            </div>
+            {% endif %}
+
+            {% if c.resolution_note %}
+            <div class="review-resolution">
+                <strong>Resolution:</strong> {{ c.resolution_note }}
+                <span style="color:var(--gray-500);font-size:12px;">
+                    &mdash; {{ c.resolver.display_name or c.resolver.username if c.resolver else '' }}
+                    {{ c.resolved_at.strftime('%Y-%m-%d %H:%M') if c.resolved_at else '' }}
+                </span>
+            </div>
+            {% endif %}
+
+            {% if c.status == 'open' %}
+            <div class="review-comment-actions" style="margin-top:8px;">
+                <form method="post" action="{{ url_for('resolve_review_comment', comment_id=c.id) }}" class="inline-form" style="display:flex;gap:4px;align-items:center;">
+                    <input type="text" name="resolution_note" placeholder="Resolution note..." class="change-summary-input" style="flex:1;">
+                    <button type="submit" class="btn btn-small btn-primary">Resolve</button>
+                </form>
+            </div>
+            {% endif %}
+        </div>
+        {% endfor %}
+    </div>
+</div>
+{% else %}
+<div class="card empty-state">
+    <p>No review comments yet. {% if not active_cycle %}Start a review cycle and add comments to begin the review process.{% else %}Add a comment above to begin reviewing.{% endif %}</p>
+</div>
+{% endif %}
+{% endblock %}

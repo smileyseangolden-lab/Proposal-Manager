@@ -212,7 +212,14 @@
                     {% endif %}
                 </td>
                 <td>{{ p.created_at.strftime('%Y-%m-%d') }}</td>
-                <td><span class="badge badge-status-{{ p.status }}">{{ p.status }}</span></td>
+                <td>
+                    <span class="badge badge-status-{{ p.status }}">{{ p.status }}</span>
+                    {% if p.clarification_sub_status and p.clarification_sub_status != 'none' %}
+                    <a href="{{ url_for('clarification_register', project_id=p.id) }}" class="badge badge-status-{{ p.clarification_sub_status }}" style="text-decoration:none;margin-left:2px;">
+                        {{ p.clarification_sub_status | replace('_', ' ') | title }}
+                    </a>
+                    {% endif %}
+                </td>
                 <td class="row-actions" onclick="event.stopPropagation()">
                     <form method="post" action="{{ url_for('update_project_status', project_id=p.id) }}" class="inline-form">
                         <select name="status" onchange="this.form.submit()" class="status-select">

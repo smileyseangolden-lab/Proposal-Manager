@@ -1,0 +1,261 @@
+{% extends "base.html" %}
+
+{% block title %}Clarification Register &mdash; {{ project.name }}{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <div class="page-header-row">
+        <div>
+            <h1>Clarification Register</h1>
+            <p class="page-subtitle">{{ project.name }}
+                {% if project.clarification_sub_status != 'none' %}
+                <span class="badge badge-status-{{ project.clarification_sub_status }}">{{ project.clarification_sub_status | replace('_', ' ') | title }}</span>
+                {% endif %}
+            </p>
+        </div>
+        <div class="header-actions">
+            <a href="{{ url_for('project_upload', project_id=project.id) }}" class="btn btn-secondary btn-small">Back to Project</a>
+            {% if customer_count > 0 %}
+            <form method="post" action="{{ url_for('generate_rfi_letter', project_id=project.id) }}" class="inline-form">
+                <button type="submit" class="btn btn-primary btn-small">Generate RFI Letter</button>
+            </form>
+            {% endif %}
+        </div>
+    </div>
+</section>
+
+<!-- Stats -->
+<section class="stats-grid">
+    <div class="stat-card">
+        <span class="stat-number">{{ total }}</span>
+        <span class="stat-label">Total Items</span>
+    </div>
+    <div class="stat-card stat-red">
+        <span class="stat-number">{{ open_count }}</span>
+        <span class="stat-label">Open</span>
+    </div>
+    <div class="stat-card stat-green">
+        <span class="stat-number">{{ resolved_count }}</span>
+        <span class="stat-label">Resolved</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-number">{{ customer_count }}</span>
+        <span class="stat-label">Customer (RFI)</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-number">{{ parking_lot_count }}</span>
+        <span class="stat-label">Parking Lot</span>
+    </div>
+    {% if proposal and unresolved_impact > 0 %}
+    <div class="stat-card stat-red">
+        <span class="stat-number">-{{ unresolved_impact }}%</span>
+        <span class="stat-label">Confidence Impact</span>
+    </div>
+    {% endif %}
+</section>
+
+<!-- Filters -->
+<div class="card" style="margin-bottom:16px;">
+    <form method="get" action="{{ url_for('clarification_register', project_id=project.id) }}" class="filter-row">
+        <select name="status" class="status-select">
+            <option value="">All Statuses</option>
+            {% for s in ['draft','open','sent','response_received','incorporated','resolved','skipped'] %}
+            <option value="{{ s }}" {{ 'selected' if filter_status == s }}>{{ s | replace('_',' ') | title }}</option>
+            {% endfor %}
+        </select>
+        <select name="path" class="status-select">
+            <option value="">All Paths</option>
+            <option value="infer" {{ 'selected' if filter_path == 'infer' }}>AI Can Infer</option>
+            <option value="internal" {{ 'selected' if filter_path == 'internal' }}>Internal Team</option>
+            <option value="customer" {{ 'selected' if filter_path == 'customer' }}>Customer (RFI)</option>
+        </select>
+        <select name="category" class="status-select">
+            <option value="">All Categories</option>
+            {% for c in ['scope','pricing','compliance','schedule','technical','general'] %}
+            <option value="{{ c }}" {{ 'selected' if filter_category == c }}>{{ c | title }}</option>
+            {% endfor %}
+        </select>
+        <button type="submit" class="btn btn-small btn-secondary">Filter</button>
+        {% if filter_status or filter_path or filter_category %}
+        <a href="{{ url_for('clarification_register', project_id=project.id) }}" class="btn btn-small btn-secondary">Clear</a>
+        {% endif %}
+    </form>
+</div>
+
+<!-- Add New Item -->
+<div class="card" style="margin-bottom:16px;">
+    <details>
+        <summary style="cursor:pointer;font-weight:600;margin-bottom:12px;">+ Add Clarification Item</summary>
+        <form method="post" action="{{ url_for('add_clarification', project_id=project.id) }}">
+            <div class="form-grid-3">
+                <div class="form-group">
+                    <label>Resolution Path</label>
+                    <select name="resolution_path" class="status-select">
+                        <option value="internal">Internal Team</option>
+                        <option value="customer">Customer (RFI)</option>
+                        <option value="infer">AI Can Infer</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Category</label>
+                    <select name="category" class="status-select">
+                        {% for c in ['general','scope','pricing','compliance','schedule','technical'] %}
+                        <option value="{{ c }}">{{ c | title }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Priority</label>
+                    <select name="priority" class="status-select">
+                        <option value="low">Low</option>
+                        <option value="medium" selected>Medium</option>
+                        <option value="high">High</option>
+                        <option value="critical">Critical</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Question / Clarification Needed</label>
+                <textarea name="question" rows="3" required placeholder="Describe what needs to be clarified..."></textarea>
+            </div>
+            <div class="form-grid-3">
+                <div class="form-group">
+                    <label>Proposal Section (optional)</label>
+                    <input type="text" name="proposal_section" placeholder="e.g. ## Scope of Work">
+                </div>
+                <div class="form-group">
+                    <label>Assign to User</label>
+                    <select name="assigned_to_user_id" class="status-select">
+                        <option value="">Unassigned</option>
+                        {% for u in users %}
+                        <option value="{{ u.id }}">{{ u.display_name or u.username }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Assign to Role</label>
+                    <select name="assigned_to_role" class="status-select">
+                        <option value="">None</option>
+                        <option value="proposal">Proposal</option>
+                        <option value="sales">Sales</option>
+                        <option value="admin">Admin</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group">
+                <label><input type="checkbox" name="is_parking_lot" value="1"> Parking Lot (non-blocking)</label>
+            </div>
+            <button type="submit" class="btn btn-primary">Add Item</button>
+        </form>
+    </details>
+</div>
+
+<!-- Items List -->
+{% if items %}
+<div class="card">
+    <table class="proposals-table">
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>Path</th>
+                <th>Category</th>
+                <th>Priority</th>
+                <th>Question</th>
+                <th>Section</th>
+                <th>Status</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for item in items %}
+        <tr class="{{ 'parking-lot-row' if item.is_parking_lot }}">
+            <td>
+                {% if item.rfi_reference_id %}
+                <span class="badge badge-status-submitted">{{ item.rfi_reference_id }}</span>
+                {% else %}
+                <span style="color:var(--gray-500);font-size:12px;">{{ item.id[:8] }}</span>
+                {% endif %}
+            </td>
+            <td>
+                <span class="badge badge-path-{{ item.resolution_path }}">
+                    {% if item.resolution_path == 'infer' %}AI Infer
+                    {% elif item.resolution_path == 'customer' %}Customer
+                    {% else %}Internal{% endif %}
+                </span>
+            </td>
+            <td><span class="badge">{{ item.category | title }}</span></td>
+            <td>
+                <span class="badge badge-priority-{{ item.priority }}">{{ item.priority | title }}</span>
+            </td>
+            <td>
+                <div style="max-width:300px;">
+                    {{ item.question[:150] }}{% if item.question|length > 150 %}...{% endif %}
+                    {% if item.ai_suggestion %}
+                    <div style="margin-top:4px;font-size:12px;color:var(--primary);">AI suggests: {{ item.ai_suggestion[:100] }}...</div>
+                    {% endif %}
+                    {% if item.is_parking_lot %}
+                    <span class="badge" style="background:#fef3c7;color:#92400e;margin-top:4px;">Parking Lot</span>
+                    {% endif %}
+                </div>
+            </td>
+            <td style="font-size:12px;">{{ item.proposal_section or '&mdash;' }}</td>
+            <td><span class="badge badge-status-{{ item.status }}">{{ item.status | replace('_',' ') | title }}</span></td>
+            <td class="row-actions">
+                {% if item.status in ['open', 'draft', 'response_received'] %}
+                <details style="position:relative;">
+                    <summary class="btn btn-small btn-secondary">Actions</summary>
+                    <div class="action-dropdown">
+                        {% if item.status in ['open', 'draft'] %}
+                        <form method="post" action="{{ url_for('respond_clarification', item_id=item.id) }}" style="padding:8px;">
+                            <textarea name="response" rows="2" placeholder="Enter response..." required style="width:100%;margin-bottom:4px;"></textarea>
+                            <button type="submit" class="btn btn-small btn-primary">Respond</button>
+                        </form>
+                        {% endif %}
+                        {% if item.status == 'response_received' %}
+                        <form method="post" action="{{ url_for('resolve_clarification', item_id=item.id) }}" style="padding:8px;">
+                            <button type="submit" class="btn btn-small btn-primary" style="width:100%;">Mark Resolved</button>
+                        </form>
+                        {% endif %}
+                        <form method="post" action="{{ url_for('toggle_parking_lot', item_id=item.id) }}" style="padding:4px 8px;">
+                            <button type="submit" class="btn btn-small btn-secondary" style="width:100%;">
+                                {{ 'Remove from' if item.is_parking_lot else 'Move to' }} Parking Lot
+                            </button>
+                        </form>
+                    </div>
+                </details>
+                {% elif item.status == 'sent' %}
+                <form method="post" action="{{ url_for('record_rfi_response', project_id=project.id, item_id=item.id) }}" style="display:inline;">
+                    <details style="position:relative;">
+                        <summary class="btn btn-small btn-primary">Record Response</summary>
+                        <div class="action-dropdown" style="padding:8px;">
+                            <textarea name="response" rows="2" placeholder="Customer's response..." required style="width:100%;margin-bottom:4px;"></textarea>
+                            <button type="submit" class="btn btn-small btn-primary">Save</button>
+                        </div>
+                    </details>
+                </form>
+                {% elif item.status == 'resolved' %}
+                <span style="color:var(--success);font-size:12px;">Resolved</span>
+                {% endif %}
+            </td>
+        </tr>
+        {% if item.response %}
+        <tr>
+            <td></td>
+            <td colspan="7" style="background:var(--gray-50);font-size:13px;padding:8px 12px;">
+                <strong>Response:</strong> {{ item.response }}
+                {% if item.responded_at %}
+                <span style="color:var(--gray-500);"> &mdash; {{ item.responded_at.strftime('%Y-%m-%d %H:%M') }}</span>
+                {% endif %}
+            </td>
+        </tr>
+        {% endif %}
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% else %}
+<div class="card empty-state">
+    <p>No clarification items yet. Items are created automatically when the AI detects gaps during proposal generation, or you can add them manually above.</p>
+</div>
+{% endif %}
+{% endblock %}

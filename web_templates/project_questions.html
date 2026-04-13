@@ -5,31 +5,128 @@
 {% block content %}
 <section class="page-header">
     <h1>Clarification Questions</h1>
-    <p class="page-subtitle">The AI agent needs additional information to generate a more accurate proposal for <strong>{{ project.name }}</strong>.</p>
+    <p class="page-subtitle">The AI agent has categorized questions by resolution path for <strong>{{ project.name }}</strong>.</p>
 </section>
 
 <div class="card">
     <form method="post" action="{{ url_for('project_questions', project_id=project.id) }}">
-        {% for q in questions %}
-        <div class="question-block">
-            <div class="question-number">Question {{ loop.index }}</div>
-            <p class="question-text">{{ q.question }}</p>
-            {% if q.context %}
-            <p class="question-context">Context: {{ q.context }}</p>
-            {% endif %}
-            <div class="form-group">
-                <textarea name="answer_{{ q.id }}" rows="3" placeholder="Enter your answer..."></textarea>
+
+        <!-- AI Can Infer -->
+        {% if infer_qs %}
+        <div class="question-category">
+            <h2 style="display:flex;align-items:center;gap:8px;">
+                <span class="badge badge-path-infer">AI Can Infer</span>
+                AI has a suggested answer &mdash; confirm or override
+            </h2>
+            {% for q in infer_qs %}
+            <div class="question-block question-infer">
+                <div class="question-number">Question {{ loop.index }}</div>
+                <p class="question-text">{{ q.question }}</p>
+                {% if ai_suggestions.get(q.id) %}
+                <div class="ai-suggestion-box">
+                    <strong>AI Suggestion:</strong> {{ ai_suggestions[q.id] }}
+                </div>
+                <label class="accept-label">
+                    <input type="checkbox" name="accept_{{ q.id }}" value="1" checked>
+                    Accept AI suggestion
+                </label>
+                {% endif %}
+                <div class="form-group">
+                    <textarea name="answer_{{ q.id }}" rows="2" placeholder="Override with your own answer (leave blank to accept suggestion)..."></textarea>
+                </div>
+                <label class="skip-label">
+                    <input type="checkbox" name="skip_{{ q.id }}" value="1">
+                    Skip this question
+                </label>
             </div>
-            <label class="skip-label">
-                <input type="checkbox" name="skip_{{ q.id }}" value="1">
-                Skip this question (the AI will use its best judgment)
-            </label>
+            {% endfor %}
         </div>
-        {% endfor %}
+        {% endif %}
+
+        <!-- Internal Team -->
+        {% if internal_qs %}
+        <div class="question-category">
+            <h2 style="display:flex;align-items:center;gap:8px;">
+                <span class="badge badge-path-internal">Internal Team</span>
+                Your team likely knows the answer
+            </h2>
+            {% for q in internal_qs %}
+            <div class="question-block question-internal">
+                <div class="question-number">Question {{ loop.index }}</div>
+                <p class="question-text">{{ q.question }}</p>
+                {% if q.context %}
+                <p class="question-context">Context: {{ q.context }}</p>
+                {% endif %}
+                <div class="form-group">
+                    <textarea name="answer_{{ q.id }}" rows="3" placeholder="Enter your answer..."></textarea>
+                </div>
+                <label class="skip-label">
+                    <input type="checkbox" name="skip_{{ q.id }}" value="1">
+                    Skip this question (AI will use best judgment)
+                </label>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+        <!-- Customer Facing -->
+        {% if customer_qs %}
+        <div class="question-category">
+            <h2 style="display:flex;align-items:center;gap:8px;">
+                <span class="badge badge-path-customer">Customer</span>
+                Only the customer can answer these
+            </h2>
+            <p style="color:var(--gray-500);margin-bottom:12px;">These will be collected into a formal RFI letter you can send to the customer. You can answer now if you know, or send to customer.</p>
+            {% for q in customer_qs %}
+            <div class="question-block question-customer">
+                <div class="question-number">Question {{ loop.index }}</div>
+                <p class="question-text">{{ q.question }}</p>
+                {% if q.context %}
+                <p class="question-context">Context: {{ q.context }}</p>
+                {% endif %}
+                <div class="form-group">
+                    <textarea name="answer_{{ q.id }}" rows="3" placeholder="Enter answer if known, or leave blank to include in RFI letter..."></textarea>
+                </div>
+                <div style="display:flex;gap:12px;flex-wrap:wrap;">
+                    <label class="skip-label">
+                        <input type="checkbox" name="send_to_customer_{{ q.id }}" value="1">
+                        Add to RFI letter for customer
+                    </label>
+                    <label class="skip-label">
+                        <input type="checkbox" name="skip_{{ q.id }}" value="1">
+                        Skip (AI will use best judgment)
+                    </label>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+
+        <!-- Fallback for uncategorized -->
+        {% set other_qs = questions | rejectattr('resolution_path', 'in', ['infer','internal','customer']) | list %}
+        {% if other_qs %}
+        <div class="question-category">
+            <h2>Other Questions</h2>
+            {% for q in other_qs %}
+            <div class="question-block">
+                <div class="question-number">Question {{ loop.index }}</div>
+                <p class="question-text">{{ q.question }}</p>
+                <div class="form-group">
+                    <textarea name="answer_{{ q.id }}" rows="3" placeholder="Enter your answer..."></textarea>
+                </div>
+                <label class="skip-label">
+                    <input type="checkbox" name="skip_{{ q.id }}" value="1">
+                    Skip this question
+                </label>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
 
         <div class="form-actions">
             <button type="submit" class="btn btn-primary btn-large">Submit Answers & Continue</button>
             <a href="{{ url_for('project_upload', project_id=project.id) }}" class="btn btn-secondary">Back to Project</a>
+            <a href="{{ url_for('clarification_register', project_id=project.id) }}" class="btn btn-secondary">View Clarification Register</a>
         </div>
     </form>
 </div>

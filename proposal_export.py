@@ -304,3 +304,113 @@ def _add_word_diff_line(doc, old_line: str, new_line: str):
             run = p.add_run(" ".join(new_words[b1:b2]) + " ")
             run.font.color.rgb = RGBColor(0x1A, 0x56, 0xDB)
             run.font.underline = True
+
+
+def markdown_to_rfi_docx(
+    items: list,
+    project_name: str,
+    client_name: str,
+    company_name: str,
+    author: str,
+    output_path: str,
+) -> str:
+    """Generate a formatted RFI/Clarification letter as DOCX.
+
+    Args:
+        items: List of ClarificationItem model instances (customer-facing).
+        project_name: Name of the project.
+        client_name: Name of the client/customer.
+        company_name: Sender company name.
+        author: Name of the person generating the letter.
+        output_path: File path for the output DOCX.
+
+    Returns:
+        The output file path.
+    """
+    doc = docx.Document()
+
+    section = doc.sections[0]
+    section.top_margin = Inches(1)
+    section.bottom_margin = Inches(1)
+    section.left_margin = Inches(1.25)
+    section.right_margin = Inches(1.25)
+
+    style = doc.styles["Normal"]
+    font = style.font
+    font.name = "Calibri"
+    font.size = Pt(11)
+
+    # Header
+    title = doc.add_heading("Request for Information / Clarification", level=1)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    doc.add_paragraph()
+
+    # Letter metadata
+    meta = doc.add_paragraph()
+    meta.add_run(f"Date: {datetime.now(timezone.utc).strftime('%B %d, %Y')}\n")
+    meta.add_run(f"From: {company_name}\n")
+    meta.add_run(f"To: {client_name or '[Customer Name]'}\n")
+    meta.add_run(f"Re: {project_name}\n")
+    meta.add_run(f"Prepared by: {author}\n")
+
+    doc.add_paragraph()
+
+    # Introduction
+    intro = doc.add_paragraph()
+    intro.add_run(
+        f"Dear {client_name or '[Customer Name]'},\n\n"
+        f"During our review of the RFP/RFQ documentation for the above-referenced project, "
+        f"we have identified the following items requiring clarification. We respectfully "
+        f"request your response to each item below to ensure our proposal accurately addresses "
+        f"your requirements.\n\n"
+        f"Please reference the RFI number in your response for tracking purposes."
+    )
+
+    doc.add_paragraph()
+
+    # RFI Items
+    doc.add_heading("Clarification Items", level=2)
+
+    # Group by category
+    categories = {}
+    for item in items:
+        cat = (item.category or "general").title()
+        if cat not in categories:
+            categories[cat] = []
+        categories[cat].append(item)
+
+    for cat_name, cat_items in categories.items():
+        doc.add_heading(cat_name, level=3)
+
+        table = doc.add_table(rows=1, cols=4)
+        table.style = "Light Grid Accent 1"
+
+        header_cells = table.rows[0].cells
+        for i, hdr in enumerate(["RFI #", "Priority", "Question", "Response"]):
+            header_cells[i].text = hdr
+            for paragraph in header_cells[i].paragraphs:
+                for r in paragraph.runs:
+                    r.bold = True
+
+        for item in cat_items:
+            row = table.add_row()
+            row.cells[0].text = item.rfi_reference_id or "-"
+            row.cells[1].text = (item.priority or "medium").title()
+            row.cells[2].text = item.question or ""
+            row.cells[3].text = ""
+
+        doc.add_paragraph()
+
+    # Footer
+    doc.add_paragraph()
+    footer = doc.add_paragraph()
+    footer.add_run(
+        "We appreciate your prompt attention to these items. Please do not hesitate "
+        "to contact us if you require any additional information.\n\n"
+    )
+    closing = footer.add_run(f"Sincerely,\n{author}\n{company_name}")
+    closing.bold = True
+
+    doc.save(output_path)
+    return output_path

@@ -39,6 +39,10 @@
         </div>
         <div class="proposal-actions">
             <a href="{{ url_for('edit_proposal', proposal_id=proposal.id) }}" class="btn btn-primary">Edit Proposal</a>
+            <a href="{{ url_for('proposal_reviews', proposal_id=proposal.id) }}" class="btn btn-secondary">Review & Comments</a>
+            {% if project %}
+            <a href="{{ url_for('clarification_register', project_id=project.id) }}" class="btn btn-secondary">Clarifications</a>
+            {% endif %}
             <a href="{{ url_for('download', proposal_id=proposal.id, fmt='docx') }}" class="btn btn-secondary">Download DOCX</a>
             <a href="{{ url_for('download_redline', proposal_id=proposal.id) }}" class="btn btn-secondary">Download Redline DOCX</a>
             <a href="{{ url_for('download', proposal_id=proposal.id, fmt='md') }}" class="btn btn-secondary">Download Markdown</a>
