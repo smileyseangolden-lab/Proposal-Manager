@@ -6,9 +6,10 @@ services:
       - apparmor:unconfined
     ports:
       # Published on loopback only — nginx reverse-proxies the public port here.
-      # Moved from 15000 to 15010 to sidestep a stuck dockerd port reservation.
-      # If you change this, also update nginx's proxy_pass (see README deployment notes).
-      - "127.0.0.1:15010:5000"
+      # Override via HOST_PORT in .env (default 15010 avoids a stuck dockerd
+      # reservation seen on 15000). If you change this, also update nginx's
+      # proxy_pass (see README deployment notes).
+      - "127.0.0.1:${HOST_PORT:-15010}:5000"
     env_file:
       - .env
     volumes:
