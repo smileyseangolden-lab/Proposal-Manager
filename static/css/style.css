@@ -1891,3 +1891,157 @@ body {
 .overdue { color: #991b1b; font-weight: 600; }
 .text-center { text-align: center; }
 
+/* ============================================================
+   Clarification & Review Styles (Phases 1-4)
+   ============================================================ */
+
+/* Resolution path badges */
+.badge-path-infer { background: #dbeafe; color: #1e40af; }
+.badge-path-internal { background: #fef3c7; color: #92400e; }
+.badge-path-customer { background: #fce7f3; color: #9d174d; }
+
+/* Priority badges */
+.badge-priority-low { background: var(--gray-100); color: var(--gray-700); }
+.badge-priority-medium { background: #fef3c7; color: #92400e; }
+.badge-priority-high { background: #fed7aa; color: #9a3412; }
+.badge-priority-critical { background: #fecaca; color: #991b1b; }
+
+/* Status badges for clarification statuses */
+.badge-status-draft { background: var(--gray-100); color: var(--gray-700); }
+.badge-status-open { background: #fef3c7; color: #92400e; }
+.badge-status-sent { background: #dbeafe; color: #1e40af; }
+.badge-status-response_received { background: #d1fae5; color: #065f46; }
+.badge-status-incorporated { background: #d1fae5; color: #065f46; }
+.badge-status-resolved { background: #d1fae5; color: #065f46; }
+.badge-status-skipped { background: var(--gray-100); color: var(--gray-500); }
+.badge-status-clarification_pending { background: #fef3c7; color: #92400e; }
+.badge-status-in_review { background: #dbeafe; color: #1e40af; }
+.badge-status-rfi_sent { background: #fce7f3; color: #9d174d; }
+.badge-status-completed { background: #d1fae5; color: #065f46; }
+
+/* Review comment types */
+.badge-comment-comment { background: var(--gray-100); color: var(--gray-700); }
+.badge-comment-question { background: #fef3c7; color: #92400e; }
+.badge-comment-change_request { background: #fecaca; color: #991b1b; }
+.badge-comment-approval { background: #d1fae5; color: #065f46; }
+
+/* Filter row */
+.filter-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+/* Form grid */
+.form-grid-3 {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-bottom: 12px;
+}
+@media (max-width: 768px) {
+    .form-grid-3 { grid-template-columns: 1fr; }
+}
+
+/* Question categories */
+.question-category {
+    margin-bottom: 24px;
+    padding: 16px;
+    border: 1px solid var(--gray-200);
+    border-radius: var(--radius);
+    background: var(--white);
+}
+.question-infer { border-left: 3px solid #1e40af; }
+.question-internal { border-left: 3px solid #92400e; }
+.question-customer { border-left: 3px solid #9d174d; }
+
+/* AI suggestion box */
+.ai-suggestion-box {
+    background: #eff6ff;
+    border: 1px solid #bfdbfe;
+    padding: 10px 12px;
+    border-radius: 6px;
+    margin: 8px 0;
+    font-size: 13px;
+    color: #1e40af;
+}
+
+.accept-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: #1e40af;
+    margin-bottom: 6px;
+}
+
+/* Action dropdown */
+.action-dropdown {
+    position: absolute;
+    right: 0;
+    top: 100%;
+    background: var(--white);
+    border: 1px solid var(--gray-200);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-lg);
+    z-index: 100;
+    min-width: 250px;
+}
+
+/* Parking lot row */
+.parking-lot-row {
+    background: #fffbeb;
+    opacity: 0.8;
+}
+
+/* Review comments list */
+.review-comments-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-top: 12px;
+}
+
+.review-comment {
+    border: 1px solid var(--gray-200);
+    border-radius: var(--radius);
+    padding: 12px 16px;
+    background: var(--white);
+}
+.review-comment-question { border-left: 3px solid #d97706; }
+.review-comment-change_request { border-left: 3px solid #dc2626; }
+.review-comment-approval { border-left: 3px solid #059669; }
+.review-resolved { opacity: 0.7; background: var(--gray-50); }
+
+.review-comment-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+}
+
+.review-quote {
+    background: var(--gray-50);
+    border-left: 3px solid var(--gray-300);
+    padding: 6px 12px;
+    margin: 6px 0;
+    font-size: 13px;
+    font-style: italic;
+    color: var(--gray-700);
+}
+
+.review-comment-body {
+    font-size: 14px;
+    line-height: 1.5;
+}
+
+.review-resolution {
+    margin-top: 8px;
+    padding: 8px 12px;
+    background: #d1fae5;
+    border-radius: 4px;
+    font-size: 13px;
+    color: #065f46;
+}

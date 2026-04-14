@@ -278,13 +278,41 @@ Follow this workflow precisely when generating proposals:
 ## Interactive Clarification
 
 If you encounter information in the RFP/RFQ that is ambiguous, contradictory,
-or critical to the proposal but missing, you may ask the user for clarification.
-To do this, include a section at the VERY END of your output titled
-"## CLARIFICATION QUESTIONS" with numbered questions. Each question should be
-on its own line prefixed with "Q:" and include context about why you need this
-information. Only ask questions that are truly critical to producing an accurate
-proposal — do not ask about information you can reasonably infer or mark as
-ACTION REQUIRED.
+or critical to the proposal but missing, you MUST categorize each gap into one
+of three resolution paths and include them in a section at the VERY END of your
+output titled "## CLARIFICATION QUESTIONS".
+
+Each question MUST be on its own line with this format:
+  [RESOLUTION_PATH] Q: Your question here
+
+Where RESOLUTION_PATH is one of:
+- **INFER** — You can likely answer this yourself from context, company standards,
+  past proposals, or general industry knowledge. Include your proposed answer and
+  ask the user to confirm or override. Format:
+  [INFER] Q: question text | SUGGESTED: your proposed answer here
+- **INTERNAL** — The proposal team likely knows this (margin targets, preferred
+  subs, internal resource availability, etc.). This stays within the team.
+  [INTERNAL] Q: question text
+- **CUSTOMER** — Only the customer/issuer of the RFP can answer this (missing
+  specs, contradictory requirements, ambiguous scope, etc.). These will be
+  collected into a formal RFI letter to send back to the customer.
+  [CUSTOMER] Q: question text
+
+Also tag each question with a category in parentheses at the end:
+(scope), (pricing), (compliance), (schedule), (technical), or (general).
+
+Example:
+  [INFER] Q: The RFP does not specify the commissioning standard. Based on the
+  data center vertical, should we assume ASHRAE Guideline 0? | SUGGESTED: Use
+  ASHRAE Guideline 0 per industry standard (compliance)
+  [CUSTOMER] Q: Section 3.2 specifies "redundant power" but does not indicate
+  N+1 or 2N topology. Which redundancy level is required? (technical)
+  [INTERNAL] Q: What margin target should be used for this pursuit? (pricing)
+
+Only ask questions that are truly critical to producing an accurate proposal.
+For INFER items, proceed with your suggested answer in the proposal body and
+mark it with `[ASSUMED: description — pending confirmation]` so reviewers can
+spot assumptions easily.
 
 ## Output Rules
 
@@ -823,23 +851,79 @@ def preflight_check_proposal(markdown_content: str,
 
 
 def _extract_questions(text: str) -> list[dict]:
-    """Extract clarification questions from the proposal output."""
+    """Extract clarification questions from the proposal output.
+
+    Parses the new categorized format:
+      [INFER] Q: question | SUGGESTED: answer (category)
+      [INTERNAL] Q: question (category)
+      [CUSTOMER] Q: question (category)
+
+    Falls back to legacy format (plain Q: lines) for backwards compatibility.
+    """
     match = re.search(r"## CLARIFICATION QUESTIONS\s*\n(.*)", text, re.DOTALL)
     if not match:
         return []
 
     questions_text = match.group(1)
     questions = []
+
     for line in questions_text.strip().split("\n"):
         line = line.strip()
+        if not line:
+            continue
+
+        # New categorized format: [INFER|INTERNAL|CUSTOMER] Q: ...
+        cat_match = re.match(
+            r"\[(INFER|INTERNAL|CUSTOMER)\]\s*Q:\s*(.+)", line, re.IGNORECASE
+        )
+        if cat_match:
+            resolution_path = cat_match.group(1).lower()
+            raw_question = cat_match.group(2).strip()
+
+            # Extract category tag like (scope), (pricing), etc.
+            category = "general"
+            cat_tag = re.search(r"\((\w+)\)\s*$", raw_question)
+            if cat_tag:
+                category = cat_tag.group(1).lower()
+                raw_question = raw_question[:cat_tag.start()].strip()
+
+            # Extract AI suggestion for INFER items
+            ai_suggestion = ""
+            if resolution_path == "infer" and "| SUGGESTED:" in raw_question:
+                parts = raw_question.split("| SUGGESTED:", 1)
+                raw_question = parts[0].strip()
+                ai_suggestion = parts[1].strip()
+
+            questions.append({
+                "question": raw_question,
+                "context": "",
+                "resolution_path": resolution_path,
+                "category": category,
+                "ai_suggestion": ai_suggestion,
+            })
+            continue
+
+        # Legacy format: Q: question or numbered list
         if line.startswith("Q:") or line.startswith("Q "):
             q_text = line[2:].strip().lstrip(":").strip()
             if q_text:
-                questions.append({"question": q_text, "context": ""})
+                questions.append({
+                    "question": q_text,
+                    "context": "",
+                    "resolution_path": "internal",
+                    "category": "general",
+                    "ai_suggestion": "",
+                })
         elif re.match(r"^\d+[\.\)]\s*", line):
             q_text = re.sub(r"^\d+[\.\)]\s*", "", line).strip()
             if q_text:
-                questions.append({"question": q_text, "context": ""})
+                questions.append({
+                    "question": q_text,
+                    "context": "",
+                    "resolution_path": "internal",
+                    "category": "general",
+                    "ai_suggestion": "",
+                })
 
     return questions
 
@@ -858,3 +942,194 @@ def _detect_document_type(text: str) -> str:
         "request for quote"
     ) + text_lower.count("rfq")
     return "RFQ" if rfq_signals > rfp_signals else "RFP"
+
+
+def regenerate_section(
+    full_proposal_md: str,
+    section_heading: str,
+    clarification_answer: str,
+    original_rfp_text: str = "",
+    company_name: str = "",
+    user_api_key: str = None,
+    user_model: str = None,
+) -> dict:
+    """Regenerate a specific section of the proposal using new clarification info.
+
+    Instead of regenerating the entire proposal, this targets just the affected
+    section and returns the updated markdown for that section only.
+
+    Args:
+        full_proposal_md: The current full proposal markdown.
+        section_heading: The heading of the section to regenerate (e.g. "## Scope of Work").
+        clarification_answer: The new information/answer that should be incorporated.
+        original_rfp_text: Optional RFP text for additional context.
+        company_name: Company name for branding.
+        user_api_key: User's API key override.
+        user_model: User's model override.
+
+    Returns:
+        dict with 'section_markdown' (the regenerated section) and 'section_heading'.
+    """
+    api_key = user_api_key or ANTHROPIC_API_KEY
+    model = user_model or CLAUDE_MODEL
+
+    if not api_key:
+        raise RuntimeError("No API key configured.")
+
+    # Extract the target section from the proposal
+    section_pattern = re.escape(section_heading)
+    match = re.search(
+        rf"({section_pattern}.*?)(?=\n##\s|\Z)", full_proposal_md, re.DOTALL
+    )
+    current_section = match.group(1).strip() if match else ""
+
+    system_prompt = f"""You are a proposal editor assistant. Your task is to revise a SINGLE SECTION
+of an existing proposal based on new clarification information.
+
+{f'You are writing on behalf of **{company_name}**.' if company_name else ''}
+
+## Rules
+1. Only output the revised section — do NOT output the entire proposal.
+2. Maintain the same markdown heading level and formatting style.
+3. Incorporate the new information naturally into the existing content.
+4. Remove any [ACTION REQUIRED] or [ASSUMED] placeholders that are resolved
+   by the new information.
+5. Do NOT fabricate pricing, personnel names, or specifications.
+6. Keep the same tone and detail level as the surrounding proposal.
+7. Today's date is {datetime.now(timezone.utc).strftime("%B %d, %Y")}.
+"""
+
+    user_message = f"""Please revise the following proposal section based on the new clarification answer provided.
+
+## Current Section
+```
+{current_section}
+```
+
+## New Clarification Information
+{clarification_answer}
+
+{f'## Original RFP Context (for reference){chr(10)}```{chr(10)}{original_rfp_text[:4000]}{chr(10)}```' if original_rfp_text else ''}
+
+Output ONLY the revised section in markdown, starting with the section heading.
+"""
+
+    client = anthropic.Anthropic(api_key=api_key)
+    result_text = ""
+    with client.messages.stream(
+        model=model,
+        max_tokens=4000,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_message}],
+    ) as stream:
+        for text in stream.text_stream:
+            result_text += text
+
+    return {
+        "section_markdown": result_text.strip(),
+        "section_heading": section_heading,
+    }
+
+
+def analyze_addendum_impact(
+    original_rfp_text: str,
+    addendum_text: str,
+    current_proposal_md: str,
+    user_api_key: str = None,
+    user_model: str = None,
+) -> dict:
+    """Analyze an addendum/amendment against the original RFP and current proposal.
+
+    Identifies what changed in the addendum and which proposal sections need updating.
+
+    Args:
+        original_rfp_text: The original RFP document text.
+        addendum_text: The addendum/amendment document text.
+        current_proposal_md: The current proposal markdown.
+        user_api_key: User's API key override.
+        user_model: User's model override.
+
+    Returns:
+        dict with 'changes' (list of change dicts) and 'summary'.
+    """
+    api_key = user_api_key or ANTHROPIC_API_KEY
+    model = user_model or CLAUDE_MODEL
+
+    if not api_key:
+        raise RuntimeError("No API key configured.")
+
+    system_prompt = """You are an expert proposal analyst. Your task is to analyze an RFP addendum
+and determine its impact on an existing proposal.
+
+## Output Format
+Return a JSON object with this structure:
+{
+  "summary": "Brief overall summary of addendum changes",
+  "changes": [
+    {
+      "addendum_item": "What the addendum says",
+      "impact_description": "How this affects the proposal",
+      "affected_sections": ["## Section Heading 1", "## Section Heading 2"],
+      "severity": "high|medium|low",
+      "action_needed": "What specifically needs to change",
+      "can_ai_resolve": true/false,
+      "suggested_resolution": "If AI can resolve, the suggested text change"
+    }
+  ]
+}
+
+## Rules
+- Be specific about which proposal sections are affected.
+- Use the exact heading text from the proposal for affected_sections.
+- Classify severity: high = changes scope/pricing/compliance, medium = changes details, low = cosmetic/minor.
+- If the addendum merely clarifies something already handled correctly, note it but set severity to low.
+- Do NOT fabricate impacts — only report genuine changes.
+"""
+
+    user_message = f"""Analyze the following addendum against the original RFP and current proposal.
+
+## Original RFP (first 6000 chars)
+```
+{original_rfp_text[:6000]}
+```
+
+## Addendum
+```
+{addendum_text[:6000]}
+```
+
+## Current Proposal (first 8000 chars)
+```
+{current_proposal_md[:8000]}
+```
+
+Return your analysis as the JSON object described in the instructions.
+"""
+
+    client = anthropic.Anthropic(api_key=api_key)
+    result_text = ""
+    with client.messages.stream(
+        model=model,
+        max_tokens=4000,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_message}],
+    ) as stream:
+        for text in stream.text_stream:
+            result_text += text
+
+    # Parse JSON from response
+    try:
+        # Try to extract JSON from markdown code blocks if present
+        json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", result_text, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group(1))
+        else:
+            result = json.loads(result_text)
+    except (json.JSONDecodeError, AttributeError):
+        result = {
+            "summary": "Could not parse addendum analysis. Raw output included.",
+            "changes": [],
+            "raw_output": result_text,
+        }
+
+    return result

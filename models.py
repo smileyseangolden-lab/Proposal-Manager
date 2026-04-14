@@ -62,6 +62,7 @@ class Project(db.Model):
     vertical = db.Column(db.String(50), default="general")
     vertical_label = db.Column(db.String(100), default="General")
     status = db.Column(db.String(30), default="active")  # active, submitted, won, lost, archived
+    clarification_sub_status = db.Column(db.String(30), default="none")  # none, clarification_pending, in_review, rfi_sent
     dollar_amount = db.Column(db.Float, default=0.0)
     output_format = db.Column(db.String(20), default="docx")  # docx, pdf, both
     assigned_to = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
@@ -150,6 +151,7 @@ class ProposalQuestion(db.Model):
     context = db.Column(db.Text, default="")
     answer = db.Column(db.Text, default="")
     status = db.Column(db.String(20), default="pending")  # pending, answered, skipped
+    resolution_path = db.Column(db.String(20), default="internal")  # infer, internal, customer
     created_at = db.Column(db.DateTime, default=_utcnow)
     answered_at = db.Column(db.DateTime, nullable=True)
 
@@ -298,6 +300,146 @@ class ProposalVersion(db.Model):
 
     proposal = db.relationship("Proposal", backref="versions")
     editor = db.relationship("User")
+
+
+class ClarificationItem(db.Model):
+    """Tracks clarification questions throughout the proposal lifecycle.
+
+    Can be AI-detected gaps, internal review questions, or customer-facing RFI items.
+    Serves as the single source of truth for all open questions on a project.
+    """
+    __tablename__ = "clarification_items"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    project_id = db.Column(db.String(32), db.ForeignKey("projects.id"), nullable=False)
+    proposal_id = db.Column(db.String(32), db.ForeignKey("proposals.id"), nullable=True)
+
+    # Classification
+    source = db.Column(db.String(30), default="ai_detected")  # ai_detected, human_review, addendum
+    resolution_path = db.Column(db.String(20), default="internal")  # infer, internal, customer
+    category = db.Column(db.String(50), default="general")  # scope, pricing, compliance, schedule, technical, general
+    priority = db.Column(db.String(20), default="medium")  # low, medium, high, critical
+    is_parking_lot = db.Column(db.Boolean, default=False)  # Phase 4: non-blocking question
+
+    # Content
+    question = db.Column(db.Text, nullable=False)
+    context = db.Column(db.Text, default="")
+    ai_suggestion = db.Column(db.Text, default="")  # AI's proposed answer for 'infer' path items
+    proposal_section = db.Column(db.String(300), default="")  # Which section this relates to
+
+    # Assignment
+    assigned_to_user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    assigned_to_role = db.Column(db.String(20), default="")  # admin, sales, proposal, or RACI roles like BDM, AE
+
+    # Response tracking
+    status = db.Column(db.String(30), default="draft")  # draft, open, sent, response_received, incorporated, resolved, skipped
+    response = db.Column(db.Text, default="")
+    responded_by = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    responded_at = db.Column(db.DateTime, nullable=True)
+    incorporated_at = db.Column(db.DateTime, nullable=True)
+
+    # RFI letter tracking (Phase 3)
+    rfi_reference_id = db.Column(db.String(50), default="")  # e.g. RFI-001
+    rfi_sent_at = db.Column(db.DateTime, nullable=True)
+
+    # Confidence impact (Phase 4)
+    confidence_impact = db.Column(db.Integer, default=0)  # How many points this drags the score down
+
+    created_by = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    created_at = db.Column(db.DateTime, default=_utcnow)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow)
+
+    # Relationships
+    project = db.relationship("Project", backref="clarification_items")
+    proposal = db.relationship("Proposal", backref="clarification_items")
+    assignee = db.relationship("User", foreign_keys=[assigned_to_user_id], backref="assigned_clarifications")
+    responder = db.relationship("User", foreign_keys=[responded_by])
+    creator = db.relationship("User", foreign_keys=[created_by])
+
+
+class ReviewComment(db.Model):
+    """Section-level review comments on proposals (Phase 2).
+
+    Allows reviewers to attach typed comments/questions to specific
+    proposal sections, with assignment and resolution tracking.
+    """
+    __tablename__ = "review_comments"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    proposal_id = db.Column(db.String(32), db.ForeignKey("proposals.id"), nullable=False)
+    review_cycle_id = db.Column(db.String(32), db.ForeignKey("review_cycles.id"), nullable=True)
+
+    # Location in proposal
+    section_heading = db.Column(db.String(500), default="")  # Markdown heading the comment is attached to
+    line_reference = db.Column(db.Text, default="")  # Quoted text the comment refers to
+
+    # Content
+    comment_type = db.Column(db.String(20), default="comment")  # comment, question, change_request, approval
+    content = db.Column(db.Text, nullable=False)
+    resolution_note = db.Column(db.Text, default="")
+
+    # Assignment
+    author_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    assigned_to_user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    assigned_to_role = db.Column(db.String(20), default="")
+
+    # Status
+    status = db.Column(db.String(20), default="open")  # open, resolved, wont_fix
+    resolved_by = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    resolved_at = db.Column(db.DateTime, nullable=True)
+
+    # Link to clarification register (questions/change_requests create ClarificationItems)
+    clarification_item_id = db.Column(db.String(32), db.ForeignKey("clarification_items.id"), nullable=True)
+
+    created_at = db.Column(db.DateTime, default=_utcnow)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow)
+
+    # Relationships
+    proposal = db.relationship("Proposal", backref="review_comments")
+    author = db.relationship("User", foreign_keys=[author_id], backref="authored_review_comments")
+    assignee = db.relationship("User", foreign_keys=[assigned_to_user_id])
+    resolver = db.relationship("User", foreign_keys=[resolved_by])
+    review_cycle = db.relationship("ReviewCycle", backref="comments")
+    clarification_item = db.relationship("ClarificationItem", backref="review_comments")
+
+
+class ReviewCycle(db.Model):
+    """Tracks review rounds for a proposal (Phase 2).
+
+    Each review cycle (Review 1, Review 2, Final) groups review comments
+    and tracks completion progress.
+    """
+    __tablename__ = "review_cycles"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    proposal_id = db.Column(db.String(32), db.ForeignKey("proposals.id"), nullable=False)
+    cycle_number = db.Column(db.Integer, nullable=False, default=1)
+    name = db.Column(db.String(100), default="")  # e.g. "Review 1", "Final Review"
+    status = db.Column(db.String(20), default="active")  # active, completed
+    started_by = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    started_at = db.Column(db.DateTime, default=_utcnow)
+    completed_at = db.Column(db.DateTime, nullable=True)
+
+    # Relationships
+    proposal = db.relationship("Proposal", backref="review_cycles")
+    initiator = db.relationship("User", foreign_keys=[started_by])
+
+
+class VerticalClarificationTemplate(db.Model):
+    """Pre-defined clarification questions per vertical (Phase 4).
+
+    Different industries have different common gaps. This stores
+    vertical-specific questions the AI should always check for.
+    """
+    __tablename__ = "vertical_clarification_templates"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    vertical = db.Column(db.String(50), nullable=False)
+    question = db.Column(db.Text, nullable=False)
+    category = db.Column(db.String(50), default="general")
+    priority = db.Column(db.String(20), default="medium")
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=_utcnow)
 
 
 class Notification(db.Model):

@@ -54,6 +54,7 @@ from config.settings import (
 from document_parser import parse_document
 from models import (
     ActivityLog,
+    ClarificationItem,
     CompanyStandard,
     DocumentTag,
     EquipmentItem,
@@ -69,6 +70,8 @@ from models import (
     ProposalRevisionBatch,
     ProposalStatusHistory,
     ProposalVersion,
+    ReviewComment,
+    ReviewCycle,
     RevisionRequest,
     RevisionTemplate,
     StaffRole,
@@ -76,15 +79,22 @@ from models import (
     User,
     UserRateSheet,
     UserVerticalTemplate,
+    VerticalClarificationTemplate,
     db,
 )
 from proposal_agent import (
+    analyze_addendum_impact,
     generate_proposal,
     parse_customer_email,
     preflight_check_proposal,
+    regenerate_section,
     revise_proposal,
 )
-from proposal_export import markdown_to_docx, markdown_to_redline_docx
+from proposal_export import (
+    markdown_to_docx,
+    markdown_to_redline_docx,
+    markdown_to_rfi_docx,
+)
 from proposal_lifecycle import (
     LABELS as LIFECYCLE_LABELS,
     STATES as LIFECYCLE_STATES,
@@ -218,6 +228,20 @@ with app.app_context():
                 _conn.commit()
             if "review_deadline" not in _prop_cols:
                 _cur.execute('ALTER TABLE proposals ADD COLUMN review_deadline DATETIME DEFAULT NULL')
+                _conn.commit()
+
+            # Migrate projects table to add clarification_sub_status if missing
+            _cur.execute("PRAGMA table_info(projects)")
+            _proj_cols2 = {row[1] for row in _cur.fetchall()}
+            if "clarification_sub_status" not in _proj_cols2:
+                _cur.execute('ALTER TABLE projects ADD COLUMN clarification_sub_status VARCHAR(30) DEFAULT "none"')
+                _conn.commit()
+
+            # Migrate proposal_questions table to add resolution_path if missing
+            _cur.execute("PRAGMA table_info(proposal_questions)")
+            _pq_cols = {row[1] for row in _cur.fetchall()}
+            if "resolution_path" not in _pq_cols:
+                _cur.execute('ALTER TABLE proposal_questions ADD COLUMN resolution_path VARCHAR(20) DEFAULT "internal"')
                 _conn.commit()
 
             _conn.close()
@@ -1265,8 +1289,26 @@ def project_generate(project_id):
                     question=q["question"],
                     context=q.get("context", ""),
                     status="pending",
+                    resolution_path=q.get("resolution_path", "internal"),
                 )
                 db.session.add(pq)
+
+                # Also create ClarificationItem entries for tracking
+                ci = ClarificationItem(
+                    project_id=project_id,
+                    source="ai_detected",
+                    resolution_path=q.get("resolution_path", "internal"),
+                    category=q.get("category", "general"),
+                    question=q["question"],
+                    context=q.get("context", ""),
+                    ai_suggestion=q.get("ai_suggestion", ""),
+                    status="open",
+                    created_by=current_user.id,
+                )
+                db.session.add(ci)
+
+            # Update project sub-status
+            project.clarification_sub_status = "clarification_pending"
             db.session.commit()
             _log_activity("proposal_questions", f"{len(result['questions'])} clarification question(s)", project_id)
             return redirect(url_for("project_questions", project_id=project_id))
@@ -1354,7 +1396,7 @@ def project_generate(project_id):
 @login_required
 def project_questions(project_id):
     project = db.session.get(Project, project_id)
-    if not project or project.user_id != current_user.id:
+    if not _can_access_project(project):
         abort(404)
 
     pending = ProposalQuestion.query.filter_by(project_id=project_id, status="pending").all()
@@ -1362,23 +1404,84 @@ def project_questions(project_id):
     if request.method == "POST":
         for q in pending:
             answer = request.form.get(f"answer_{q.id}", "").strip()
-            if answer:
+            accept_suggestion = request.form.get(f"accept_{q.id}")
+            if accept_suggestion and q.resolution_path == "infer":
+                # User accepted the AI suggestion — find matching ClarificationItem
+                ci = ClarificationItem.query.filter_by(
+                    project_id=project_id, question=q.question, source="ai_detected"
+                ).first()
+                if ci:
+                    ci.status = "resolved"
+                    ci.response = ci.ai_suggestion
+                    ci.responded_at = datetime.now(timezone.utc)
+                    ci.responded_by = current_user.id
+                q.answer = answer or "(accepted AI suggestion)"
+                q.status = "answered"
+                q.answered_at = datetime.now(timezone.utc)
+            elif answer:
                 q.answer = answer
                 q.status = "answered"
                 q.answered_at = datetime.now(timezone.utc)
+                # Update corresponding ClarificationItem
+                ci = ClarificationItem.query.filter_by(
+                    project_id=project_id, question=q.question, source="ai_detected"
+                ).first()
+                if ci:
+                    ci.status = "response_received"
+                    ci.response = answer
+                    ci.responded_at = datetime.now(timezone.utc)
+                    ci.responded_by = current_user.id
             elif request.form.get(f"skip_{q.id}"):
                 q.status = "skipped"
+                ci = ClarificationItem.query.filter_by(
+                    project_id=project_id, question=q.question, source="ai_detected"
+                ).first()
+                if ci:
+                    ci.status = "skipped"
+            elif request.form.get(f"send_to_customer_{q.id}"):
+                # Mark as needing customer response — keep pending but tag for RFI
+                ci = ClarificationItem.query.filter_by(
+                    project_id=project_id, question=q.question, source="ai_detected"
+                ).first()
+                if ci:
+                    ci.resolution_path = "customer"
+                    ci.status = "open"
+                q.status = "skipped"  # Skip for now, will be handled via RFI
         db.session.commit()
 
         # Check if there are still pending questions
         remaining = ProposalQuestion.query.filter_by(project_id=project_id, status="pending").count()
         if remaining == 0:
+            project.clarification_sub_status = "none"
+            db.session.commit()
             flash("All questions answered. You can now regenerate the proposal.", "success")
             return redirect(url_for("project_upload", project_id=project_id))
 
         return redirect(url_for("project_questions", project_id=project_id))
 
-    return render_template("project_questions.html", project=project, questions=pending)
+    # Group questions by resolution path for display
+    infer_qs = [q for q in pending if q.resolution_path == "infer"]
+    internal_qs = [q for q in pending if q.resolution_path == "internal"]
+    customer_qs = [q for q in pending if q.resolution_path == "customer"]
+
+    # Get AI suggestions for infer items from ClarificationItems
+    ai_suggestions = {}
+    for q in infer_qs:
+        ci = ClarificationItem.query.filter_by(
+            project_id=project_id, question=q.question, source="ai_detected"
+        ).first()
+        if ci and ci.ai_suggestion:
+            ai_suggestions[q.id] = ci.ai_suggestion
+
+    return render_template(
+        "project_questions.html",
+        project=project,
+        questions=pending,
+        infer_qs=infer_qs,
+        internal_qs=internal_qs,
+        customer_qs=customer_qs,
+        ai_suggestions=ai_suggestions,
+    )
 
 
 @app.route("/projects/<project_id>/update-status", methods=["POST"])
@@ -3703,6 +3806,672 @@ def delete_proposal_comment(proposal_id, comment_id):
     db.session.commit()
     flash("Comment deleted.", "success")
     return redirect(request.referrer or url_for("view_proposal", proposal_id=proposal_id))
+
+# Clarification Register (Phase 1)
+# ---------------------------------------------------------------------------
+
+@app.route("/projects/<project_id>/clarifications")
+@login_required
+def clarification_register(project_id):
+    """View the clarification register for a project."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    filter_status = request.args.get("status", "")
+    filter_path = request.args.get("path", "")
+    filter_category = request.args.get("category", "")
+
+    query = ClarificationItem.query.filter_by(project_id=project_id)
+    if filter_status:
+        query = query.filter_by(status=filter_status)
+    if filter_path:
+        query = query.filter_by(resolution_path=filter_path)
+    if filter_category:
+        query = query.filter_by(category=filter_category)
+
+    items = query.order_by(ClarificationItem.created_at.desc()).all()
+
+    # Stats
+    total = ClarificationItem.query.filter_by(project_id=project_id).count()
+    open_count = ClarificationItem.query.filter_by(project_id=project_id, status="open").count()
+    resolved_count = ClarificationItem.query.filter_by(project_id=project_id, status="resolved").count()
+    customer_count = ClarificationItem.query.filter_by(project_id=project_id, resolution_path="customer").count()
+    parking_lot_count = ClarificationItem.query.filter_by(project_id=project_id, is_parking_lot=True).count()
+
+    # Confidence impact (Phase 4)
+    proposal = Proposal.query.filter_by(project_id=project_id).order_by(Proposal.generated_at.desc()).first()
+    unresolved_impact = sum(
+        ci.confidence_impact for ci in
+        ClarificationItem.query.filter_by(project_id=project_id).filter(
+            ClarificationItem.status.in_(["open", "draft", "sent"])
+        ).all()
+    )
+
+    users = User.query.order_by(User.display_name).all()
+
+    return render_template(
+        "clarification_register.html",
+        project=project, items=items, proposal=proposal,
+        total=total, open_count=open_count, resolved_count=resolved_count,
+        customer_count=customer_count, parking_lot_count=parking_lot_count,
+        unresolved_impact=unresolved_impact, users=users,
+        filter_status=filter_status, filter_path=filter_path,
+        filter_category=filter_category,
+    )
+
+
+@app.route("/projects/<project_id>/clarifications/add", methods=["POST"])
+@login_required
+def add_clarification(project_id):
+    """Manually add a clarification item."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    ci = ClarificationItem(
+        project_id=project_id,
+        source="human_review",
+        resolution_path=request.form.get("resolution_path", "internal"),
+        category=request.form.get("category", "general"),
+        priority=request.form.get("priority", "medium"),
+        question=request.form.get("question", "").strip(),
+        context=request.form.get("context", "").strip(),
+        proposal_section=request.form.get("proposal_section", "").strip(),
+        assigned_to_role=request.form.get("assigned_to_role", ""),
+        assigned_to_user_id=request.form.get("assigned_to_user_id") or None,
+        is_parking_lot=request.form.get("is_parking_lot") == "1",
+        status="open",
+        created_by=current_user.id,
+    )
+
+    # Link to latest proposal if exists
+    proposal = Proposal.query.filter_by(project_id=project_id).order_by(Proposal.generated_at.desc()).first()
+    if proposal:
+        ci.proposal_id = proposal.id
+
+    db.session.add(ci)
+
+    # Update project sub-status
+    project.clarification_sub_status = "clarification_pending"
+    db.session.commit()
+
+    _log_activity("clarification_add", f"Added clarification: {ci.question[:80]}", project_id)
+
+    # Notify assignee if assigned
+    if ci.assigned_to_user_id:
+        _notify(ci.assigned_to_user_id, "assignment",
+                f"Clarification assigned: {project.name}",
+                f"You have been assigned a clarification question on '{project.name}': {ci.question[:100]}",
+                link=f"/projects/{project_id}/clarifications")
+
+    flash("Clarification item added.", "success")
+    return redirect(url_for("clarification_register", project_id=project_id))
+
+
+@app.route("/clarifications/<item_id>/respond", methods=["POST"])
+@login_required
+def respond_clarification(item_id):
+    """Submit a response to a clarification item."""
+    ci = db.session.get(ClarificationItem, item_id)
+    if not ci:
+        abort(404)
+    project = db.session.get(Project, ci.project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    ci.response = request.form.get("response", "").strip()
+    ci.responded_by = current_user.id
+    ci.responded_at = datetime.now(timezone.utc)
+    ci.status = "response_received"
+    db.session.commit()
+
+    _log_activity("clarification_respond", f"Responded to clarification: {ci.question[:60]}", ci.project_id)
+    flash("Response recorded.", "success")
+    return redirect(url_for("clarification_register", project_id=ci.project_id))
+
+
+@app.route("/clarifications/<item_id>/resolve", methods=["POST"])
+@login_required
+def resolve_clarification(item_id):
+    """Mark a clarification item as resolved/incorporated."""
+    ci = db.session.get(ClarificationItem, item_id)
+    if not ci:
+        abort(404)
+    project = db.session.get(Project, ci.project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    ci.status = "resolved"
+    ci.incorporated_at = datetime.now(timezone.utc)
+    db.session.commit()
+
+    # Check if all items resolved — clear sub-status
+    remaining = ClarificationItem.query.filter_by(project_id=ci.project_id).filter(
+        ClarificationItem.status.in_(["open", "draft", "sent", "response_received"])
+    ).count()
+    if remaining == 0:
+        project.clarification_sub_status = "none"
+        db.session.commit()
+
+    _log_activity("clarification_resolve", f"Resolved clarification: {ci.question[:60]}", ci.project_id)
+    flash("Clarification resolved.", "success")
+    return redirect(url_for("clarification_register", project_id=ci.project_id))
+
+
+@app.route("/clarifications/<item_id>/parking-lot", methods=["POST"])
+@login_required
+def toggle_parking_lot(item_id):
+    """Toggle parking lot status for a clarification item (Phase 4)."""
+    ci = db.session.get(ClarificationItem, item_id)
+    if not ci:
+        abort(404)
+    if not _can_access_project(db.session.get(Project, ci.project_id)):
+        abort(404)
+
+    ci.is_parking_lot = not ci.is_parking_lot
+    db.session.commit()
+    status = "moved to parking lot" if ci.is_parking_lot else "removed from parking lot"
+    flash(f"Clarification {status}.", "success")
+    return redirect(url_for("clarification_register", project_id=ci.project_id))
+
+
+@app.route("/clarifications/<item_id>/update", methods=["POST"])
+@login_required
+def update_clarification(item_id):
+    """Update a clarification item's fields."""
+    ci = db.session.get(ClarificationItem, item_id)
+    if not ci:
+        abort(404)
+    if not _can_access_project(db.session.get(Project, ci.project_id)):
+        abort(404)
+
+    ci.priority = request.form.get("priority", ci.priority)
+    ci.category = request.form.get("category", ci.category)
+    ci.resolution_path = request.form.get("resolution_path", ci.resolution_path)
+    ci.assigned_to_user_id = request.form.get("assigned_to_user_id") or ci.assigned_to_user_id
+    ci.assigned_to_role = request.form.get("assigned_to_role", ci.assigned_to_role)
+    ci.confidence_impact = int(request.form.get("confidence_impact", ci.confidence_impact) or 0)
+    db.session.commit()
+
+    flash("Clarification updated.", "success")
+    return redirect(url_for("clarification_register", project_id=ci.project_id))
+
+
+# ---------------------------------------------------------------------------
+# Review Comments & Cycles (Phase 2)
+# ---------------------------------------------------------------------------
+
+@app.route("/proposal/<proposal_id>/reviews")
+@login_required
+def proposal_reviews(proposal_id):
+    """View review comments and cycles for a proposal."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    # Get or create active review cycle
+    active_cycle = ReviewCycle.query.filter_by(
+        proposal_id=proposal_id, status="active"
+    ).first()
+
+    cycles = ReviewCycle.query.filter_by(proposal_id=proposal_id).order_by(
+        ReviewCycle.cycle_number.desc()
+    ).all()
+
+    # Comments for active cycle (or all if no cycles)
+    if active_cycle:
+        comments = ReviewComment.query.filter_by(
+            proposal_id=proposal_id, review_cycle_id=active_cycle.id
+        ).order_by(ReviewComment.created_at.desc()).all()
+    else:
+        comments = ReviewComment.query.filter_by(
+            proposal_id=proposal_id
+        ).order_by(ReviewComment.created_at.desc()).all()
+
+    # Stats
+    total_comments = len(comments)
+    open_comments = sum(1 for c in comments if c.status == "open")
+    questions = sum(1 for c in comments if c.comment_type == "question" and c.status == "open")
+    change_requests = sum(1 for c in comments if c.comment_type == "change_request" and c.status == "open")
+    approvals = sum(1 for c in comments if c.comment_type == "approval")
+
+    # Extract section headings from proposal for dropdown
+    md_path = GENERATED_DIR / proposal.md_file
+    sections = []
+    if md_path.exists():
+        for line in md_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## ") or stripped.startswith("### "):
+                sections.append(stripped)
+
+    users = User.query.order_by(User.display_name).all()
+
+    return render_template(
+        "proposal_reviews.html",
+        proposal=proposal, project=project,
+        active_cycle=active_cycle, cycles=cycles,
+        comments=comments, sections=sections, users=users,
+        total_comments=total_comments, open_comments=open_comments,
+        questions=questions, change_requests=change_requests, approvals=approvals,
+    )
+
+
+@app.route("/proposal/<proposal_id>/reviews/start-cycle", methods=["POST"])
+@login_required
+def start_review_cycle(proposal_id):
+    """Start a new review cycle."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    # Complete any active cycle
+    active = ReviewCycle.query.filter_by(proposal_id=proposal_id, status="active").first()
+    if active:
+        active.status = "completed"
+        active.completed_at = datetime.now(timezone.utc)
+
+    # Get next cycle number
+    max_cycle = db.session.query(db.func.max(ReviewCycle.cycle_number)).filter_by(
+        proposal_id=proposal_id
+    ).scalar() or 0
+
+    cycle = ReviewCycle(
+        proposal_id=proposal_id,
+        cycle_number=max_cycle + 1,
+        name=request.form.get("cycle_name", f"Review {max_cycle + 1}"),
+        status="active",
+        started_by=current_user.id,
+    )
+    db.session.add(cycle)
+
+    project.clarification_sub_status = "in_review"
+    db.session.commit()
+
+    _log_activity("review_cycle_start", f"Started review cycle {cycle.cycle_number}", project.id)
+    flash(f"Review cycle '{cycle.name}' started.", "success")
+    return redirect(url_for("proposal_reviews", proposal_id=proposal_id))
+
+
+@app.route("/proposal/<proposal_id>/reviews/complete-cycle", methods=["POST"])
+@login_required
+def complete_review_cycle(proposal_id):
+    """Complete the active review cycle."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    active = ReviewCycle.query.filter_by(proposal_id=proposal_id, status="active").first()
+    if active:
+        active.status = "completed"
+        active.completed_at = datetime.now(timezone.utc)
+        project.clarification_sub_status = "none"
+        db.session.commit()
+        _log_activity("review_cycle_complete", f"Completed review cycle {active.cycle_number}", project.id)
+        flash(f"Review cycle '{active.name}' completed.", "success")
+
+    return redirect(url_for("proposal_reviews", proposal_id=proposal_id))
+
+
+@app.route("/proposal/<proposal_id>/reviews/add-comment", methods=["POST"])
+@login_required
+def add_review_comment(proposal_id):
+    """Add a review comment to a proposal."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    active_cycle = ReviewCycle.query.filter_by(
+        proposal_id=proposal_id, status="active"
+    ).first()
+
+    comment = ReviewComment(
+        proposal_id=proposal_id,
+        review_cycle_id=active_cycle.id if active_cycle else None,
+        section_heading=request.form.get("section_heading", ""),
+        line_reference=request.form.get("line_reference", "").strip(),
+        comment_type=request.form.get("comment_type", "comment"),
+        content=request.form.get("content", "").strip(),
+        author_id=current_user.id,
+        assigned_to_user_id=request.form.get("assigned_to_user_id") or None,
+        assigned_to_role=request.form.get("assigned_to_role", ""),
+        status="open",
+    )
+    db.session.add(comment)
+    db.session.flush()
+
+    # If it's a question or change_request, also create a ClarificationItem
+    if comment.comment_type in ("question", "change_request"):
+        ci = ClarificationItem(
+            project_id=project.id,
+            proposal_id=proposal_id,
+            source="human_review",
+            resolution_path="internal",
+            category="general",
+            question=comment.content,
+            proposal_section=comment.section_heading,
+            assigned_to_user_id=comment.assigned_to_user_id,
+            assigned_to_role=comment.assigned_to_role,
+            status="open",
+            created_by=current_user.id,
+        )
+        db.session.add(ci)
+        db.session.flush()
+        comment.clarification_item_id = ci.id
+        project.clarification_sub_status = "in_review"
+
+    db.session.commit()
+
+    # Notify assignee
+    if comment.assigned_to_user_id and comment.assigned_to_user_id != current_user.id:
+        type_label = comment.comment_type.replace("_", " ").title()
+        _notify(comment.assigned_to_user_id, "assignment",
+                f"Review {type_label}: {project.name}",
+                f"{current_user.display_name or current_user.username} left a {type_label} on '{project.name}': {comment.content[:100]}",
+                link=f"/proposal/{proposal_id}/reviews")
+
+    _log_activity("review_comment_add", f"Added {comment.comment_type} on {comment.section_heading or 'proposal'}", project.id)
+    flash("Review comment added.", "success")
+    return redirect(url_for("proposal_reviews", proposal_id=proposal_id))
+
+
+@app.route("/reviews/<comment_id>/resolve", methods=["POST"])
+@login_required
+def resolve_review_comment(comment_id):
+    """Resolve a review comment."""
+    comment = db.session.get(ReviewComment, comment_id)
+    if not comment:
+        abort(404)
+    proposal = db.session.get(Proposal, comment.proposal_id)
+    if not _can_access_project(db.session.get(Project, proposal.project_id)):
+        abort(404)
+
+    comment.status = "resolved"
+    comment.resolution_note = request.form.get("resolution_note", "").strip()
+    comment.resolved_by = current_user.id
+    comment.resolved_at = datetime.now(timezone.utc)
+
+    # Also resolve linked clarification item
+    if comment.clarification_item_id:
+        ci = db.session.get(ClarificationItem, comment.clarification_item_id)
+        if ci:
+            ci.status = "resolved"
+            ci.incorporated_at = datetime.now(timezone.utc)
+
+    db.session.commit()
+
+    _log_activity("review_comment_resolve", f"Resolved {comment.comment_type}", proposal.project_id)
+    flash("Comment resolved.", "success")
+    return redirect(url_for("proposal_reviews", proposal_id=comment.proposal_id))
+
+
+# ---------------------------------------------------------------------------
+# RFI Letter Export (Phase 3)
+# ---------------------------------------------------------------------------
+
+@app.route("/projects/<project_id>/rfi/generate", methods=["POST"])
+@login_required
+def generate_rfi_letter(project_id):
+    """Generate and download an RFI/Clarification letter from customer-facing items."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    customer_items = ClarificationItem.query.filter_by(
+        project_id=project_id, resolution_path="customer"
+    ).filter(
+        ClarificationItem.status.in_(["open", "draft"])
+    ).order_by(ClarificationItem.category, ClarificationItem.created_at).all()
+
+    if not customer_items:
+        flash("No customer-facing clarification items to include in RFI.", "error")
+        return redirect(url_for("clarification_register", project_id=project_id))
+
+    # Assign RFI reference IDs
+    for i, ci in enumerate(customer_items, 1):
+        ci.rfi_reference_id = f"RFI-{i:03d}"
+        ci.status = "sent"
+        ci.rfi_sent_at = datetime.now(timezone.utc)
+
+    project.clarification_sub_status = "rfi_sent"
+    db.session.commit()
+
+    # Generate DOCX
+    company_name = current_user.company_name or "Our Company"
+    rfi_filename = f"rfi_letter_{project_id[:8]}_{datetime.now(timezone.utc).strftime('%Y%m%d')}.docx"
+    rfi_path = GENERATED_DIR / rfi_filename
+
+    markdown_to_rfi_docx(
+        items=customer_items,
+        project_name=project.name,
+        client_name=project.client_name,
+        company_name=company_name,
+        author=current_user.display_name or current_user.username,
+        output_path=str(rfi_path),
+    )
+
+    _log_activity("rfi_generate", f"Generated RFI letter with {len(customer_items)} item(s)", project_id)
+    return send_file(str(rfi_path), as_attachment=True, download_name=rfi_filename,
+                     mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+
+@app.route("/projects/<project_id>/rfi/record-response/<item_id>", methods=["POST"])
+@login_required
+def record_rfi_response(project_id, item_id):
+    """Record a customer's response to an RFI item."""
+    ci = db.session.get(ClarificationItem, item_id)
+    if not ci or ci.project_id != project_id:
+        abort(404)
+    if not _can_access_project(db.session.get(Project, ci.project_id)):
+        abort(404)
+
+    ci.response = request.form.get("response", "").strip()
+    ci.responded_by = current_user.id
+    ci.responded_at = datetime.now(timezone.utc)
+    ci.status = "response_received"
+    db.session.commit()
+
+    # Check if all RFI items have responses
+    pending_rfi = ClarificationItem.query.filter_by(
+        project_id=project_id, resolution_path="customer", status="sent"
+    ).count()
+    if pending_rfi == 0:
+        project = db.session.get(Project, project_id)
+        project.clarification_sub_status = "clarification_pending"
+        db.session.commit()
+
+    _log_activity("rfi_response", f"Recorded response for {ci.rfi_reference_id}", project_id)
+    flash(f"Response recorded for {ci.rfi_reference_id}.", "success")
+    return redirect(url_for("clarification_register", project_id=project_id))
+
+
+# ---------------------------------------------------------------------------
+# Addendum Impact Analysis (Phase 3)
+# ---------------------------------------------------------------------------
+
+@app.route("/projects/<project_id>/addendum-analysis", methods=["POST"])
+@login_required
+def addendum_analysis(project_id):
+    """Analyze a newly uploaded addendum against existing proposal."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    addendum_doc_id = request.form.get("addendum_doc_id")
+    addendum_doc = db.session.get(ProjectDocument, addendum_doc_id)
+    if not addendum_doc:
+        flash("Addendum document not found.", "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    # Get original RFP text
+    rfp_docs = ProjectDocument.query.filter_by(project_id=project_id, file_type="rfp").all()
+    original_rfp_text = ""
+    for doc in rfp_docs:
+        if doc.id != addendum_doc_id:
+            try:
+                original_rfp_text += parse_document(doc.file_path) + "\n"
+            except Exception:
+                continue
+
+    # Get addendum text
+    try:
+        addendum_text = parse_document(addendum_doc.file_path)
+    except Exception:
+        flash("Could not parse addendum document.", "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    # Get current proposal
+    proposal = Proposal.query.filter_by(project_id=project_id).order_by(Proposal.generated_at.desc()).first()
+    current_md = ""
+    if proposal:
+        md_path = GENERATED_DIR / proposal.md_file
+        if md_path.exists():
+            current_md = md_path.read_text(encoding="utf-8")
+
+    if not current_md:
+        flash("No existing proposal to analyze against.", "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    try:
+        result = analyze_addendum_impact(
+            original_rfp_text, addendum_text, current_md,
+            user_api_key=current_user.api_key_encrypted or None,
+            user_model=current_user.llm_model or None,
+        )
+
+        # Create ClarificationItems for each identified change
+        for change in result.get("changes", []):
+            ci = ClarificationItem(
+                project_id=project_id,
+                proposal_id=proposal.id if proposal else None,
+                source="addendum",
+                resolution_path="internal" if change.get("can_ai_resolve") else "internal",
+                category="scope",
+                priority=change.get("severity", "medium"),
+                question=change.get("addendum_item", ""),
+                context=change.get("impact_description", ""),
+                ai_suggestion=change.get("suggested_resolution", ""),
+                proposal_section=", ".join(change.get("affected_sections", [])),
+                status="open",
+                created_by=current_user.id,
+            )
+            db.session.add(ci)
+
+        project.clarification_sub_status = "clarification_pending"
+        db.session.commit()
+
+        _log_activity("addendum_analysis", f"Analyzed addendum: {len(result.get('changes', []))} impacts found", project_id)
+        flash(f"Addendum analysis complete: {len(result.get('changes', []))} impact(s) identified and added to clarification register.", "success")
+
+    except Exception as e:
+        flash(f"Error analyzing addendum: {e}", "error")
+
+    return redirect(url_for("clarification_register", project_id=project_id))
+
+
+# ---------------------------------------------------------------------------
+# Targeted Section Regeneration (Phase 4)
+# ---------------------------------------------------------------------------
+
+@app.route("/proposal/<proposal_id>/regenerate-section", methods=["POST"])
+@login_required
+def regenerate_proposal_section(proposal_id):
+    """Regenerate a specific section of the proposal with new clarification info."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    section_heading = request.form.get("section_heading", "").strip()
+    clarification_answer = request.form.get("clarification_answer", "").strip()
+
+    if not section_heading or not clarification_answer:
+        flash("Section heading and clarification info are required.", "error")
+        return redirect(url_for("edit_proposal", proposal_id=proposal_id))
+
+    # Get current proposal content
+    md_path = GENERATED_DIR / proposal.md_file
+    current_md = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+
+    # Get original RFP text for context
+    rfp_docs = ProjectDocument.query.filter_by(project_id=proposal.project_id, file_type="rfp").all()
+    rfp_text = ""
+    for doc in rfp_docs:
+        try:
+            rfp_text += parse_document(doc.file_path) + "\n"
+        except Exception:
+            continue
+
+    try:
+        result = regenerate_section(
+            full_proposal_md=current_md,
+            section_heading=section_heading,
+            clarification_answer=clarification_answer,
+            original_rfp_text=rfp_text,
+            company_name=current_user.company_name,
+            user_api_key=current_user.api_key_encrypted or None,
+            user_model=current_user.llm_model or None,
+        )
+
+        # Replace the section in the full proposal
+        new_section = result["section_markdown"]
+        section_pattern = re.escape(section_heading)
+        updated_md = re.sub(
+            rf"({section_pattern}.*?)(?=\n## |\Z)",
+            new_section + "\n\n",
+            current_md,
+            count=1,
+            flags=re.DOTALL,
+        )
+
+        # Save as new version
+        latest = ProposalVersion.query.filter_by(proposal_id=proposal_id).order_by(
+            ProposalVersion.version_number.desc()
+        ).first()
+        next_version = (latest.version_number + 1) if latest else 1
+
+        version = ProposalVersion(
+            proposal_id=proposal_id,
+            version_number=next_version,
+            markdown_content=updated_md,
+            edit_source="ai",
+            editor_id=current_user.id,
+            change_summary=f"AI regenerated section: {section_heading}",
+        )
+        db.session.add(version)
+
+        # Update file on disk
+        md_path.write_text(updated_md, encoding="utf-8")
+        if proposal.docx_file:
+            docx_path = GENERATED_DIR / proposal.docx_file
+            markdown_to_docx(updated_md, str(docx_path))
+
+        # Update action items count
+        action_items = re.findall(r"\[ACTION REQUIRED:\s*(.+?)\]", updated_md)
+        proposal.action_items_count = len(action_items)
+
+        db.session.commit()
+        _log_activity("section_regenerate", f"Regenerated section: {section_heading}", project.id)
+        flash(f"Section '{section_heading}' regenerated and saved as v{next_version}.", "success")
+
+    except Exception as e:
+        flash(f"Error regenerating section: {e}", "error")
+
+    return redirect(url_for("edit_proposal", proposal_id=proposal_id))
 
 
 # ---------------------------------------------------------------------------

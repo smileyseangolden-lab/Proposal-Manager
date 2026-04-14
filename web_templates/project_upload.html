@@ -7,9 +7,16 @@
     <div class="page-header-row">
         <div>
             <h1>{{ project.name }}</h1>
-            <p class="page-subtitle">{{ project.client_name or 'No client specified' }} &mdash; <span class="badge badge-status-{{ project.status }}">{{ project.status }}</span></p>
+            <p class="page-subtitle">{{ project.client_name or 'No client specified' }} &mdash; <span class="badge badge-status-{{ project.status }}">{{ project.status }}</span>
+                {% if project.clarification_sub_status and project.clarification_sub_status != 'none' %}
+                <a href="{{ url_for('clarification_register', project_id=project.id) }}" class="badge badge-status-{{ project.clarification_sub_status }}" style="text-decoration:none;">
+                    {{ project.clarification_sub_status | replace('_', ' ') | title }}
+                </a>
+                {% endif %}
+            </p>
         </div>
         <div class="header-actions">
+            <a href="{{ url_for('clarification_register', project_id=project.id) }}" class="btn btn-small btn-secondary">Clarifications</a>
             <form method="post" action="{{ url_for('update_project_status', project_id=project.id) }}" class="inline-form">
                 <input type="text" name="dollar_amount" placeholder="Dollar amount" value="{{ project.dollar_amount if project.dollar_amount else '' }}" class="input-small">
                 <select name="status" class="status-select">
@@ -174,6 +181,27 @@
         <p class="processing-text">Generating your proposal&hellip;</p>
         <p class="processing-subtext">This typically takes 1-3 minutes. The AI may ask clarification questions.</p>
     </div>
+</div>
+{% endif %}
+
+<!-- Addendum Impact Analysis -->
+{% set addendum_docs = documents | selectattr('version_label') | list %}
+{% set has_proposal = project.proposals.first() is not none %}
+{% if has_proposal and documents | length > 1 %}
+<div class="card">
+    <details>
+        <summary style="cursor:pointer;font-weight:600;">Addendum Impact Analysis</summary>
+        <p style="color:var(--gray-500);margin:8px 0;">Upload an addendum and analyze its impact on the existing proposal. Changes will be added to the Clarification Register.</p>
+        <form method="post" action="{{ url_for('addendum_analysis', project_id=project.id) }}" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px;">
+            <select name="addendum_doc_id" class="status-select" required>
+                <option value="">Select addendum document...</option>
+                {% for doc in documents %}
+                <option value="{{ doc.id }}">{{ doc.original_filename }}{% if doc.version_label %} ({{ doc.version_label }}){% endif %}</option>
+                {% endfor %}
+            </select>
+            <button type="submit" class="btn btn-small btn-primary" onclick="return confirm('Analyze this document as an addendum? AI will identify impacts on the existing proposal.')">Analyze Impact</button>
+        </form>
+    </details>
 </div>
 {% endif %}
 
