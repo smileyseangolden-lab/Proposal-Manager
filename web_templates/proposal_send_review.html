@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+
+{% block title %}Send for Review &mdash; {{ project.name }}{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <h1>Send for Internal Review</h1>
+    <p class="page-subtitle">{{ project.name }} &middot; {{ project.client_name or 'No client' }}</p>
+</section>
+
+<div class="card">
+    <h2>Assign Reviewers</h2>
+    <p class="card-desc">Pick stakeholders and tag each with a review role. Every required reviewer must approve the current version before the proposal can be sent to the customer.</p>
+
+    <form method="post" action="{{ url_for('send_for_review', proposal_id=proposal.id) }}" id="review-form">
+        <table class="mini-table" id="reviewer-table">
+            <thead>
+                <tr>
+                    <th>Reviewer</th>
+                    <th>Review Role</th>
+                    <th>Required</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody id="reviewer-rows">
+                {% for i in range(3) %}
+                <tr class="reviewer-row">
+                    <td>
+                        <select name="reviewer_user_id">
+                            <option value="">— Select user —</option>
+                            {% for u in users %}
+                            <option value="{{ u.id }}">{{ u.display_name or u.username }} ({{ u.email }})</option>
+                            {% endfor %}
+                        </select>
+                    </td>
+                    <td>
+                        <select name="reviewer_role">
+                            {% for key, label in review_roles %}
+                            <option value="{{ key }}">{{ label }}</option>
+                            {% endfor %}
+                        </select>
+                    </td>
+                    <td class="text-center">
+                        <input type="checkbox" name="required_{{ i }}" value="1" checked>
+                    </td>
+                    <td><button type="button" class="btn btn-small btn-secondary remove-row">Remove</button></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        <button type="button" id="add-row" class="btn btn-small btn-secondary">+ Add Reviewer</button>
+
+        <div class="form-row" style="margin-top:16px;">
+            <div class="form-group">
+                <label for="review_deadline">Review Deadline (optional)</label>
+                <input type="datetime-local" id="review_deadline" name="review_deadline">
+            </div>
+        </div>
+        <div class="form-group">
+            <label for="review_note">Note to Reviewers (optional)</label>
+            <textarea id="review_note" name="review_note" rows="3" placeholder="e.g., Please focus on the pricing section."></textarea>
+        </div>
+
+        <div class="proposal-actions">
+            <button type="submit" class="btn btn-primary">Send for Review</button>
+            <a href="{{ url_for('view_proposal', proposal_id=proposal.id) }}" class="btn btn-secondary">Cancel</a>
+        </div>
+    </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+    var addBtn = document.getElementById("add-row");
+    var tbody = document.getElementById("reviewer-rows");
+
+    function bindRemove(row) {
+        var btn = row.querySelector(".remove-row");
+        btn.addEventListener("click", function(){ row.parentNode.removeChild(row); });
+    }
+
+    tbody.querySelectorAll(".reviewer-row").forEach(bindRemove);
+
+    addBtn.addEventListener("click", function(){
+        var first = tbody.querySelector(".reviewer-row");
+        if (!first) return;
+        var clone = first.cloneNode(true);
+        clone.querySelectorAll("select").forEach(function(s){ s.selectedIndex = 0; });
+        // Fix the checkbox name to use a unique index
+        var idx = tbody.querySelectorAll(".reviewer-row").length;
+        var cb = clone.querySelector("input[type=checkbox]");
+        if (cb) cb.name = "required_" + idx;
+        tbody.appendChild(clone);
+        bindRemove(clone);
+    });
+})();
+</script>
+{% endblock %}

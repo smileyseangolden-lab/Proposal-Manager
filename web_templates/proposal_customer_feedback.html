@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+
+{% block title %}Log Customer Feedback &mdash; {{ project.name }}{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <h1>Log Customer Feedback</h1>
+    <p class="page-subtitle">{{ project.name }} &middot; {{ project.client_name or 'No client' }}</p>
+</section>
+
+<div class="settings-tabs">
+    <button class="settings-tab active" data-tab="parse">Paste Email (AI Parse)</button>
+    <button class="settings-tab" data-tab="manual">Manual Entry</button>
+</div>
+
+<!-- Paste email tab -->
+<div class="settings-tab-panel active" id="tab-parse">
+    <div class="card">
+        <h2>Paste the Customer's Email</h2>
+        <p class="card-desc">The AI will read the email and extract a list of structured revision requests. You can review and edit each request in the next step before applying them.</p>
+        <form method="post" action="{{ url_for('customer_feedback', proposal_id=proposal.id) }}">
+            <input type="hidden" name="mode" value="parse_email">
+            <div class="form-group">
+                <textarea name="email_text" rows="14" placeholder="Paste the customer's email content here..."></textarea>
+            </div>
+            <div class="proposal-actions">
+                <button type="submit" class="btn btn-primary">Parse with AI</button>
+                <a href="{{ url_for('view_proposal', proposal_id=proposal.id) }}" class="btn btn-secondary">Cancel</a>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Manual entry tab -->
+<div class="settings-tab-panel" id="tab-manual">
+    <div class="card">
+        <h2>Enter Feedback Items Manually</h2>
+        <p class="card-desc">Add one revision request per row. Each will be filed with source = Customer.</p>
+        <form method="post" action="{{ url_for('customer_feedback', proposal_id=proposal.id) }}">
+            <input type="hidden" name="mode" value="manual">
+            <table class="mini-table" id="manual-rows">
+                <thead>
+                    <tr>
+                        <th>Category</th>
+                        <th>Section</th>
+                        <th>Directive</th>
+                    </tr>
+                </thead>
+                <tbody id="manual-tbody">
+                    {% for i in range(3) %}
+                    <tr class="manual-row">
+                        <td>
+                            <select name="category">
+                                {% for key, label in review_categories %}
+                                <option value="{{ key }}">{{ label }}</option>
+                                {% endfor %}
+                            </select>
+                        </td>
+                        <td><input type="text" name="target_section" placeholder="e.g., Pricing"></td>
+                        <td><textarea name="directive" rows="2" placeholder="e.g., Lower T&amp;M rate by 10%"></textarea></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            <button type="button" id="add-manual-row" class="btn btn-small btn-secondary">+ Add Row</button>
+            <div class="proposal-actions" style="margin-top:16px;">
+                <button type="submit" class="btn btn-primary">Save Feedback</button>
+                <a href="{{ url_for('view_proposal', proposal_id=proposal.id) }}" class="btn btn-secondary">Cancel</a>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+    // Tab switching
+    var tabs = document.querySelectorAll(".settings-tab");
+    var panels = document.querySelectorAll(".settings-tab-panel");
+    tabs.forEach(function(tab){
+        tab.addEventListener("click", function(){
+            tabs.forEach(function(t){ t.classList.remove("active"); });
+            panels.forEach(function(p){ p.classList.remove("active"); });
+            tab.classList.add("active");
+            var panel = document.getElementById("tab-" + tab.dataset.tab);
+            if (panel) panel.classList.add("active");
+        });
+    });
+
+    // Add-row button for manual entry
+    var addBtn = document.getElementById("add-manual-row");
+    var tbody = document.getElementById("manual-tbody");
+    if (addBtn && tbody) {
+        addBtn.addEventListener("click", function(){
+            var first = tbody.querySelector(".manual-row");
+            if (!first) return;
+            var clone = first.cloneNode(true);
+            clone.querySelectorAll("input, textarea").forEach(function(el){ el.value = ""; });
+            clone.querySelectorAll("select").forEach(function(s){ s.selectedIndex = 0; });
+            tbody.appendChild(clone);
+        });
+    }
+})();
+</script>
+{% endblock %}

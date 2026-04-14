@@ -1,0 +1,143 @@
+{% extends "base.html" %}
+
+{% block title %}Review &mdash; {{ project.name }}{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <h1>Review Proposal</h1>
+    <p class="page-subtitle">
+        {{ project.name }} &middot;
+        <span class="badge badge-review badge-review-{{ proposal.review_status }}">
+            {{ lifecycle_labels.get(proposal.review_status, proposal.review_status) }}
+        </span>
+        {% if reviewer %}
+        &middot; You are the <strong>{{ reviewer.review_role | title }}</strong> reviewer
+        {% endif %}
+    </p>
+</section>
+
+<div class="review-grid">
+    <div class="review-main">
+        <div class="card">
+            <h2>v{{ version.version_number if version else 'N/A' }}</h2>
+            <div class="proposal-body">
+                {{ proposal_html|safe }}
+            </div>
+        </div>
+    </div>
+
+    <div class="review-rail">
+        <div class="card">
+            <h3>File a Revision Request</h3>
+            {% if templates %}
+            <div class="form-group">
+                <label>Use Template</label>
+                <select id="template-picker">
+                    <option value="">— None —</option>
+                    {% for t in templates %}
+                    <option value="{{ t.directive_template|e }}" data-category="{{ t.category }}">{{ t.name }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            {% endif %}
+            <form method="post" action="{{ url_for('create_revision_request', proposal_id=proposal.id) }}">
+                <div class="form-group">
+                    <label for="category">Category</label>
+                    <select id="category" name="category">
+                        {% for key, label in review_categories %}
+                        <option value="{{ key }}">{{ label }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="target_section">Target Section (optional)</label>
+                    <input type="text" id="target_section" name="target_section" placeholder="e.g., Pricing">
+                </div>
+                <div class="form-group">
+                    <label for="directive">Directive</label>
+                    <textarea id="directive" name="directive" rows="4" required placeholder="e.g., Bump buyout margins by 1 percentage point across all line items."></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary">Submit Revision Request</button>
+            </form>
+        </div>
+
+        {% if reviewer %}
+        <div class="card">
+            <h3>Decision</h3>
+            {% if my_decision %}
+            <p>You previously recorded: <strong>{{ my_decision.decision.replace('_', ' ') }}</strong> on v{{ state.version_number }}.</p>
+            {% endif %}
+            <form method="post" action="{{ url_for('approve_proposal', proposal_id=proposal.id) }}">
+                <div class="form-group">
+                    <label for="note">Note (optional)</label>
+                    <textarea id="note" name="note" rows="2"></textarea>
+                </div>
+                <div class="proposal-actions">
+                    <button type="submit" name="decision" value="approved" class="btn btn-primary">Approve v{{ state.version_number }}</button>
+                    <button type="submit" name="decision" value="requested_changes" class="btn btn-secondary">Request Changes</button>
+                </div>
+            </form>
+        </div>
+        {% endif %}
+
+        {% if my_requests %}
+        <div class="card">
+            <h3>My Revision Requests</h3>
+            <ul class="revision-list">
+                {% for r in my_requests %}
+                <li class="revision-item revision-{{ r.status }}">
+                    <div class="revision-meta">
+                        <span class="badge badge-vertical">{{ r.category | title }}</span>
+                        <span class="revision-status">{{ r.status | title }}</span>
+                    </div>
+                    <div class="revision-directive">{{ r.directive }}</div>
+                    {% if r.target_section %}
+                    <div class="revision-section">Section: {{ r.target_section }}</div>
+                    {% endif %}
+                    {% if r.status == 'pending' %}
+                    <form method="post" action="{{ url_for('withdraw_revision_request', proposal_id=proposal.id, request_id=r.id) }}" class="inline-form">
+                        <button type="submit" class="btn btn-small btn-secondary">Withdraw</button>
+                    </form>
+                    {% endif %}
+                </li>
+                {% endfor %}
+            </ul>
+        </div>
+        {% endif %}
+
+        <div class="card">
+            <h3>Approval Status</h3>
+            <p><strong>{{ state.approved_count }}/{{ state.required_count }}</strong> required reviewers have approved.</p>
+            {% if state.pending_reviewers %}
+            <p>Pending: {{ state.pending_reviewers | length }}</p>
+            {% endif %}
+            {% if state.requested_changes_count %}
+            <p>Requested Changes: {{ state.requested_changes_count }}</p>
+            {% endif %}
+            <a href="{{ url_for('view_proposal', proposal_id=proposal.id) }}" class="btn btn-small btn-secondary">Back to Proposal</a>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+    var picker = document.getElementById("template-picker");
+    var directive = document.getElementById("directive");
+    var category = document.getElementById("category");
+    if (!picker || !directive) return;
+    picker.addEventListener("change", function(){
+        if (picker.value) {
+            directive.value = picker.value;
+            var cat = picker.options[picker.selectedIndex].getAttribute("data-category");
+            if (cat && category) {
+                for (var i = 0; i < category.options.length; i++) {
+                    if (category.options[i].value === cat) { category.selectedIndex = i; break; }
+                }
+            }
+        }
+    });
+})();
+</script>
+{% endblock %}

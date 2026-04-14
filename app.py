@@ -61,10 +61,16 @@ from models import (
     Project,
     ProjectDocument,
     Proposal,
+    ProposalApproval,
     ProposalComment,
     ProposalCorrection,
     ProposalQuestion,
+    ProposalReviewer,
+    ProposalRevisionBatch,
+    ProposalStatusHistory,
     ProposalVersion,
+    RevisionRequest,
+    RevisionTemplate,
     StaffRole,
     TravelExpenseRate,
     User,
@@ -72,8 +78,23 @@ from models import (
     UserVerticalTemplate,
     db,
 )
-from proposal_agent import generate_proposal
+from proposal_agent import (
+    generate_proposal,
+    parse_customer_email,
+    preflight_check_proposal,
+    revise_proposal,
+)
 from proposal_export import markdown_to_docx, markdown_to_redline_docx
+from proposal_lifecycle import (
+    LABELS as LIFECYCLE_LABELS,
+    STATES as LIFECYCLE_STATES,
+    LifecycleError,
+    approval_state,
+    auto_advance_after_decision,
+    latest_version,
+    pending_requests,
+    transition as lifecycle_transition,
+)
 from rate_sheet_parser import parse_rate_sheet
 
 # ---------------------------------------------------------------------------
@@ -118,58 +139,90 @@ def load_user(user_id):
 
 
 with app.app_context():
-    db.create_all()
+    # Cross-worker schema bootstrap lock. Under gunicorn, every worker imports
+    # this module and runs db.create_all() + migrations. Without a lock, two
+    # workers race to CREATE TABLE for a brand-new table and the loser crashes
+    # with "table already exists". A simple file lock (fcntl.flock) serializes
+    # the bootstrap so only one worker at a time touches the schema.
+    import fcntl as _fcntl
+    _data_dir = Path(__file__).resolve().parent / "data"
+    _data_dir.mkdir(exist_ok=True)
+    _lock_path = _data_dir / ".schema.lock"
+    with open(_lock_path, "w") as _lock_fh:
+        _fcntl.flock(_lock_fh, _fcntl.LOCK_EX)
+        try:
+            # Tolerate the race even if the lock somehow fails: if another
+            # worker already created a table between our check and create,
+            # swallow the "already exists" error. All other DDL errors
+            # still propagate.
+            try:
+                db.create_all()
+            except Exception as _e:
+                if "already exists" not in str(_e):
+                    raise
 
-    # Migrate existing project_documents table to add new columns if missing
-    import sqlite3 as _sqlite3
-    _db_path = str(Path(__file__).resolve().parent / "data" / "proposal_manager.db")
-    _conn = _sqlite3.connect(_db_path)
-    _cur = _conn.cursor()
-    _cur.execute("PRAGMA table_info(project_documents)")
-    _existing_cols = {row[1] for row in _cur.fetchall()}
-    _migrations = [
-        ("is_reference", "ALTER TABLE project_documents ADD COLUMN is_reference BOOLEAN DEFAULT 0"),
-        ("notes", 'ALTER TABLE project_documents ADD COLUMN notes TEXT DEFAULT ""'),
-        ("version_group", 'ALTER TABLE project_documents ADD COLUMN version_group VARCHAR(32) DEFAULT ""'),
-        ("version_label", 'ALTER TABLE project_documents ADD COLUMN version_label VARCHAR(100) DEFAULT ""'),
-    ]
-    for col, sql in _migrations:
-        if col not in _existing_cols:
-            _cur.execute(sql)
-    _conn.commit()
+            # Migrate existing project_documents table to add new columns if missing
+            import sqlite3 as _sqlite3
+            _db_path = str(_data_dir / "proposal_manager.db")
+            _conn = _sqlite3.connect(_db_path)
+            _cur = _conn.cursor()
+            _cur.execute("PRAGMA table_info(project_documents)")
+            _existing_cols = {row[1] for row in _cur.fetchall()}
+            _migrations = [
+                ("is_reference", "ALTER TABLE project_documents ADD COLUMN is_reference BOOLEAN DEFAULT 0"),
+                ("notes", 'ALTER TABLE project_documents ADD COLUMN notes TEXT DEFAULT ""'),
+                ("version_group", 'ALTER TABLE project_documents ADD COLUMN version_group VARCHAR(32) DEFAULT ""'),
+                ("version_label", 'ALTER TABLE project_documents ADD COLUMN version_label VARCHAR(100) DEFAULT ""'),
+            ]
+            for col, sql in _migrations:
+                if col not in _existing_cols:
+                    _cur.execute(sql)
+            _conn.commit()
 
-    # Migrate projects table to add assigned_to column if missing
-    _cur.execute("PRAGMA table_info(projects)")
-    _proj_cols = {row[1] for row in _cur.fetchall()}
-    if "assigned_to" not in _proj_cols:
-        _cur.execute('ALTER TABLE projects ADD COLUMN assigned_to VARCHAR(32) DEFAULT NULL')
-        _conn.commit()
+            # Migrate projects table to add assigned_to column if missing
+            _cur.execute("PRAGMA table_info(projects)")
+            _proj_cols = {row[1] for row in _cur.fetchall()}
+            if "assigned_to" not in _proj_cols:
+                _cur.execute('ALTER TABLE projects ADD COLUMN assigned_to VARCHAR(32) DEFAULT NULL')
+                _conn.commit()
 
-    # Part 2 migrations: deadlines and win/loss analysis columns
-    _cur.execute("PRAGMA table_info(projects)")
-    _proj_cols = {row[1] for row in _cur.fetchall()}
-    _project_migrations = [
-        ("due_date", "ALTER TABLE projects ADD COLUMN due_date DATETIME DEFAULT NULL"),
-        ("close_reason", 'ALTER TABLE projects ADD COLUMN close_reason TEXT DEFAULT ""'),
-        ("close_category", 'ALTER TABLE projects ADD COLUMN close_category VARCHAR(50) DEFAULT ""'),
-        ("competitor_name", 'ALTER TABLE projects ADD COLUMN competitor_name VARCHAR(300) DEFAULT ""'),
-        ("closed_at", "ALTER TABLE projects ADD COLUMN closed_at DATETIME DEFAULT NULL"),
-    ]
-    for col, sql in _project_migrations:
-        if col not in _proj_cols:
-            _cur.execute(sql)
-    _conn.commit()
+            # Part 2 migrations: deadlines and win/loss analysis columns
+            _cur.execute("PRAGMA table_info(projects)")
+            _proj_cols = {row[1] for row in _cur.fetchall()}
+            _project_migrations = [
+                ("due_date", "ALTER TABLE projects ADD COLUMN due_date DATETIME DEFAULT NULL"),
+                ("close_reason", 'ALTER TABLE projects ADD COLUMN close_reason TEXT DEFAULT ""'),
+                ("close_category", 'ALTER TABLE projects ADD COLUMN close_category VARCHAR(50) DEFAULT ""'),
+                ("competitor_name", 'ALTER TABLE projects ADD COLUMN competitor_name VARCHAR(300) DEFAULT ""'),
+                ("closed_at", "ALTER TABLE projects ADD COLUMN closed_at DATETIME DEFAULT NULL"),
+            ]
+            for col, sql in _project_migrations:
+                if col not in _proj_cols:
+                    _cur.execute(sql)
+            _conn.commit()
 
-    # Migrate users table to add role column if missing
-    _cur.execute("PRAGMA table_info(users)")
-    _user_cols = {row[1] for row in _cur.fetchall()}
-    if "role" not in _user_cols:
-        _cur.execute('ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT "proposal"')
-        # Backfill: set existing admins to admin role
-        _cur.execute('UPDATE users SET role = "admin" WHERE is_admin = 1')
-        _conn.commit()
+            # Migrate users table to add role column if missing
+            _cur.execute("PRAGMA table_info(users)")
+            _user_cols = {row[1] for row in _cur.fetchall()}
+            if "role" not in _user_cols:
+                _cur.execute('ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT "proposal"')
+                # Backfill: set existing admins to admin role
+                _cur.execute('UPDATE users SET role = "admin" WHERE is_admin = 1')
+                _conn.commit()
 
-    _conn.close()
+            # Migrate proposals table for Part 3 review lifecycle
+            _cur.execute("PRAGMA table_info(proposals)")
+            _prop_cols = {row[1] for row in _cur.fetchall()}
+            if "review_status" not in _prop_cols:
+                _cur.execute('ALTER TABLE proposals ADD COLUMN review_status VARCHAR(40) DEFAULT "draft"')
+                _conn.commit()
+            if "review_deadline" not in _prop_cols:
+                _cur.execute('ALTER TABLE proposals ADD COLUMN review_deadline DATETIME DEFAULT NULL')
+                _conn.commit()
+
+            _conn.close()
+        finally:
+            _fcntl.flock(_lock_fh, _fcntl.LOCK_UN)
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +483,69 @@ def dashboard():
         "other": "Other",
     }
 
+    # --- Part 3: Review widgets ----------------------------------------------
+
+    # "Pending My Review" — proposals where I'm an assigned reviewer and I
+    # haven't yet recorded a decision on the latest version.
+    my_reviews_pending: list[dict] = []
+    my_assignments = ProposalReviewer.query.filter_by(user_id=current_user.id).all()
+    for r in my_assignments:
+        prop = db.session.get(Proposal, r.proposal_id)
+        if not prop:
+            continue
+        if prop.review_status not in ("in_review", "revision_requested"):
+            continue
+        version = latest_version(prop.id)
+        if not version:
+            continue
+        decision = ProposalApproval.query.filter_by(
+            proposal_id=prop.id, version_id=version.id, user_id=current_user.id
+        ).first()
+        if decision is not None:
+            continue
+        proj = db.session.get(Project, prop.project_id)
+        my_reviews_pending.append({
+            "proposal": prop,
+            "project": proj,
+            "reviewer": r,
+            "version_number": version.version_number,
+            "deadline": r.deadline,
+            "overdue": bool(r.deadline) and r.deadline < datetime.now(timezone.utc),
+        })
+
+    # "Out for Review" — proposals I own that are currently in_review /
+    # revision_requested / internally_approved (awaiting customer send).
+    out_for_review: list[dict] = []
+    owned_props = (
+        Proposal.query.join(Project)
+        .filter(Project.user_id == current_user.id,
+                Proposal.review_status.in_(("in_review", "revision_requested", "internally_approved")))
+        .all()
+    )
+    for prop in owned_props:
+        state = approval_state(prop)
+        proj = db.session.get(Project, prop.project_id)
+        out_for_review.append({
+            "proposal": prop,
+            "project": proj,
+            "state": state,
+            "pending_req_count": RevisionRequest.query.filter_by(
+                proposal_id=prop.id, status="pending"
+            ).count(),
+        })
+
+    # "Awaiting Customer Response" — proposals I own that are out to customer
+    awaiting_customer = (
+        Proposal.query.join(Project)
+        .filter(Project.user_id == current_user.id,
+                Proposal.review_status.in_(("submitted_to_customer", "customer_feedback")))
+        .all()
+    )
+    awaiting_customer_items = []
+    for prop in awaiting_customer:
+        proj = db.session.get(Project, prop.project_id)
+        awaiting_customer_items.append({"proposal": prop, "project": proj})
+
     return render_template(
         "dashboard.html",
         active_projects=active_projects,
@@ -445,6 +561,10 @@ def dashboard():
         upcoming_deadlines=upcoming_deadlines,
         overdue_projects=overdue_projects,
         close_category_labels=close_category_labels,
+        my_reviews_pending=my_reviews_pending,
+        out_for_review=out_for_review,
+        awaiting_customer_items=awaiting_customer_items,
+        lifecycle_labels=LIFECYCLE_LABELS,
     )
 
 
@@ -484,6 +604,10 @@ def settings():
     travel_rates = TravelExpenseRate.query.filter_by(user_id=current_user.id).order_by(TravelExpenseRate.expense_type).all()
     # Company standards
     company_standards = CompanyStandard.query.filter_by(user_id=current_user.id).order_by(CompanyStandard.category, CompanyStandard.title).all()
+    # Revision request templates (Part 3)
+    revision_templates = RevisionTemplate.query.filter_by(user_id=current_user.id).order_by(
+        RevisionTemplate.category, RevisionTemplate.name
+    ).all()
 
     return render_template(
         "settings.html",
@@ -493,6 +617,8 @@ def settings():
         equipment_items=equipment_items,
         travel_rates=travel_rates,
         company_standards=company_standards,
+        revision_templates=revision_templates,
+        revision_categories=REVISION_CATEGORIES,
         verticals=VERTICALS,
     )
 
@@ -1172,9 +1298,19 @@ def project_generate(project_id):
             md_file=md_filename,
             docx_file=docx_filename,
             pdf_file=pdf_filename,
+            review_status="draft",
         )
         db.session.add(proposal)
         db.session.flush()  # Get proposal.id before commit
+
+        # Record the initial "draft" state in status history
+        db.session.add(ProposalStatusHistory(
+            proposal_id=proposal.id,
+            from_status="",
+            to_status="draft",
+            actor_id=current_user.id,
+            note="AI-generated v1.",
+        ))
 
         # Save version 1 (AI-generated original)
         v1 = ProposalVersion(
@@ -1326,9 +1462,9 @@ def view_proposal(proposal_id):
         flash("Proposal not found.", "error")
         return redirect(url_for("dashboard"))
 
-    project = db.session.get(Project, proposal.project_id)
-    if not _can_access_project(project):
+    if not _can_view_proposal(proposal):
         abort(404)
+    project = db.session.get(Project, proposal.project_id)
 
     md_path = GENERATED_DIR / proposal.md_file
     if not md_path.exists():
@@ -1353,6 +1489,20 @@ def view_proposal(proposal_id):
     ).all()
     open_comment_count = sum(1 for c in comments if not c.is_resolved)
 
+    # Review lifecycle context
+    state = approval_state(proposal)
+    reviewers = ProposalReviewer.query.filter_by(proposal_id=proposal_id).order_by(
+        ProposalReviewer.assigned_at
+    ).all()
+    pending_req_count = RevisionRequest.query.filter_by(
+        proposal_id=proposal_id, status="pending"
+    ).count()
+    is_owner = _is_proposal_owner(proposal)
+    my_reviewer = _get_reviewer(proposal_id, current_user.id)
+    status_history = ProposalStatusHistory.query.filter_by(
+        proposal_id=proposal_id
+    ).order_by(ProposalStatusHistory.created_at.desc()).limit(10).all()
+
     return render_template(
         "proposal.html",
         meta=meta,
@@ -1362,6 +1512,13 @@ def view_proposal(proposal_id):
         project=project,
         comments=comments,
         open_comment_count=open_comment_count,
+        state=state,
+        reviewers=reviewers,
+        pending_req_count=pending_req_count,
+        is_owner=is_owner,
+        my_reviewer=my_reviewer,
+        status_history=status_history,
+        lifecycle_labels=LIFECYCLE_LABELS,
     )
 
 
@@ -1631,6 +1788,853 @@ def finalize_proposal(proposal_id):
     _log_activity("proposal_finalize", f"Finalized proposal with corrections", project.id)
     flash("Proposal finalized. AI will learn from your edits for future proposals.", "success")
     return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
+
+# ---------------------------------------------------------------------------
+# Part 3: Multi-Stakeholder Review & Revision Workflow
+# ---------------------------------------------------------------------------
+
+REVIEW_ROLE_OPTIONS = [
+    ("engineering", "Engineering"),
+    ("accounting", "Accounting"),
+    ("sales", "Sales"),
+    ("legal", "Legal"),
+    ("operations", "Operations"),
+    ("other", "Other"),
+]
+
+REVISION_CATEGORIES = [
+    ("pricing", "Pricing"),
+    ("scope", "Scope"),
+    ("resources", "Resources"),
+    ("schedule", "Schedule"),
+    ("terms", "Terms"),
+    ("compliance", "Compliance"),
+    ("tone", "Tone"),
+    ("structure", "Structure"),
+    ("other", "Other"),
+]
+
+REVISION_SOURCES = [
+    "internal_engineering", "internal_accounting", "internal_sales",
+    "internal_legal", "internal_operations", "internal_other",
+    "customer", "other",
+]
+
+
+def _proposal_owner(proposal: Proposal) -> User:
+    project = db.session.get(Project, proposal.project_id)
+    return db.session.get(User, project.user_id) if project else None
+
+
+def _can_view_proposal(proposal: Proposal) -> bool:
+    """The proposal owner, the assigned user, any admin, OR any assigned reviewer
+    can view the proposal."""
+    if not proposal:
+        return False
+    project = db.session.get(Project, proposal.project_id)
+    if not project:
+        return False
+    if (
+        project.user_id == current_user.id
+        or project.assigned_to == current_user.id
+        or current_user.is_admin
+    ):
+        return True
+    # Assigned reviewer?
+    reviewer = ProposalReviewer.query.filter_by(
+        proposal_id=proposal.id, user_id=current_user.id
+    ).first()
+    return reviewer is not None
+
+
+def _is_proposal_owner(proposal: Proposal) -> bool:
+    """Only the project owner, its assignee, or an admin is considered the
+    proposal 'owner' for workflow-control purposes."""
+    if not proposal:
+        return False
+    project = db.session.get(Project, proposal.project_id)
+    if not project:
+        return False
+    return (
+        project.user_id == current_user.id
+        or project.assigned_to == current_user.id
+        or current_user.is_admin
+    )
+
+
+def _source_for_review_role(review_role: str) -> str:
+    mapping = {
+        "engineering": "internal_engineering",
+        "accounting": "internal_accounting",
+        "sales": "internal_sales",
+        "legal": "internal_legal",
+        "operations": "internal_operations",
+        "other": "internal_other",
+    }
+    return mapping.get(review_role, "internal_other")
+
+
+def _get_reviewer(proposal_id: str, user_id: str) -> ProposalReviewer | None:
+    return ProposalReviewer.query.filter_by(
+        proposal_id=proposal_id, user_id=user_id
+    ).first()
+
+
+@app.route("/proposal/<proposal_id>/send-for-review", methods=["GET", "POST"])
+@login_required
+def send_for_review(proposal_id):
+    """Assign reviewers and transition a proposal from draft to in_review."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal or not _is_proposal_owner(proposal):
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+
+    if request.method == "GET":
+        all_users = User.query.order_by(User.display_name).all()
+        existing_reviewers = ProposalReviewer.query.filter_by(proposal_id=proposal_id).all()
+        return render_template(
+            "proposal_send_review.html",
+            proposal=proposal,
+            project=project,
+            users=all_users,
+            existing_reviewers=existing_reviewers,
+            review_roles=REVIEW_ROLE_OPTIONS,
+            lifecycle_labels=LIFECYCLE_LABELS,
+        )
+
+    # POST — parse reviewer assignments
+    # Form inputs: reviewer_user_id[], reviewer_role[], reviewer_required[]
+    user_ids = request.form.getlist("reviewer_user_id")
+    roles = request.form.getlist("reviewer_role")
+    required_flags = request.form.getlist("reviewer_required")
+    note = request.form.get("review_note", "").strip()
+    deadline_str = request.form.get("review_deadline", "").strip()
+
+    if not user_ids:
+        flash("Please select at least one reviewer.", "error")
+        return redirect(url_for("send_for_review", proposal_id=proposal_id))
+
+    # Enforce "owner cannot be sole approver" rule: at least one reviewer must be
+    # someone other than the proposal owner (see plan §8).
+    owner_id = project.user_id
+    non_owner_count = sum(1 for uid in user_ids if uid and uid != owner_id)
+    if non_owner_count == 0:
+        flash("At least one reviewer must be someone other than the proposal owner.", "error")
+        return redirect(url_for("send_for_review", proposal_id=proposal_id))
+
+    deadline = None
+    if deadline_str:
+        try:
+            deadline = datetime.fromisoformat(deadline_str).replace(tzinfo=timezone.utc)
+        except ValueError:
+            deadline = None
+
+    # Clear old reviewer rows that aren't in the new set and add new ones.
+    ProposalReviewer.query.filter_by(proposal_id=proposal_id).delete()
+    db.session.flush()
+
+    added = 0
+    for idx, uid in enumerate(user_ids):
+        if not uid:
+            continue
+        user = db.session.get(User, uid)
+        if not user:
+            continue
+        role = roles[idx] if idx < len(roles) else "other"
+        if role not in {r[0] for r in REVIEW_ROLE_OPTIONS}:
+            role = "other"
+        req_idx = f"required_{idx}"
+        is_required = req_idx in required_flags or request.form.get(req_idx) == "1"
+        # Default to required=True
+        if not required_flags and not request.form.get(req_idx):
+            is_required = True
+        reviewer = ProposalReviewer(
+            proposal_id=proposal_id,
+            user_id=uid,
+            review_role=role,
+            is_required=is_required,
+            assigned_by=current_user.id,
+            deadline=deadline,
+            notes=note,
+        )
+        db.session.add(reviewer)
+        added += 1
+
+        _notify(
+            uid,
+            "review_assigned",
+            f"You've been assigned to review: {project.name}",
+            f"{current_user.display_name or current_user.username} assigned you as the {role.title()} reviewer on '{project.name}'.",
+            link=f"/proposal/{proposal_id}/review",
+        )
+
+    if added == 0:
+        flash("No valid reviewers were added.", "error")
+        return redirect(url_for("send_for_review", proposal_id=proposal_id))
+
+    if deadline:
+        proposal.review_deadline = deadline
+
+    try:
+        lifecycle_transition(proposal, "in_review", current_user.id,
+                             note=f"Sent for internal review. {added} reviewer(s) assigned.")
+    except LifecycleError as e:
+        flash(str(e), "error")
+        return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
+    db.session.commit()
+    _log_activity("proposal_send_for_review",
+                  f"Sent '{project.name}' proposal for internal review ({added} reviewer(s))",
+                  project.id)
+    flash(f"Proposal sent for review to {added} stakeholder(s).", "success")
+    return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
+
+@app.route("/proposal/<proposal_id>/review", methods=["GET", "POST"])
+@login_required
+def proposal_review_page(proposal_id):
+    """Reviewer-facing page: file revision requests and approve/request changes."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal or not _can_view_proposal(proposal):
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+
+    reviewer = _get_reviewer(proposal.id, current_user.id)
+    if reviewer is None and not _is_proposal_owner(proposal):
+        flash("You are not a reviewer on this proposal.", "error")
+        return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
+    version = latest_version(proposal_id)
+    md_path = GENERATED_DIR / proposal.md_file
+    proposal_md = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+    proposal_html = md.markdown(proposal_md, extensions=["tables", "fenced_code"])
+
+    # My pending/existing revision requests on this proposal
+    my_requests = RevisionRequest.query.filter_by(
+        proposal_id=proposal_id, author_id=current_user.id
+    ).order_by(RevisionRequest.created_at.desc()).all()
+
+    # Templates I can apply
+    templates = RevisionTemplate.query.filter_by(user_id=current_user.id).order_by(
+        RevisionTemplate.category, RevisionTemplate.name
+    ).all()
+
+    # My current decision on the latest version, if any
+    my_decision = None
+    if version:
+        my_decision = ProposalApproval.query.filter_by(
+            proposal_id=proposal_id,
+            version_id=version.id,
+            user_id=current_user.id,
+        ).order_by(ProposalApproval.decided_at.desc()).first()
+
+    state = approval_state(proposal)
+
+    return render_template(
+        "proposal_review.html",
+        proposal=proposal,
+        project=project,
+        reviewer=reviewer,
+        version=version,
+        proposal_html=proposal_html,
+        my_requests=my_requests,
+        my_decision=my_decision,
+        templates=templates,
+        review_categories=REVISION_CATEGORIES,
+        review_roles=REVIEW_ROLE_OPTIONS,
+        state=state,
+        lifecycle_labels=LIFECYCLE_LABELS,
+    )
+
+
+@app.route("/proposal/<proposal_id>/revision-request", methods=["POST"])
+@login_required
+def create_revision_request(proposal_id):
+    """Create a new structured revision request."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal or not _can_view_proposal(proposal):
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+
+    reviewer = _get_reviewer(proposal_id, current_user.id)
+    is_owner = _is_proposal_owner(proposal)
+    if reviewer is None and not is_owner:
+        abort(403)
+
+    directive = request.form.get("directive", "").strip()
+    if not directive:
+        flash("Directive is required.", "error")
+        return redirect(url_for("proposal_review_page", proposal_id=proposal_id))
+
+    category = request.form.get("category", "other").strip().lower()
+    if category not in {c[0] for c in REVISION_CATEGORIES}:
+        category = "other"
+
+    target_section = request.form.get("target_section", "").strip()[:200]
+
+    if reviewer:
+        source = _source_for_review_role(reviewer.review_role)
+    else:
+        source = "internal_other"
+
+    req = RevisionRequest(
+        proposal_id=proposal_id,
+        author_id=current_user.id,
+        source=source,
+        category=category,
+        directive=directive,
+        target_section=target_section,
+        status="pending",
+    )
+    db.session.add(req)
+
+    # Notify the proposal owner that a request was filed
+    if project and project.user_id != current_user.id:
+        _notify(
+            project.user_id,
+            "revision_requested",
+            f"Revision requested on: {project.name}",
+            f"{current_user.display_name or current_user.username} filed a {category} revision request.",
+            link=f"/proposal/{proposal_id}",
+        )
+
+    # If current status is in_review and we got a request, transition
+    if proposal.review_status == "in_review":
+        try:
+            lifecycle_transition(
+                proposal, "revision_requested", current_user.id,
+                note=f"Revision request filed by {current_user.display_name or current_user.username}.",
+            )
+        except LifecycleError:
+            pass
+
+    db.session.commit()
+    _log_activity("revision_request_create",
+                  f"Filed {category} revision request on '{project.name}'",
+                  project.id if project else None)
+    flash("Revision request filed.", "success")
+    return redirect(url_for("proposal_review_page", proposal_id=proposal_id))
+
+
+@app.route("/proposal/<proposal_id>/revision-request/<request_id>/withdraw", methods=["POST"])
+@login_required
+def withdraw_revision_request(proposal_id, request_id):
+    """Soft-delete a revision request (status=withdrawn) — only author or owner."""
+    req = db.session.get(RevisionRequest, request_id)
+    if not req or req.proposal_id != proposal_id:
+        abort(404)
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    if req.author_id != current_user.id and not _is_proposal_owner(proposal):
+        abort(403)
+    if req.status != "pending":
+        flash("Only pending requests can be withdrawn.", "error")
+        return redirect(url_for("proposal_review_page", proposal_id=proposal_id))
+    req.status = "withdrawn"
+    db.session.commit()
+    _log_activity("revision_request_withdraw", f"Withdrew revision request {request_id}")
+    flash("Revision request withdrawn.", "success")
+    return redirect(request.referrer or url_for("proposal_review_page", proposal_id=proposal_id))
+
+
+@app.route("/proposal/<proposal_id>/approve", methods=["POST"])
+@login_required
+def approve_proposal(proposal_id):
+    """Record an approval or request-changes decision for the latest version."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal or not _can_view_proposal(proposal):
+        abort(404)
+
+    reviewer = _get_reviewer(proposal_id, current_user.id)
+    if reviewer is None:
+        flash("You are not a reviewer on this proposal.", "error")
+        return redirect(url_for("proposal_review_page", proposal_id=proposal_id))
+
+    project = db.session.get(Project, proposal.project_id)
+
+    # Prevent self-approval loophole: owner cannot approve their own proposal.
+    if project and project.user_id == current_user.id:
+        flash("You cannot approve your own proposal. Another reviewer must approve it.", "error")
+        return redirect(url_for("proposal_review_page", proposal_id=proposal_id))
+
+    decision = request.form.get("decision", "").strip()
+    if decision not in ("approved", "requested_changes"):
+        flash("Invalid decision.", "error")
+        return redirect(url_for("proposal_review_page", proposal_id=proposal_id))
+
+    note = request.form.get("note", "").strip()
+    version = latest_version(proposal_id)
+    if not version:
+        flash("No version to approve.", "error")
+        return redirect(url_for("proposal_review_page", proposal_id=proposal_id))
+
+    # Upsert one decision per (proposal, version, user)
+    existing = ProposalApproval.query.filter_by(
+        proposal_id=proposal_id, version_id=version.id, user_id=current_user.id
+    ).first()
+    if existing:
+        existing.decision = decision
+        existing.note = note
+        existing.decided_at = datetime.now(timezone.utc)
+    else:
+        db.session.add(ProposalApproval(
+            proposal_id=proposal_id,
+            version_id=version.id,
+            user_id=current_user.id,
+            review_role=reviewer.review_role,
+            decision=decision,
+            note=note,
+        ))
+
+    db.session.flush()
+    auto_advance_after_decision(proposal, current_user.id)
+
+    # Notify the proposal owner
+    if project and project.user_id != current_user.id:
+        label = "approved" if decision == "approved" else "requested changes"
+        _notify(
+            project.user_id,
+            "proposal_approved" if decision == "approved" else "revision_requested",
+            f"{current_user.display_name or current_user.username} {label} your proposal: {project.name}",
+            note[:200] if note else "",
+            link=f"/proposal/{proposal_id}",
+        )
+
+    db.session.commit()
+    _log_activity(
+        "proposal_approve" if decision == "approved" else "proposal_request_changes",
+        f"{decision} on v{version.version_number}",
+        project.id if project else None,
+    )
+    flash(
+        "Approval recorded." if decision == "approved" else "Change request recorded.",
+        "success",
+    )
+    return redirect(url_for("proposal_review_page", proposal_id=proposal_id))
+
+
+@app.route("/proposal/<proposal_id>/apply-feedback", methods=["GET", "POST"])
+@login_required
+def apply_feedback(proposal_id):
+    """Owner-only batch-apply UI: review pending revision requests and trigger AI."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal or not _is_proposal_owner(proposal):
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+
+    pending = pending_requests(proposal_id)
+
+    if request.method == "GET":
+        return render_template(
+            "proposal_apply_feedback.html",
+            proposal=proposal,
+            project=project,
+            pending=pending,
+            review_categories=REVISION_CATEGORIES,
+            lifecycle_labels=LIFECYCLE_LABELS,
+        )
+
+    # POST — collect selected request ids & edited directives
+    selected_ids = request.form.getlist("apply_request_id")
+    if not selected_ids:
+        flash("Please select at least one revision request to apply.", "error")
+        return redirect(url_for("apply_feedback", proposal_id=proposal_id))
+
+    selected_requests = []
+    for rid in selected_ids:
+        req = db.session.get(RevisionRequest, rid)
+        if not req or req.proposal_id != proposal_id or req.status != "pending":
+            continue
+        # Allow owner to edit the directive inline before the AI sees it
+        edited = request.form.get(f"directive_{rid}", "").strip()
+        if edited:
+            req.directive = edited
+        selected_requests.append(req)
+
+    if not selected_requests:
+        flash("No valid requests selected.", "error")
+        return redirect(url_for("apply_feedback", proposal_id=proposal_id))
+
+    # Build the AI payload
+    current_version = latest_version(proposal_id)
+    if not current_version:
+        flash("Proposal has no version to revise.", "error")
+        return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
+    ai_payload = []
+    for r in selected_requests:
+        author = db.session.get(User, r.author_id) if r.author_id else None
+        author_label = (author.display_name or author.username) if author else r.source.replace("_", " ").title()
+        role_label = r.source.replace("internal_", "").replace("_", " ").title()
+        ai_payload.append({
+            "source": r.source,
+            "category": r.category,
+            "directive": r.directive,
+            "target_section": r.target_section,
+            "author_label": f"{author_label} — {role_label}",
+        })
+
+    # Load supporting context
+    owner = _proposal_owner(proposal)
+    owner_id = owner.id if owner else current_user.id
+    standards = CompanyStandard.query.filter_by(user_id=owner_id, is_active=True).all()
+    standards_data = [
+        {"category": s.category, "title": s.title, "content": s.content}
+        for s in standards
+    ] if standards else None
+
+    corrections = ProposalCorrection.query.filter_by(user_id=owner_id).order_by(
+        ProposalCorrection.created_at.desc()
+    ).limit(10).all()
+    corrections_data = [
+        {
+            "vertical": c.vertical,
+            "summary": c.correction_summary,
+            "original": (c.original_snippet or "")[:500],
+            "corrected": (c.corrected_snippet or "")[:500],
+            "type": c.correction_type,
+        }
+        for c in corrections
+    ] if corrections else None
+
+    try:
+        result = revise_proposal(
+            current_markdown=current_version.markdown_content,
+            revision_requests=ai_payload,
+            vertical=proposal.vertical,
+            company_name=current_user.company_name,
+            user_api_key=current_user.api_key_encrypted or None,
+            user_model=current_user.llm_model or None,
+            company_standards=standards_data,
+            past_corrections=corrections_data,
+        )
+    except RuntimeError as e:
+        flash(str(e), "error")
+        return redirect(url_for("apply_feedback", proposal_id=proposal_id))
+    except Exception as e:
+        flash(f"AI revision failed: {e}", "error")
+        return redirect(url_for("apply_feedback", proposal_id=proposal_id))
+
+    # Create the new version
+    latest_num = current_version.version_number
+    new_version = ProposalVersion(
+        proposal_id=proposal_id,
+        version_number=latest_num + 1,
+        markdown_content=result["revised_markdown"],
+        edit_source="ai",
+        editor_id=current_user.id,
+        change_summary=f"AI revision: {result['ai_summary']}",
+    )
+    db.session.add(new_version)
+    db.session.flush()
+
+    # Write the new markdown/docx to disk
+    md_path = GENERATED_DIR / proposal.md_file
+    md_path.write_text(result["revised_markdown"], encoding="utf-8")
+    if proposal.docx_file:
+        docx_path = GENERATED_DIR / proposal.docx_file
+        markdown_to_docx(result["revised_markdown"], str(docx_path))
+
+    # Update action items count
+    proposal.action_items_count = len(
+        re.findall(r"\[ACTION REQUIRED:\s*(.+?)\]", result["revised_markdown"])
+    )
+
+    # Log the revision batch
+    batch = ProposalRevisionBatch(
+        proposal_id=proposal_id,
+        from_version_id=current_version.id,
+        to_version_id=new_version.id,
+        triggered_by=current_user.id,
+        request_count=len(selected_requests),
+        ai_change_summary=json.dumps({
+            "summary": result["ai_summary"],
+            "change_log": result["change_log"],
+        }),
+    )
+    db.session.add(batch)
+
+    # Mark requests as applied
+    for r in selected_requests:
+        r.status = "applied"
+        r.applied_in_version_id = new_version.id
+
+    # Transition back to in_review so reviewers can re-approve the new version.
+    # A new version invalidates all prior approvals; reviewers must re-approve.
+    try:
+        if proposal.review_status in (
+            "revision_requested", "in_review", "internally_approved", "customer_feedback"
+        ):
+            lifecycle_transition(
+                proposal, "in_review", current_user.id,
+                note=f"AI generated v{new_version.version_number} from {len(selected_requests)} request(s)."
+            )
+    except LifecycleError:
+        pass
+
+    # Notify reviewers a new version needs their attention
+    reviewers = ProposalReviewer.query.filter_by(proposal_id=proposal_id).all()
+    for rv in reviewers:
+        if rv.user_id == current_user.id:
+            continue
+        _notify(
+            rv.user_id,
+            "review_assigned",
+            f"New version to review: {project.name}",
+            f"v{new_version.version_number} was generated from {len(selected_requests)} revision request(s). Please re-review.",
+            link=f"/proposal/{proposal_id}/review",
+        )
+
+    db.session.commit()
+    _log_activity(
+        "proposal_revise",
+        f"AI-revised proposal to v{new_version.version_number} ({len(selected_requests)} requests applied)",
+        project.id,
+    )
+    flash(
+        f"Version {new_version.version_number} generated. {len(selected_requests)} request(s) applied.",
+        "success",
+    )
+    return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
+
+@app.route("/proposal/<proposal_id>/submit-to-customer", methods=["POST"])
+@login_required
+def submit_to_customer(proposal_id):
+    """Owner transitions internally_approved → submitted_to_customer."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal or not _is_proposal_owner(proposal):
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+
+    try:
+        lifecycle_transition(
+            proposal, "submitted_to_customer", current_user.id,
+            note="Submitted to customer by owner.",
+        )
+    except LifecycleError as e:
+        flash(str(e), "error")
+        return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
+    db.session.commit()
+    _log_activity("proposal_submit_to_customer", f"Submitted proposal for '{project.name}' to customer", project.id)
+    flash("Proposal marked as submitted to customer.", "success")
+    return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
+
+@app.route("/proposal/<proposal_id>/customer-feedback", methods=["GET", "POST"])
+@login_required
+def customer_feedback(proposal_id):
+    """Owner enters customer feedback — either typed items or pasted email for AI parsing."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal or not _is_proposal_owner(proposal):
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+
+    if request.method == "GET":
+        return render_template(
+            "proposal_customer_feedback.html",
+            proposal=proposal,
+            project=project,
+            review_categories=REVISION_CATEGORIES,
+            lifecycle_labels=LIFECYCLE_LABELS,
+        )
+
+    mode = request.form.get("mode", "manual")
+    created = 0
+
+    if mode == "parse_email":
+        email_text = request.form.get("email_text", "").strip()
+        if not email_text:
+            flash("Please paste the customer's email.", "error")
+            return redirect(url_for("customer_feedback", proposal_id=proposal_id))
+        try:
+            drafts = parse_customer_email(
+                email_text,
+                user_api_key=current_user.api_key_encrypted or None,
+                user_model=current_user.llm_model or None,
+            )
+        except RuntimeError as e:
+            flash(str(e), "error")
+            return redirect(url_for("customer_feedback", proposal_id=proposal_id))
+        except Exception as e:
+            flash(f"Email parsing failed: {e}", "error")
+            return redirect(url_for("customer_feedback", proposal_id=proposal_id))
+
+        if not drafts:
+            flash("The AI did not find any revision requests in that email.", "error")
+            return redirect(url_for("customer_feedback", proposal_id=proposal_id))
+
+        for d in drafts:
+            req = RevisionRequest(
+                proposal_id=proposal_id,
+                author_id=current_user.id,
+                source="customer",
+                category=d.get("category", "other"),
+                directive=d["directive"],
+                target_section=d.get("target_section", ""),
+                status="pending",
+            )
+            db.session.add(req)
+            created += 1
+    else:
+        # Manual entry: one directive per row (directives[])
+        directives = request.form.getlist("directive")
+        categories = request.form.getlist("category")
+        sections = request.form.getlist("target_section")
+        for idx, text in enumerate(directives):
+            text = text.strip()
+            if not text:
+                continue
+            cat = categories[idx] if idx < len(categories) else "other"
+            if cat not in {c[0] for c in REVISION_CATEGORIES}:
+                cat = "other"
+            sect = sections[idx] if idx < len(sections) else ""
+            req = RevisionRequest(
+                proposal_id=proposal_id,
+                author_id=current_user.id,
+                source="customer",
+                category=cat,
+                directive=text,
+                target_section=sect[:200],
+                status="pending",
+            )
+            db.session.add(req)
+            created += 1
+
+    if created == 0:
+        flash("No revision requests were created.", "error")
+        return redirect(url_for("customer_feedback", proposal_id=proposal_id))
+
+    # Transition to customer_feedback state
+    try:
+        if proposal.review_status in ("submitted_to_customer", "customer_feedback"):
+            if proposal.review_status == "submitted_to_customer":
+                lifecycle_transition(
+                    proposal, "customer_feedback", current_user.id,
+                    note=f"{created} customer feedback item(s) logged.",
+                )
+    except LifecycleError:
+        pass
+
+    db.session.commit()
+    _log_activity("customer_feedback_log", f"Logged {created} customer feedback item(s)", project.id)
+    flash(
+        f"{created} customer revision request(s) logged. Review and apply them to generate a new version.",
+        "success",
+    )
+    return redirect(url_for("apply_feedback", proposal_id=proposal_id))
+
+
+@app.route("/proposal/<proposal_id>/customer-decision", methods=["POST"])
+@login_required
+def customer_decision(proposal_id):
+    """Owner records the customer's final decision: accepted or declined."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal or not _is_proposal_owner(proposal):
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+
+    decision = request.form.get("decision", "").strip()
+    note = request.form.get("note", "").strip()
+
+    if decision == "accepted":
+        try:
+            lifecycle_transition(proposal, "customer_approved", current_user.id, note=note)
+            lifecycle_transition(proposal, "won", current_user.id, note="Customer accepted.")
+        except LifecycleError as e:
+            flash(str(e), "error")
+            return redirect(url_for("view_proposal", proposal_id=proposal_id))
+        flash("Marked as won. Congratulations!", "success")
+    elif decision == "declined":
+        try:
+            lifecycle_transition(proposal, "customer_declined", current_user.id, note=note)
+            lifecycle_transition(proposal, "lost", current_user.id, note="Customer declined.")
+        except LifecycleError as e:
+            flash(str(e), "error")
+            return redirect(url_for("view_proposal", proposal_id=proposal_id))
+        flash("Marked as lost.", "success")
+    else:
+        flash("Invalid decision.", "error")
+        return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
+    db.session.commit()
+    _log_activity("customer_decision", f"Customer {decision}", project.id)
+    return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
+
+@app.route("/proposal/<proposal_id>/preflight")
+@login_required
+def proposal_preflight(proposal_id):
+    """Run a pre-flight AI sanity check on the latest version. Returns JSON."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal or not _is_proposal_owner(proposal):
+        abort(404)
+
+    version = latest_version(proposal_id)
+    if not version:
+        return {"action_items": [], "warnings": ["No version to check."], "ready": False}
+
+    try:
+        result = preflight_check_proposal(
+            version.markdown_content,
+            user_api_key=current_user.api_key_encrypted or None,
+            user_model=current_user.llm_model or None,
+        )
+    except Exception as e:
+        result = {"action_items": [], "warnings": [f"Pre-flight check error: {e}"], "ready": False}
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Revision Request Templates (user-level presets)
+# ---------------------------------------------------------------------------
+
+
+@app.route("/settings/add-revision-template", methods=["POST"])
+@login_required
+def add_revision_template():
+    name = request.form.get("template_name", "").strip()
+    category = request.form.get("template_category", "other").strip().lower()
+    directive = request.form.get("template_directive", "").strip()
+    description = request.form.get("template_description", "").strip()
+
+    if not name or not directive:
+        flash("Name and directive are required.", "error")
+        return redirect(url_for("settings") + "#revision-templates")
+
+    if category not in {c[0] for c in REVISION_CATEGORIES}:
+        category = "other"
+
+    tmpl = RevisionTemplate(
+        user_id=current_user.id,
+        name=name[:200],
+        category=category,
+        directive_template=directive,
+        description=description,
+    )
+    db.session.add(tmpl)
+    db.session.commit()
+    _log_activity("revision_template_add", f"Added revision template: {name}")
+    flash(f"Revision template '{name}' added.", "success")
+    return redirect(url_for("settings") + "#revision-templates")
+
+
+@app.route("/settings/delete-revision-template/<template_id>", methods=["POST"])
+@login_required
+def delete_revision_template(template_id):
+    tmpl = db.session.get(RevisionTemplate, template_id)
+    if not tmpl or tmpl.user_id != current_user.id:
+        abort(404)
+    name = tmpl.name
+    db.session.delete(tmpl)
+    db.session.commit()
+    _log_activity("revision_template_delete", f"Deleted revision template: {name}")
+    flash(f"Revision template '{name}' deleted.", "success")
+    return redirect(url_for("settings") + "#revision-templates")
 
 
 # ---------------------------------------------------------------------------
