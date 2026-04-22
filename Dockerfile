@@ -2,6 +2,13 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# Prefer IPv4 over IPv6 in getaddrinfo. This host's Docker bridge is IPv4-only
+# (no ip6tables MASQUERADE), so any IPv6 connection attempt fails with
+# ENETUNREACH / EADDRNOTAVAIL and the Anthropic SDK surfaces it as
+# "Connection error." Elevating the v4-mapped-v4 precedence above the default
+# IPv6 precedence makes glibc return A records first so httpx connects over v4.
+RUN printf '\nprecedence ::ffff:0:0/96  100\n' >> /etc/gai.conf
+
 # Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

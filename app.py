@@ -85,6 +85,7 @@ from models import (
 )
 from proposal_agent import (
     analyze_addendum_impact,
+    friendly_api_error,
     generate_proposal,
     parse_customer_email,
     preflight_check_proposal,
@@ -1560,7 +1561,7 @@ def project_generate(project_id):
         flash(str(e), "error")
         return redirect(url_for("project_upload", project_id=project_id))
     except Exception as e:
-        flash(f"An error occurred: {e}", "error")
+        flash(f"Proposal generation failed: {friendly_api_error(e)}", "error")
         return redirect(url_for("project_upload", project_id=project_id))
 
 
@@ -2599,7 +2600,7 @@ def apply_feedback(proposal_id):
         flash(str(e), "error")
         return redirect(url_for("apply_feedback", proposal_id=proposal_id))
     except Exception as e:
-        flash(f"AI revision failed: {e}", "error")
+        flash(f"AI revision failed: {friendly_api_error(e)}", "error")
         return redirect(url_for("apply_feedback", proposal_id=proposal_id))
 
     # Create the new version
@@ -2745,7 +2746,7 @@ def customer_feedback(proposal_id):
             flash(str(e), "error")
             return redirect(url_for("customer_feedback", proposal_id=proposal_id))
         except Exception as e:
-            flash(f"Email parsing failed: {e}", "error")
+            flash(f"Email parsing failed: {friendly_api_error(e)}", "error")
             return redirect(url_for("customer_feedback", proposal_id=proposal_id))
 
         if not drafts:
@@ -2869,7 +2870,11 @@ def proposal_preflight(proposal_id):
             user_model=current_user.llm_model or None,
         )
     except Exception as e:
-        result = {"action_items": [], "warnings": [f"Pre-flight check error: {e}"], "ready": False}
+        result = {
+            "action_items": [],
+            "warnings": [f"Pre-flight check error: {friendly_api_error(e)}"],
+            "ready": False,
+        }
 
     return result
 
@@ -4558,7 +4563,7 @@ def addendum_analysis(project_id):
         flash(f"Addendum analysis complete: {len(result.get('changes', []))} impact(s) identified and added to clarification register.", "success")
 
     except Exception as e:
-        flash(f"Error analyzing addendum: {e}", "error")
+        flash(f"Error analyzing addendum: {friendly_api_error(e)}", "error")
 
     return redirect(url_for("clarification_register", project_id=project_id))
 
@@ -4651,7 +4656,7 @@ def regenerate_proposal_section(proposal_id):
         flash(f"Section '{section_heading}' regenerated and saved as v{next_version}.", "success")
 
     except Exception as e:
-        flash(f"Error regenerating section: {e}", "error")
+        flash(f"Error regenerating section: {friendly_api_error(e)}", "error")
 
     return redirect(url_for("edit_proposal", proposal_id=proposal_id))
 

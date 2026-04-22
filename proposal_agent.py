@@ -33,6 +33,57 @@ from document_parser import (
 )
 
 
+# Generous defaults so slow networks / large proposals don't look like outages.
+_CLIENT_TIMEOUT_SECONDS = 120.0
+_CLIENT_MAX_RETRIES = 3
+
+
+def _make_client(api_key: str) -> anthropic.Anthropic:
+    """Create an Anthropic client with connection-friendly defaults."""
+    return anthropic.Anthropic(
+        api_key=api_key,
+        timeout=_CLIENT_TIMEOUT_SECONDS,
+        max_retries=_CLIENT_MAX_RETRIES,
+    )
+
+
+def friendly_api_error(exc: BaseException) -> str:
+    """Map Anthropic SDK exceptions to actionable user-facing messages."""
+    if isinstance(exc, anthropic.APIConnectionError):
+        return (
+            "Could not reach the Anthropic API (connection error). "
+            "Check that the server has outbound network access to "
+            "api.anthropic.com and that any firewall, proxy, or DNS "
+            "settings allow HTTPS to that host."
+        )
+    if isinstance(exc, anthropic.AuthenticationError):
+        return (
+            "Anthropic rejected the API key. Re-enter your key in "
+            "Settings > Profile & AI."
+        )
+    if isinstance(exc, anthropic.PermissionDeniedError):
+        return (
+            "Your Anthropic account doesn't have access to the requested "
+            "model. Pick a different model in Settings > Profile & AI."
+        )
+    if isinstance(exc, anthropic.NotFoundError):
+        return (
+            "The selected AI model is not available. Choose a different "
+            "model in Settings > Profile & AI."
+        )
+    if isinstance(exc, anthropic.RateLimitError):
+        return (
+            "Anthropic API rate limit hit. Wait a minute and try again, "
+            "or lower the request volume."
+        )
+    if isinstance(exc, anthropic.APIStatusError):
+        return (
+            f"Anthropic API error (status {exc.status_code}): "
+            f"{getattr(exc, 'message', str(exc))}"
+        )
+    return str(exc) or exc.__class__.__name__
+
+
 def _build_system_prompt(vertical_key: str, vertical_resources: dict,
                          global_templates: dict[str, str],
                          global_references: dict[str, list[str]],
@@ -450,7 +501,7 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
             qa_block += f"\nQ: {qa['question']}\nA: {qa['answer']}\n"
         user_message += qa_block
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = _make_client(api_key)
 
     proposal_text = ""
     with client.messages.stream(
@@ -631,7 +682,7 @@ Your response MUST contain exactly two sections separated by the marker
 Return the revised proposal followed by the =====CHANGE_LOG===== marker and the JSON change log.
 """
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = _make_client(api_key)
 
     full_text = ""
     with client.messages.stream(
@@ -734,7 +785,7 @@ Rules:
 - Aim for 1-10 requests per email; combine near-duplicates.
 """
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = _make_client(api_key)
 
     response_text = ""
     with client.messages.stream(
@@ -810,7 +861,7 @@ def preflight_check_proposal(markdown_content: str,
     model = user_model or CLAUDE_MODEL
     if api_key:
         try:
-            client = anthropic.Anthropic(api_key=api_key)
+            client = _make_client(api_key)
             system_prompt = (
                 "You are a proposal quality reviewer. Look at this proposal and "
                 "identify any issues that could embarrass the sender if submitted "
@@ -839,9 +890,10 @@ def preflight_check_proposal(markdown_content: str,
                                 warnings.append(w.strip())
                 except (json.JSONDecodeError, ValueError):
                     pass
-        except Exception:
-            # Never fail pre-flight on API error — degrade gracefully.
-            pass
+        except Exception as e:
+            # Don't fail pre-flight, but make the failure visible so users
+            # aren't told "all clear" when the AI review never actually ran.
+            warnings.append(f"AI review could not run — {friendly_api_error(e)}")
 
     return {
         "action_items": action_items,
@@ -1014,7 +1066,7 @@ of an existing proposal based on new clarification information.
 Output ONLY the revised section in markdown, starting with the section heading.
 """
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = _make_client(api_key)
     result_text = ""
     with client.messages.stream(
         model=model,
@@ -1106,7 +1158,7 @@ Return a JSON object with this structure:
 Return your analysis as the JSON object described in the instructions.
 """
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = _make_client(api_key)
     result_text = ""
     with client.messages.stream(
         model=model,
