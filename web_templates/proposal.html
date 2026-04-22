@@ -3,6 +3,22 @@
 {% block title %}Proposal &mdash; {{ meta.source_file }}{% endblock %}
 
 {% block content %}
+
+{% if linked_sow %}
+<div class="card" style="border-left:4px solid {% if sow_stale %}#f59e0b{% else %}#10b981{% endif %};background:{% if sow_stale %}#fef3c7{% else %}#ecfdf5{% endif %};">
+    {% if sow_stale %}
+    <strong>SOW has changed since this proposal was generated.</strong>
+    Regenerate the proposal to resync with the latest Scope of Work.
+    {% else %}
+    <strong>Generated from approved Scope of Work.</strong>
+    {% endif %}
+    <a href="{{ url_for('sow_edit', project_id=project.id) }}" style="margin-left:8px;">View SOW</a>
+    {% if proposal.include_sow_in_deliverable %}
+    &middot; <span style="color:#065f46;">SOW &amp; assumptions included in customer deliverable</span>
+    {% endif %}
+</div>
+{% endif %}
+
 <section class="proposal-header">
     <div class="proposal-meta">
         <h1>Generated Proposal</h1>
@@ -177,6 +193,18 @@
         {{ proposal_html|safe }}
     </div>
 </section>
+
+{% if sow_included_html %}
+<section class="proposal-content">
+    <div class="card">
+        <h2>Scope of Work (included in deliverable)</h2>
+        <p class="card-desc">This content will be appended to the proposal when the customer deliverable is downloaded.</p>
+        <div class="proposal-body">
+            {{ sow_included_html|safe }}
+        </div>
+    </div>
+</section>
+{% endif %}
 
 <!-- Review Comments -->
 <section class="comments-section">

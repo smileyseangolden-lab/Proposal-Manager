@@ -75,6 +75,8 @@ from models import (
     ReviewCycle,
     RevisionRequest,
     RevisionTemplate,
+    ScopeOfWork,
+    ScopeOfWorkVersion,
     StaffRole,
     TravelExpenseRate,
     User,
@@ -85,13 +87,18 @@ from models import (
 )
 from proposal_agent import (
     analyze_addendum_impact,
+    assemble_sow_markdown,
     friendly_api_error,
     generate_proposal,
+    generate_sow,
     parse_customer_email,
     preflight_check_proposal,
     regenerate_section,
     revise_proposal,
+    sow_items_to_markdown,
+    sow_markdown_to_items,
 )
+from drawing_ingest import load_drawing_images
 from proposal_export import (
     markdown_to_docx,
     markdown_to_redline_docx,
@@ -261,6 +268,19 @@ with app.app_context():
             if "resolution_path" not in _pq_cols:
                 _cur.execute('ALTER TABLE proposal_questions ADD COLUMN resolution_path VARCHAR(20) DEFAULT "internal"')
                 _conn.commit()
+
+            # Migrate proposals table to add SOW link columns
+            _cur.execute("PRAGMA table_info(proposals)")
+            _prop_cols2 = {row[1] for row in _cur.fetchall()}
+            _proposal_sow_migrations = [
+                ("sow_id", 'ALTER TABLE proposals ADD COLUMN sow_id VARCHAR(32) DEFAULT NULL'),
+                ("sow_version_id", 'ALTER TABLE proposals ADD COLUMN sow_version_id VARCHAR(32) DEFAULT NULL'),
+                ("include_sow_in_deliverable", 'ALTER TABLE proposals ADD COLUMN include_sow_in_deliverable BOOLEAN DEFAULT 0'),
+            ]
+            for _col, _sql in _proposal_sow_migrations:
+                if _col not in _prop_cols2:
+                    _cur.execute(_sql)
+            _conn.commit()
 
             _conn.close()
         finally:
@@ -1260,6 +1280,16 @@ def project_upload(project_id):
         is_company_default=True
     ).first() is not None
 
+    sow = project.sow
+    drawing_doc_count = sum(1 for d in documents if d.file_type == "drawing")
+    sow_in_scope_count = 0
+    sow_out_of_scope_count = 0
+    sow_assumptions_count = 0
+    if sow:
+        sow_in_scope_count = len(sow_markdown_to_items(sow.in_scope_md))
+        sow_out_of_scope_count = len(sow_markdown_to_items(sow.out_of_scope_md))
+        sow_assumptions_count = len(sow_markdown_to_items(sow.assumptions_md))
+
     return render_template(
         "project_upload.html",
         project=project,
@@ -1273,6 +1303,11 @@ def project_upload(project_id):
         travel_rate_count=travel_rate_count,
         has_user_template=has_user_template,
         has_company_template=has_company_template,
+        sow=sow,
+        drawing_doc_count=drawing_doc_count,
+        sow_in_scope_count=sow_in_scope_count,
+        sow_out_of_scope_count=sow_out_of_scope_count,
+        sow_assumptions_count=sow_assumptions_count,
     )
 
 
@@ -1285,6 +1320,20 @@ def project_generate(project_id):
 
     vertical = request.form.get("vertical", "auto")
     output_format = request.form.get("output_format", "docx")
+    # Explicit opt-in from the UI to bypass an existing SOW entirely.
+    ignore_sow = request.form.get("ignore_sow") == "1"
+    include_sow_in_deliverable = request.form.get("include_sow_in_deliverable") == "1"
+
+    # SOW integration: block if a draft SOW exists and the user didn't opt
+    # to ignore it. An approved SOW is consumed as a locked input below.
+    sow = project.sow
+    if sow and sow.status == "draft" and not ignore_sow:
+        flash(
+            "This project has a draft Scope of Work. Approve it, delete it, or "
+            "choose 'Generate proposal ignoring SOW' before proceeding.",
+            "error",
+        )
+        return redirect(url_for("project_upload", project_id=project_id))
 
     project.output_format = output_format
     db.session.commit()
@@ -1432,6 +1481,26 @@ def project_generate(project_id):
             for s in standards
         ]
 
+    # If an approved SOW exists and the user didn't opt to ignore it, inject
+    # it as a locked input and record which SOW version drove this proposal.
+    approved_sow_text = ""
+    linked_sow_id = None
+    linked_sow_version_id = None
+    if sow and sow.status == "approved" and not ignore_sow:
+        approved_sow_text = assemble_sow_markdown(
+            sow.in_scope_md, sow.out_of_scope_md, sow.assumptions_md
+        )
+        latest_sow_version = (
+            ScopeOfWorkVersion.query.filter_by(sow_id=sow.id)
+            .order_by(ScopeOfWorkVersion.version_number.desc())
+            .first()
+        )
+        linked_sow_id = sow.id
+        linked_sow_version_id = latest_sow_version.id if latest_sow_version else None
+        # Prefer the SOW's vertical when one was set and the user left vertical on auto.
+        if vertical == "auto" and sow.vertical:
+            vertical = sow.vertical
+
     try:
         result = generate_proposal(
             combined_text,
@@ -1447,6 +1516,7 @@ def project_generate(project_id):
             travel_data=travel_data,
             past_corrections=corrections_data,
             company_standards=company_standards_data,
+            approved_sow=approved_sow_text,
         )
 
         # Check if the agent has questions
@@ -1514,6 +1584,9 @@ def project_generate(project_id):
             docx_file=docx_filename,
             pdf_file=pdf_filename,
             review_status="draft",
+            sow_id=linked_sow_id,
+            sow_version_id=linked_sow_version_id,
+            include_sow_in_deliverable=include_sow_in_deliverable and bool(linked_sow_id),
         )
         db.session.add(proposal)
         db.session.flush()  # Get proposal.id before commit
@@ -1563,6 +1636,421 @@ def project_generate(project_id):
     except Exception as e:
         flash(f"Proposal generation failed: {friendly_api_error(e)}", "error")
         return redirect(url_for("project_upload", project_id=project_id))
+
+
+# ---------------------------------------------------------------------------
+# Scope of Work (optional pre-proposal stage)
+# ---------------------------------------------------------------------------
+
+
+def _can_approve_sow(project) -> bool:
+    """Project owner or any admin may approve a SOW."""
+    if not project:
+        return False
+    if current_user.is_admin or getattr(current_user, "role", "") == "admin":
+        return True
+    return project.user_id == current_user.id
+
+
+def _latest_sow_version(sow_id):
+    return (
+        ScopeOfWorkVersion.query.filter_by(sow_id=sow_id)
+        .order_by(ScopeOfWorkVersion.version_number.desc())
+        .first()
+    )
+
+
+def _next_sow_version_number(sow_id) -> int:
+    latest = _latest_sow_version(sow_id)
+    return (latest.version_number + 1) if latest else 1
+
+
+def _snapshot_sow_version(sow, edit_source: str, editor_id=None, change_summary: str = ""):
+    """Create a ScopeOfWorkVersion snapshot of the current SOW contents."""
+    v = ScopeOfWorkVersion(
+        sow_id=sow.id,
+        version_number=_next_sow_version_number(sow.id),
+        in_scope_md=sow.in_scope_md or "",
+        out_of_scope_md=sow.out_of_scope_md or "",
+        assumptions_md=sow.assumptions_md or "",
+        edit_source=edit_source,
+        editor_id=editor_id,
+        change_summary=change_summary,
+    )
+    db.session.add(v)
+    return v
+
+
+def _collect_company_context_for_sow():
+    """Load settings-derived company context for SOW generation."""
+    staff_roles = StaffRole.query.filter_by(user_id=current_user.id, is_active=True).all()
+    staff_roles_data = [
+        {
+            "role_name": r.role_name,
+            "category": r.category,
+            "hourly_rate": r.hourly_rate,
+            "overtime_rate": r.overtime_rate,
+            "description": r.description,
+        }
+        for r in staff_roles
+    ] or None
+
+    equipment = EquipmentItem.query.filter_by(user_id=current_user.id, is_active=True).all()
+    equipment_data = [
+        {
+            "item_name": e.item_name,
+            "category": e.category,
+            "part_number": e.part_number,
+            "manufacturer": e.manufacturer,
+            "unit_cost": e.unit_cost,
+            "unit": e.unit,
+            "description": e.description,
+        }
+        for e in equipment
+    ] or None
+
+    travel = TravelExpenseRate.query.filter_by(user_id=current_user.id, is_active=True).all()
+    travel_data = [
+        {
+            "expense_type": t.expense_type,
+            "rate": t.rate,
+            "unit": t.unit,
+            "description": t.description,
+        }
+        for t in travel
+    ] or None
+
+    standards = CompanyStandard.query.filter_by(user_id=current_user.id, is_active=True).all()
+    company_standards_data = [
+        {"category": s.category, "title": s.title, "content": s.content}
+        for s in standards
+    ] or None
+
+    rate_sheet_data = None
+    active_sheets = UserRateSheet.query.filter_by(user_id=current_user.id, is_active=True).all()
+    if active_sheets:
+        rate_sheet_data = {}
+        for sheet in active_sheets:
+            try:
+                rate_sheet_data[sheet.sheet_type] = parse_rate_sheet(sheet.file_path)
+            except Exception:
+                continue
+
+    return {
+        "staff_roles_data": staff_roles_data,
+        "equipment_data": equipment_data,
+        "travel_data": travel_data,
+        "company_standards": company_standards_data,
+        "rate_sheet_data": rate_sheet_data,
+    }
+
+
+def _load_project_vertical_templates(vertical: str):
+    """Mirror of project_generate's template loading, simpler for SOW use."""
+    user_templates = {}
+    user_tmpls = UserVerticalTemplate.query.filter_by(
+        user_id=current_user.id, vertical=vertical, is_company_default=False
+    ).all()
+    for t in user_tmpls:
+        try:
+            user_templates[t.template_type] = parse_document(t.file_path)
+        except Exception:
+            continue
+    co_tmpls = UserVerticalTemplate.query.filter_by(
+        vertical=vertical, is_company_default=True
+    ).all()
+    for t in co_tmpls:
+        if t.template_type not in user_templates:
+            try:
+                user_templates[t.template_type] = parse_document(t.file_path)
+            except Exception:
+                continue
+    return user_templates or None
+
+
+@app.route("/projects/<project_id>/sow/generate", methods=["POST"])
+@login_required
+def sow_generate(project_id):
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    if project.sow and project.sow.status == "approved" and project.sow.locked:
+        flash("Scope of Work is already approved. Reopen it to regenerate.", "error")
+        return redirect(url_for("sow_edit", project_id=project_id))
+
+    vertical = request.form.get("vertical", "auto")
+    scan_drawings = request.form.get("scan_drawings", "1") == "1"
+
+    documents = ProjectDocument.query.filter_by(project_id=project_id).all()
+    source_docs = [d for d in documents if d.file_type in ("rfp", "supporting")]
+    if not source_docs:
+        flash("Upload at least one RFP or supporting document first.", "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    combined_text = ""
+    for doc in source_docs:
+        try:
+            text = parse_document(doc.file_path)
+            combined_text += f"\n\n--- Document: {doc.original_filename} ---\n\n{text}"
+        except Exception:
+            continue
+    if not combined_text.strip():
+        flash("Could not extract text from the uploaded documents.", "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    drawing_images: list = []
+    drawings_truncated = False
+    if scan_drawings:
+        drawing_paths = [d.file_path for d in documents if d.file_type == "drawing"]
+        if drawing_paths:
+            drawing_images, drawings_truncated = load_drawing_images(drawing_paths)
+
+    context = _collect_company_context_for_sow()
+    user_templates = _load_project_vertical_templates(
+        vertical if vertical != "auto" else project.vertical or "general"
+    )
+
+    try:
+        result = generate_sow(
+            combined_text,
+            vertical=vertical,
+            company_name=current_user.company_name,
+            user_api_key=current_user.api_key_encrypted or None,
+            user_model=current_user.llm_model or None,
+            company_standards=context["company_standards"],
+            staff_roles_data=context["staff_roles_data"],
+            equipment_data=context["equipment_data"],
+            travel_data=context["travel_data"],
+            user_templates=user_templates,
+            rate_sheet_data=context["rate_sheet_data"],
+            drawing_images=drawing_images,
+        )
+    except RuntimeError as e:
+        flash(str(e), "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+    except Exception as e:
+        flash(f"SOW generation failed: {friendly_api_error(e)}", "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    in_scope_md = sow_items_to_markdown(result["in_scope"])
+    out_of_scope_md = sow_items_to_markdown(result["out_of_scope"])
+    assumptions_md = sow_items_to_markdown(result["assumptions"], include_ref=False)
+
+    sow = project.sow
+    if sow is None:
+        sow = ScopeOfWork(
+            project_id=project_id,
+            created_by_user_id=current_user.id,
+            status="draft",
+            locked=False,
+        )
+        db.session.add(sow)
+        db.session.flush()
+
+    # If previously approved, regenerating reopens it as draft (explicit action
+    # already required upstream — sow_reopen would be the normal path).
+    sow.status = "draft"
+    sow.locked = False
+    sow.approved_at = None
+    sow.approved_by_user_id = None
+
+    sow.in_scope_md = in_scope_md
+    sow.out_of_scope_md = out_of_scope_md
+    sow.assumptions_md = assumptions_md
+    sow.source_ai_raw = result.get("raw", "")
+    sow.ai_model = result.get("model", "")
+    sow.vertical = result.get("vertical", "general")
+    sow.vertical_label = result.get("vertical_label", "General")
+    sow.drawings_scanned = bool(drawing_images)
+    sow.drawings_scanned_count = len(drawing_images)
+    sow.generated_at = datetime.now(timezone.utc)
+
+    _snapshot_sow_version(sow, edit_source="ai", editor_id=current_user.id,
+                          change_summary="AI-generated")
+    db.session.commit()
+
+    _log_activity(
+        "sow_generated",
+        f"Generated SOW ({sow.vertical_label}) with {len(result['in_scope'])} in-scope items",
+        project_id,
+    )
+
+    if drawings_truncated:
+        flash(
+            f"SOW generated. Only the first {len(drawing_images)} drawing page(s) "
+            "were sent to the model — the rest were skipped to control cost.",
+            "info",
+        )
+    else:
+        flash("Scope of Work generated. Review, edit, and approve before generating the proposal.", "success")
+    return redirect(url_for("sow_edit", project_id=project_id))
+
+
+@app.route("/projects/<project_id>/sow", methods=["GET"])
+@login_required
+def sow_edit(project_id):
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    sow = project.sow
+    if not sow:
+        flash("No Scope of Work exists yet for this project.", "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    documents = ProjectDocument.query.filter_by(project_id=project_id).all()
+    source_docs = [d for d in documents if d.file_type in ("rfp", "supporting", "drawing")]
+    versions = (
+        ScopeOfWorkVersion.query.filter_by(sow_id=sow.id)
+        .order_by(ScopeOfWorkVersion.version_number.desc())
+        .all()
+    )
+    return render_template(
+        "sow_edit.html",
+        project=project,
+        sow=sow,
+        source_docs=source_docs,
+        versions=versions,
+        can_approve=_can_approve_sow(project),
+        verticals=VERTICALS,
+    )
+
+
+@app.route("/projects/<project_id>/sow/save", methods=["POST"])
+@login_required
+def sow_save(project_id):
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    sow = project.sow
+    if not sow:
+        abort(404)
+    if sow.status == "approved" and sow.locked:
+        flash("SOW is approved and locked. Reopen it to edit.", "error")
+        return redirect(url_for("sow_edit", project_id=project_id))
+
+    sow.in_scope_md = request.form.get("in_scope_md", "").strip()
+    sow.out_of_scope_md = request.form.get("out_of_scope_md", "").strip()
+    sow.assumptions_md = request.form.get("assumptions_md", "").strip()
+    _snapshot_sow_version(sow, edit_source="human", editor_id=current_user.id,
+                          change_summary="Edited by user")
+    db.session.commit()
+    _log_activity("sow_saved", "Saved SOW edits", project_id)
+    flash("Scope of Work saved.", "success")
+    return redirect(url_for("sow_edit", project_id=project_id))
+
+
+@app.route("/projects/<project_id>/sow/approve", methods=["POST"])
+@login_required
+def sow_approve(project_id):
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    sow = project.sow
+    if not sow:
+        abort(404)
+    if not _can_approve_sow(project):
+        flash("Only the project owner or an admin can approve this SOW.", "error")
+        return redirect(url_for("sow_edit", project_id=project_id))
+    if not (sow.in_scope_md or sow.out_of_scope_md or sow.assumptions_md):
+        flash("Cannot approve an empty SOW.", "error")
+        return redirect(url_for("sow_edit", project_id=project_id))
+
+    sow.status = "approved"
+    sow.locked = True
+    sow.approved_at = datetime.now(timezone.utc)
+    sow.approved_by_user_id = current_user.id
+    db.session.commit()
+    who = "admin" if (current_user.is_admin and current_user.id != project.user_id) else "owner"
+    _log_activity("sow_approved", f"SOW approved by {who}", project_id)
+    if current_user.id != project.user_id:
+        _notify(
+            project.user_id, "sow_approved",
+            f"SOW approved for {project.name}",
+            f"{current_user.display_name or current_user.username} approved the Scope of Work for '{project.name}'.",
+            link=url_for("sow_edit", project_id=project_id),
+        )
+    flash("Scope of Work approved and locked. You can now generate the proposal.", "success")
+    return redirect(url_for("sow_edit", project_id=project_id))
+
+
+@app.route("/projects/<project_id>/sow/reopen", methods=["POST"])
+@login_required
+def sow_reopen(project_id):
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    sow = project.sow
+    if not sow:
+        abort(404)
+    if not _can_approve_sow(project):
+        flash("Only the project owner or an admin can reopen this SOW.", "error")
+        return redirect(url_for("sow_edit", project_id=project_id))
+
+    sow.status = "draft"
+    sow.locked = False
+    # Keep approved_at/by for history; clear locks only.
+    db.session.commit()
+    _log_activity("sow_reopened", "SOW reopened for editing", project_id)
+    flash("Scope of Work reopened. Any existing proposals generated from this SOW may now be out of sync.", "info")
+    return redirect(url_for("sow_edit", project_id=project_id))
+
+
+@app.route("/projects/<project_id>/sow/delete", methods=["POST"])
+@login_required
+def sow_delete(project_id):
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    sow = project.sow
+    if not sow:
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    # Null out references on any proposals that were linked to this SOW so
+    # historical records don't break; they keep include_sow_in_deliverable=False.
+    Proposal.query.filter_by(project_id=project_id, sow_id=sow.id).update(
+        {"sow_id": None, "sow_version_id": None, "include_sow_in_deliverable": False}
+    )
+    ScopeOfWorkVersion.query.filter_by(sow_id=sow.id).delete()
+    db.session.delete(sow)
+    db.session.commit()
+    _log_activity("sow_deleted", "SOW deleted", project_id)
+    flash("Scope of Work deleted. The project will use the direct proposal path.", "success")
+    return redirect(url_for("project_upload", project_id=project_id))
+
+
+@app.route("/projects/<project_id>/sow/download")
+@login_required
+def sow_download(project_id):
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    sow = project.sow
+    if not sow:
+        abort(404)
+
+    md_text = assemble_sow_markdown(sow.in_scope_md, sow.out_of_scope_md, sow.assumptions_md)
+    fmt = request.args.get("fmt", "docx")
+    if fmt == "md":
+        from io import BytesIO
+        buf = BytesIO(md_text.encode("utf-8"))
+        return send_file(
+            buf, mimetype="text/markdown", as_attachment=True,
+            download_name=f"sow_{secure_filename(project.name)}.md",
+        )
+
+    # DOCX via the same renderer the proposal uses.
+    brand_user = project.owner or current_user
+    GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+    docx_filename = f"sow_{project_id}_{uuid.uuid4().hex[:6]}.docx"
+    docx_path = GENERATED_DIR / docx_filename
+    markdown_to_docx(md_text, str(docx_path), **_logo_docx_kwargs(brand_user))
+    return send_file(
+        str(docx_path),
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        as_attachment=True,
+        download_name=f"sow_{secure_filename(project.name)}.docx",
+    )
 
 
 @app.route("/projects/<project_id>/questions", methods=["GET", "POST"])
@@ -1779,6 +2267,27 @@ def view_proposal(proposal_id):
         proposal_id=proposal_id
     ).order_by(ProposalStatusHistory.created_at.desc()).limit(10).all()
 
+    # SOW context: is this proposal linked to a SOW, and is it stale?
+    linked_sow = project.sow if (project and proposal.sow_id and project.sow and project.sow.id == proposal.sow_id) else None
+    sow_stale = False
+    if linked_sow:
+        latest_v = _latest_sow_version(linked_sow.id)
+        latest_version_id = latest_v.id if latest_v else None
+        sow_stale = (
+            linked_sow.status != "approved"
+            or (latest_version_id and latest_version_id != proposal.sow_version_id)
+        )
+    sow_included_html = ""
+    if proposal.include_sow_in_deliverable and linked_sow:
+        sow_included_html = md.markdown(
+            assemble_sow_markdown(
+                linked_sow.in_scope_md,
+                linked_sow.out_of_scope_md,
+                linked_sow.assumptions_md,
+            ),
+            extensions=["tables", "fenced_code"],
+        )
+
     return render_template(
         "proposal.html",
         meta=meta,
@@ -1795,6 +2304,9 @@ def view_proposal(proposal_id):
         my_reviewer=my_reviewer,
         status_history=status_history,
         lifecycle_labels=LIFECYCLE_LABELS,
+        linked_sow=linked_sow,
+        sow_stale=sow_stale,
+        sow_included_html=sow_included_html,
     )
 
 
@@ -1810,10 +2322,56 @@ def download(proposal_id, fmt):
     if not project or (project.user_id != current_user.id and not current_user.is_admin):
         abort(404)
 
+    # If the proposal was marked to include the SOW in the deliverable, render
+    # a one-off bundle that appends the SOW (with assumptions) to the proposal.
+    sow = project.sow if project else None
+    bundle_with_sow = (
+        proposal.include_sow_in_deliverable
+        and proposal.sow_id
+        and sow
+        and sow.id == proposal.sow_id
+    )
+
     if fmt == "docx":
+        if bundle_with_sow:
+            proposal_md_path = GENERATED_DIR / proposal.md_file
+            if not proposal_md_path.exists():
+                flash("Proposal file not found.", "error")
+                return redirect(url_for("view_proposal", proposal_id=proposal_id))
+            combined = (
+                proposal_md_path.read_text(encoding="utf-8")
+                + "\n\n---\n\n"
+                + assemble_sow_markdown(sow.in_scope_md, sow.out_of_scope_md, sow.assumptions_md)
+            )
+            bundle_name = f"proposal_with_sow_{proposal.id[:8]}.docx"
+            bundle_path = GENERATED_DIR / bundle_name
+            brand_user = project.owner or current_user
+            markdown_to_docx(combined, str(bundle_path), **_logo_docx_kwargs(brand_user))
+            return send_file(
+                str(bundle_path),
+                mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                as_attachment=True,
+                download_name=bundle_name,
+            )
         file_path = GENERATED_DIR / proposal.docx_file
         mimetype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     elif fmt == "md":
+        if bundle_with_sow:
+            proposal_md_path = GENERATED_DIR / proposal.md_file
+            if not proposal_md_path.exists():
+                flash("Proposal file not found.", "error")
+                return redirect(url_for("view_proposal", proposal_id=proposal_id))
+            from io import BytesIO
+            combined = (
+                proposal_md_path.read_text(encoding="utf-8")
+                + "\n\n---\n\n"
+                + assemble_sow_markdown(sow.in_scope_md, sow.out_of_scope_md, sow.assumptions_md)
+            )
+            buf = BytesIO(combined.encode("utf-8"))
+            return send_file(
+                buf, mimetype="text/markdown", as_attachment=True,
+                download_name=f"proposal_with_sow_{proposal.id[:8]}.md",
+            )
         file_path = GENERATED_DIR / proposal.md_file
         mimetype = "text/markdown"
     else:

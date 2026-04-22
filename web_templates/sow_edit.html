@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+
+{% block title %}Scope of Work &mdash; {{ project.name }}{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <div class="page-header-row">
+        <div>
+            <h1>Scope of Work</h1>
+            <p class="page-subtitle">
+                {{ project.name }} &mdash;
+                {% if sow.status == 'approved' %}
+                <span class="badge" style="background:#10b981;color:white;">Approved &amp; Locked</span>
+                {% else %}
+                <span class="badge" style="background:#f59e0b;color:white;">Draft</span>
+                {% endif %}
+                {% if sow.vertical_label %}
+                &middot; {{ sow.vertical_label }}
+                {% endif %}
+            </p>
+        </div>
+        <div class="header-actions">
+            <a href="{{ url_for('project_upload', project_id=project.id) }}" class="btn btn-small btn-secondary">&larr; Back to project</a>
+            <a href="{{ url_for('sow_download', project_id=project.id, fmt='docx') }}" class="btn btn-small btn-secondary">Download DOCX</a>
+            <a href="{{ url_for('sow_download', project_id=project.id, fmt='md') }}" class="btn btn-small btn-secondary">Download MD</a>
+        </div>
+    </div>
+</section>
+
+{% if sow.status == 'approved' %}
+<div class="card" style="border-left:4px solid #10b981;background:#ecfdf5;">
+    <strong>This Scope of Work is approved and locked.</strong>
+    {% if sow.approved_by %}
+    Approved by {{ sow.approved_by.display_name or sow.approved_by.username }}
+    {% if sow.approved_at %}on {{ sow.approved_at.strftime('%Y-%m-%d %H:%M') }}{% endif %}.
+    {% endif %}
+    The proposal generator will treat it as authoritative.
+    {% if can_approve %}
+    <form method="post" action="{{ url_for('sow_reopen', project_id=project.id) }}" style="display:inline;margin-left:12px;"
+          onsubmit="return confirm('Reopen this SOW? Any proposal generated from it will be flagged as out of sync.');">
+        <button type="submit" class="btn btn-small btn-secondary">Reopen for editing</button>
+    </form>
+    {% endif %}
+</div>
+{% endif %}
+
+<div style="display:grid;grid-template-columns:1fr 280px;gap:16px;align-items:start;">
+
+<div>
+<form method="post" action="{{ url_for('sow_save', project_id=project.id) }}" id="sow-form">
+
+<div class="card">
+    <h2>In Scope</h2>
+    <p class="card-desc">Work this company will perform. Each line is one deliverable. Include an RFP/reference note in <code>(ref: ...)</code> if useful.</p>
+    <textarea name="in_scope_md" rows="14" style="width:100%;font-family:monospace;"
+              {% if sow.status == 'approved' %}readonly{% endif %}>{{ sow.in_scope_md }}</textarea>
+</div>
+
+<div class="card">
+    <h2>Out of Scope</h2>
+    <p class="card-desc">Work explicitly NOT being performed, including items that belong to other contractors, integrators, or trades.</p>
+    <textarea name="out_of_scope_md" rows="10" style="width:100%;font-family:monospace;"
+              {% if sow.status == 'approved' %}readonly{% endif %}>{{ sow.out_of_scope_md }}</textarea>
+</div>
+
+<div class="card">
+    <h2>Assumptions</h2>
+    <p class="card-desc">Conditions, dependencies, and clarifications this SOW is built on. These will be included when the SOW is added to the customer deliverable.</p>
+    <textarea name="assumptions_md" rows="10" style="width:100%;font-family:monospace;"
+              {% if sow.status == 'approved' %}readonly{% endif %}>{{ sow.assumptions_md }}</textarea>
+</div>
+
+{% if sow.status != 'approved' %}
+<div class="card">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button type="submit" class="btn btn-primary">Save Draft</button>
+        <button type="submit" formaction="{{ url_for('sow_generate', project_id=project.id) }}"
+                formmethod="post" class="btn btn-secondary"
+                onclick="return confirm('Regenerate with AI? Your unsaved edits will be lost.');">
+            Regenerate with AI
+        </button>
+        {% if can_approve %}
+        <button type="submit" formaction="{{ url_for('sow_approve', project_id=project.id) }}"
+                formmethod="post" class="btn btn-primary"
+                style="background:#10b981;border-color:#10b981;"
+                onclick="return confirm('Approve and lock this SOW? The proposal generator will treat it as authoritative.');">
+            Approve &amp; Lock
+        </button>
+        {% endif %}
+        <form method="post" action="{{ url_for('sow_delete', project_id=project.id) }}" style="display:inline;"
+              onsubmit="return confirm('Delete the Scope of Work? The project will revert to the direct proposal path.');">
+            <button type="submit" class="btn btn-small btn-secondary">Delete SOW</button>
+        </form>
+    </div>
+</div>
+{% endif %}
+
+</form>
+</div>
+
+<aside>
+<div class="card">
+    <h3 style="margin-top:0;">Source Documents</h3>
+    {% if source_docs %}
+    <ul style="padding-left:18px;margin:0;">
+        {% for d in source_docs %}
+        <li>
+            <span class="badge badge-doc-{{ d.file_type }}">{{ d.file_type }}</span>
+            {{ d.original_filename }}
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p class="card-desc">No source documents uploaded.</p>
+    {% endif %}
+    {% if sow.drawings_scanned and sow.drawings_scanned_count %}
+    <p class="form-hint" style="margin-top:8px;">{{ sow.drawings_scanned_count }} drawing page(s) scanned with vision.</p>
+    {% endif %}
+</div>
+
+<div class="card">
+    <h3 style="margin-top:0;">Version History</h3>
+    {% if versions %}
+    <ul style="padding-left:18px;margin:0;font-size:0.9em;">
+        {% for v in versions %}
+        <li>
+            v{{ v.version_number }} &middot; {{ v.edit_source }} &middot;
+            {{ v.created_at.strftime('%Y-%m-%d %H:%M') }}
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p class="card-desc">No versions yet.</p>
+    {% endif %}
+</div>
+</aside>
+
+</div>
+{% endblock %}

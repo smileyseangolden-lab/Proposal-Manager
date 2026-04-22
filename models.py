@@ -147,6 +147,13 @@ class Proposal(db.Model):
     review_status = db.Column(db.String(40), default="draft")
     review_deadline = db.Column(db.DateTime, nullable=True)
 
+    # Optional link to the approved Scope of Work that drove this proposal.
+    # NULL when the user skipped the SOW step (legacy direct-to-proposal path).
+    # SET NULL cascade so deleting a SOW never corrupts proposal history.
+    sow_id = db.Column(db.String(32), db.ForeignKey("scopes_of_work.id", ondelete="SET NULL"), nullable=True)
+    sow_version_id = db.Column(db.String(32), db.ForeignKey("scope_of_work_versions.id", ondelete="SET NULL"), nullable=True)
+    include_sow_in_deliverable = db.Column(db.Boolean, default=False)
+
 
 class ProposalQuestion(db.Model):
     """Questions the AI asks the user during proposal generation."""
@@ -633,3 +640,78 @@ class RevisionTemplate(db.Model):
     created_at = db.Column(db.DateTime, default=_utcnow)
 
     user = db.relationship("User", backref="revision_templates")
+
+
+# ---------------------------------------------------------------------------
+# Scope of Work (optional pre-proposal stage)
+# ---------------------------------------------------------------------------
+
+
+class ScopeOfWork(db.Model):
+    """Optional SOW generated from RFP + company context before a proposal.
+
+    One-to-one with Project (enforced by unique project_id). Users may skip
+    the SOW entirely and go straight to proposal generation; when present
+    and status='approved' the SOW becomes a locked input to the proposal.
+    """
+    __tablename__ = "scopes_of_work"
+    __table_args__ = (
+        db.UniqueConstraint("project_id", name="uq_sow_project"),
+    )
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    project_id = db.Column(db.String(32), db.ForeignKey("projects.id"), nullable=False)
+    created_by_user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+
+    status = db.Column(db.String(20), default="draft")  # draft, approved
+    locked = db.Column(db.Boolean, default=False)
+
+    # Three editable sections; persisted as markdown bullet lists.
+    in_scope_md = db.Column(db.Text, default="")
+    out_of_scope_md = db.Column(db.Text, default="")
+    assumptions_md = db.Column(db.Text, default="")
+
+    # Unparsed AI response for debugging / re-show.
+    source_ai_raw = db.Column(db.Text, default="")
+    # Optional JSON mapping of scope items to RFP snippets/filenames.
+    rfp_citations_json = db.Column(db.Text, default="")
+
+    ai_model = db.Column(db.String(100), default="")
+    vertical = db.Column(db.String(50), default="general")
+    vertical_label = db.Column(db.String(100), default="General")
+    drawings_scanned = db.Column(db.Boolean, default=False)
+    drawings_scanned_count = db.Column(db.Integer, default=0)
+
+    generated_at = db.Column(db.DateTime, default=_utcnow)
+    approved_at = db.Column(db.DateTime, nullable=True)
+    approved_by_user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    created_at = db.Column(db.DateTime, default=_utcnow)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow)
+
+    project = db.relationship("Project", backref=db.backref("sow", uselist=False))
+    created_by = db.relationship("User", foreign_keys=[created_by_user_id])
+    approved_by = db.relationship("User", foreign_keys=[approved_by_user_id])
+
+
+class ScopeOfWorkVersion(db.Model):
+    """Version history for a SOW. Each AI generation or human save = new version."""
+    __tablename__ = "scope_of_work_versions"
+    __table_args__ = (
+        db.UniqueConstraint("sow_id", "version_number", name="uq_sow_version"),
+    )
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    sow_id = db.Column(db.String(32), db.ForeignKey("scopes_of_work.id"), nullable=False)
+    version_number = db.Column(db.Integer, nullable=False, default=1)
+
+    in_scope_md = db.Column(db.Text, default="")
+    out_of_scope_md = db.Column(db.Text, default="")
+    assumptions_md = db.Column(db.Text, default="")
+
+    edit_source = db.Column(db.String(20), default="ai")  # ai, human
+    editor_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    change_summary = db.Column(db.Text, default="")
+    created_at = db.Column(db.DateTime, default=_utcnow)
+
+    sow = db.relationship("ScopeOfWork", backref="versions")
+    editor = db.relationship("User")

@@ -86,10 +86,85 @@
 </div>
 {% endif %}
 
+<!-- Scope of Work (optional pre-proposal stage) -->
+{% if documents %}
+<div class="card">
+    <h2>Scope of Work <span class="badge" style="background:#e5e7eb;color:#374151;">Optional</span></h2>
+    {% if sow is none %}
+    <p class="card-desc">
+        Generate an editable Scope of Work before the proposal. The SOW identifies
+        what's in scope, what's out of scope, and key assumptions &mdash; filtered
+        to this company's capabilities. You can skip this step and go directly
+        to proposal generation below.
+    </p>
+    <form method="post" action="{{ url_for('sow_generate', project_id=project.id) }}" id="sow-generate-form" style="margin-top:8px;">
+        <div class="form-row">
+            <div class="form-group">
+                <label>Industry Vertical</label>
+                <select name="vertical">
+                    <option value="auto" selected>Auto-Detect</option>
+                    {% for key, v in verticals.items() %}
+                    <option value="{{ key }}">{{ v.label }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            {% if drawing_doc_count > 0 %}
+            <div class="form-group">
+                <label style="display:flex;align-items:center;gap:8px;">
+                    <input type="checkbox" name="scan_drawings" value="1" checked>
+                    Scan {{ drawing_doc_count }} drawing file(s) with vision
+                </label>
+                <p class="form-hint" style="margin-top:4px;">First 10 pages are sent to the model to control cost.</p>
+            </div>
+            {% endif %}
+        </div>
+        <button type="submit" class="btn btn-secondary" id="sow-generate-btn">Generate Scope of Work</button>
+    </form>
+    <div class="processing-overlay" id="sow-processing" style="display:none;">
+        <div class="spinner"></div>
+        <p class="processing-text">Generating Scope of Work&hellip;</p>
+        <p class="processing-subtext">Independent assessment of your source documents. Typically 1-2 minutes.</p>
+    </div>
+    {% else %}
+    <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;">
+        {% if sow.status == 'approved' %}
+        <span class="badge" style="background:#10b981;color:white;">Approved &amp; Locked</span>
+        {% else %}
+        <span class="badge" style="background:#f59e0b;color:white;">Draft</span>
+        {% endif %}
+        <span>{{ sow_in_scope_count }} in-scope &middot; {{ sow_out_of_scope_count }} out-of-scope &middot; {{ sow_assumptions_count }} assumptions</span>
+        <span class="form-hint">
+            {% if sow.generated_at %}Generated {{ sow.generated_at.strftime('%Y-%m-%d %H:%M') }}{% endif %}
+            {% if sow.drawings_scanned and sow.drawings_scanned_count %}&middot; {{ sow.drawings_scanned_count }} drawing page(s) scanned{% endif %}
+        </span>
+    </div>
+    <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;">
+        <a href="{{ url_for('sow_edit', project_id=project.id) }}" class="btn btn-primary">Open SOW Editor</a>
+        <a href="{{ url_for('sow_download', project_id=project.id, fmt='docx') }}" class="btn btn-small btn-secondary">Download DOCX</a>
+        <form method="post" action="{{ url_for('sow_delete', project_id=project.id) }}" style="display:inline;"
+              onsubmit="return confirm('Delete the Scope of Work? The project will revert to the direct proposal path.');">
+            <button type="submit" class="btn btn-small btn-secondary">Delete SOW</button>
+        </form>
+    </div>
+    {% endif %}
+</div>
+{% endif %}
+
 <!-- Generate Proposal -->
 {% if documents %}
 <div class="card card-highlight">
     <h2>Generate Proposal</h2>
+    {% if sow and sow.status == 'draft' %}
+    <div style="padding:10px;border-left:4px solid #f59e0b;background:#fef3c7;margin-bottom:12px;">
+        <strong>Draft SOW in progress.</strong> Approve or delete it, or check
+        "Ignore SOW" below to generate the proposal directly from uploaded documents.
+    </div>
+    {% elif sow and sow.status == 'approved' %}
+    <div style="padding:10px;border-left:4px solid #10b981;background:#d1fae5;margin-bottom:12px;">
+        <strong>Approved SOW will guide this proposal.</strong> The generator
+        will treat the SOW's In Scope / Out of Scope / Assumptions as authoritative.
+    </div>
+    {% endif %}
     <form method="post" action="{{ url_for('project_generate', project_id=project.id) }}" id="generate-form">
 
         <div class="form-group">
@@ -172,6 +247,26 @@
                 </label>
             </div>
         </div>
+
+        {% if sow %}
+        <div class="form-group">
+            {% if sow.status == 'draft' %}
+            <label class="checkbox-option" style="display:flex;align-items:center;gap:8px;">
+                <input type="checkbox" name="ignore_sow" value="1">
+                <span>Ignore the draft SOW and generate the proposal directly from uploaded documents</span>
+            </label>
+            {% elif sow.status == 'approved' %}
+            <label class="checkbox-option" style="display:flex;align-items:center;gap:8px;">
+                <input type="checkbox" name="include_sow_in_deliverable" value="1">
+                <span>Include the approved Scope of Work and Assumptions in the customer deliverable</span>
+            </label>
+            <label class="checkbox-option" style="display:flex;align-items:center;gap:8px;margin-top:6px;">
+                <input type="checkbox" name="ignore_sow" value="1">
+                <span>Ignore the approved SOW and generate the proposal directly from uploaded documents</span>
+            </label>
+            {% endif %}
+        </div>
+        {% endif %}
 
         <button type="submit" class="btn btn-primary btn-large" id="generate-btn">Generate Proposal</button>
     </form>
@@ -267,6 +362,16 @@
         form.addEventListener("submit", function(){
             genBtn.disabled=true;genBtn.textContent="Processing\u2026";
             proc.style.display="flex";
+        });
+    }
+
+    var sowForm = document.getElementById("sow-generate-form");
+    var sowProc = document.getElementById("sow-processing");
+    var sowBtn = document.getElementById("sow-generate-btn");
+    if(sowForm && sowProc){
+        sowForm.addEventListener("submit", function(){
+            if(sowBtn){sowBtn.disabled=true;sowBtn.textContent="Processing…";}
+            sowProc.style.display="flex";
         });
     }
 })();

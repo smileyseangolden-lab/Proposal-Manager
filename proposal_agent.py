@@ -95,7 +95,8 @@ def _build_system_prompt(vertical_key: str, vertical_resources: dict,
                          equipment_data: list = None,
                          travel_data: list = None,
                          past_corrections: list = None,
-                         company_standards: list = None) -> str:
+                         company_standards: list = None,
+                         approved_sow: str = "") -> str:
     """Assemble the system prompt with all context."""
 
     vertical_label = VERTICALS.get(vertical_key, {}).get("label", "General")
@@ -293,11 +294,35 @@ Apply these lessons: match the user's preferred tone, detail level, structure,
 and content choices. Avoid repeating the same mistakes identified above.
 """
 
+    # Approved Scope of Work block — when the user has pre-approved a SOW,
+    # treat it as authoritative and do not expand or contradict it.
+    sow_block = ""
+    if approved_sow and approved_sow.strip():
+        sow_block = f"""
+## Approved Scope of Work (LOCKED)
+
+The user has reviewed and approved the following Scope of Work. Treat In Scope,
+Out of Scope, and Assumptions as authoritative and binding.
+
+- Do NOT add work that is outside the "In Scope" section.
+- Do NOT remove or silently narrow items listed in "In Scope".
+- Do NOT rewrite items from "Out of Scope" as if they were in scope.
+- Keep the stated "Assumptions" intact in the proposal (typically in an
+  Assumptions section near the end).
+- If the RFP requires something that contradicts the approved SOW, flag it as
+  `[ACTION REQUIRED: SOW conflict — <short description>]` rather than silently
+  resolving it.
+
+```
+{approved_sow.strip()[:12000]}
+```
+"""
+
     return f"""You are the Proposal Manager Agent — an expert proposal writer that generates
 professional proposals in response to customer RFP (Request for Proposal) and
 RFQ (Request for Quotation) documents.
 
-{company_line}## Industry Vertical
+{company_line}{sow_block}## Industry Vertical
 
 You are generating a **{vertical_label}** proposal. Use the vertical-specific
 workflow, templates, and terminology appropriate for this industry. The vertical-
@@ -405,7 +430,8 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
                       equipment_data: list = None,
                       travel_data: list = None,
                       past_corrections: list = None,
-                      company_standards: list = None) -> dict:
+                      company_standards: list = None,
+                      approved_sow: str = "") -> dict:
     """Generate a proposal from the given RFP/RFQ text.
 
     Args:
@@ -480,6 +506,7 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
         travel_data=travel_data,
         past_corrections=past_corrections,
         company_standards=company_standards,
+        approved_sow=approved_sow,
     )
 
     _report("analysis", f"Generating {vertical_label} proposal...")
@@ -545,6 +572,421 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
         result["questions"] = questions
 
     return result
+
+
+def _build_sow_system_prompt(vertical_key: str,
+                             vertical_resources: dict,
+                             company_name: str = "",
+                             company_standards: list = None,
+                             staff_roles_data: list = None,
+                             equipment_data: list = None,
+                             travel_data: list = None,
+                             user_template_text: str = "",
+                             rate_sheet_text: str = "",
+                             has_drawings: bool = False) -> str:
+    """Assemble the system prompt for Scope of Work generation.
+
+    Deliberately excludes the past-proposals reference library so the SOW is
+    an independent assessment of the source documents, not a remix of prior
+    proposal output.
+    """
+    vertical_label = VERTICALS.get(vertical_key, {}).get("label", "General")
+    workflow = vertical_resources.get("workflow", "")
+    vertical_templates = vertical_resources.get("templates", {})
+
+    company_line = f"You are drafting this Scope of Work on behalf of **{company_name}**.\n\n" if company_name else ""
+
+    # Capability signal blocks — framed as "what we can actually deliver"
+    capability_parts: list[str] = []
+
+    if staff_roles_data:
+        roles = ", ".join(
+            f"{r['role_name']}" + (f" ({r['category']})" if r.get('category') else "")
+            for r in staff_roles_data[:40]
+        )
+        capability_parts.append(f"**In-house staff roles:** {roles}.")
+
+    if equipment_data:
+        cats = {}
+        for e in equipment_data[:80]:
+            cats.setdefault(e.get('category') or 'other', []).append(e.get('item_name', ''))
+        lines = [f"- {cat}: {', '.join(items[:10])}" for cat, items in cats.items()]
+        capability_parts.append("**Stocked equipment / materials (by category):**\n" + "\n".join(lines))
+
+    if travel_data:
+        types = ", ".join(sorted({t['expense_type'] for t in travel_data}))
+        capability_parts.append(f"**Travel expense categories available:** {types}.")
+
+    if company_standards:
+        std_lines = [f"- {s['category']}: {s['title']}" for s in company_standards[:30]]
+        capability_parts.append("**Company standards & posture:**\n" + "\n".join(std_lines))
+
+    if rate_sheet_text:
+        capability_parts.append(
+            "**Rate / price sheet excerpt (for context only — do NOT price the SOW):**\n"
+            f"```\n{rate_sheet_text[:3000]}\n```"
+        )
+
+    capability_block = ""
+    if capability_parts:
+        capability_block = "\n## Company Capability Signal\n\n" + "\n\n".join(capability_parts) + "\n"
+
+    template_block = ""
+    if user_template_text:
+        template_block += f"\n### User-Uploaded Template (for tone/structure reference)\n```\n{user_template_text[:4000]}\n```\n"
+    for name, content in vertical_templates.items():
+        template_block += f"\n### Vertical Template: {name}\n```\n{content[:4000]}\n```\n"
+
+    drawings_note = ""
+    if has_drawings:
+        drawings_note = (
+            "\n**Engineering drawings have been attached as images.** Treat them "
+            "as authoritative visual references. Use them to infer physical "
+            "scope, equipment footprint, routing, quantities you can count, and "
+            "work that clearly belongs to other trades (e.g., structural, "
+            "architectural, or process-mechanical work drawn but outside our "
+            "service lines). Cite drawings by filename/page when relevant.\n"
+        )
+
+    return f"""You are the Proposal Manager Scope-of-Work Agent. You produce an independent,
+pre-proposal Scope of Work from customer source documents (RFPs, specs,
+drawings, supporting files) and the company's own capability profile.
+
+This is NOT a sales document and NOT a proposal. It is an internal
+review artifact the sales team will edit and approve before a proposal is
+drafted.
+
+{company_line}## Industry Vertical
+
+This project is classified as **{vertical_label}**.
+
+## Workflow Context (reference only)
+
+{workflow}
+
+## Proposal Templates (tone/structure only — do not fill in or price)
+
+{template_block}
+
+{capability_block}
+{drawings_note}
+
+## Your Task
+
+1. Read the attached customer source documents end-to-end.
+2. Identify every distinct piece of work the customer is asking for.
+3. For each piece of work, decide whether it falls within THIS company's
+   capabilities and service lines based on the capability signal above.
+4. Produce three lists:
+   - **In Scope** — work this company will perform.
+   - **Out of Scope** — work explicitly NOT being performed, including items
+     that appear to belong to other contractors, integrators, suppliers, or
+     trades (e.g., general construction, architectural, process-mechanical,
+     commissioning agents, owner-furnished equipment).
+   - **Assumptions** — conditions, dependencies, access, schedule, site
+     readiness, owner-furnished items, code/standard selections, or
+     clarifications the scope relies on.
+
+## Rules
+
+- Base your assessment ONLY on the attached customer documents and the
+  company capability signal above. Do NOT reference past proposals.
+- Tie each In Scope and Out of Scope item back to a specific RFP reference
+  (section number, filename, or short quoted phrase) when possible.
+- Prefer specific, verifiable scope statements over marketing language.
+- Do NOT fabricate quantities, pricing, or model numbers.
+- If a piece of work is ambiguous, place it in Assumptions with a clarifying
+  statement rather than silently including or excluding it.
+- Keep each bullet crisp and atomic (one deliverable per bullet).
+
+## Output Format (STRICT)
+
+Return ONLY a JSON object, no preamble, matching this schema:
+
+```
+{{
+  "in_scope": [
+    {{"text": "...", "rfp_reference": "..." }}
+  ],
+  "out_of_scope": [
+    {{"text": "...", "rfp_reference": "..." }}
+  ],
+  "assumptions": [
+    {{"text": "..." }}
+  ]
+}}
+```
+
+- `rfp_reference` is optional; leave it out or empty-string when no citation
+  is possible.
+- Do not wrap the JSON in code fences. Return the JSON object by itself.
+- Aim for 8-20 items per section. Fewer is fine; do not pad.
+
+Today's date is {datetime.now(timezone.utc).strftime("%B %d, %Y")}.
+"""
+
+
+def generate_sow(rfp_text: str,
+                 vertical: str = "auto",
+                 company_name: str = "",
+                 user_api_key: str = None,
+                 user_model: str = None,
+                 company_standards: list = None,
+                 staff_roles_data: list = None,
+                 equipment_data: list = None,
+                 travel_data: list = None,
+                 user_templates: dict = None,
+                 rate_sheet_data: dict = None,
+                 drawing_images: list = None,
+                 progress_callback=None) -> dict:
+    """Generate an independent Scope of Work from customer documents + company context.
+
+    Args:
+        rfp_text: Combined text of all customer documents (RFP, specs, etc.).
+        vertical: Vertical key or 'auto'.
+        company_name: Branding — "on behalf of X".
+        user_api_key, user_model: Per-user overrides.
+        company_standards, staff_roles_data, equipment_data, travel_data:
+            Company capability signal loaded from settings.
+        user_templates: Dict mapping template_type -> text (for tone/structure).
+        rate_sheet_data: Parsed rate sheet data (raw_text used only as context).
+        drawing_images: Optional list of dicts {media_type, data, source_name}
+            returned by drawing_ingest.load_drawing_images(). When supplied,
+            a multimodal user message is sent and the SOW prompt references
+            the attached drawings.
+        progress_callback: Optional callable(phase, message).
+
+    Returns:
+        dict with keys:
+            - in_scope: list[dict] — [{"text": ..., "rfp_reference": ...}]
+            - out_of_scope: list[dict]
+            - assumptions: list[dict] — [{"text": ...}]
+            - raw: str — the unparsed AI response
+            - vertical, vertical_label, model, generated_at
+            - drawings_count: int
+    """
+    api_key = user_api_key or ANTHROPIC_API_KEY
+    model = user_model or CLAUDE_MODEL
+
+    if not api_key:
+        raise RuntimeError(
+            "No API key configured. Go to Settings to add your Anthropic API key."
+        )
+
+    def _report(phase: str, message: str):
+        if progress_callback:
+            progress_callback(phase, message)
+
+    if vertical == "auto":
+        from document_parser import detect_vertical
+        _report("detection", "Detecting vertical for SOW...")
+        vertical = detect_vertical(rfp_text)
+
+    vertical_label = VERTICALS.get(vertical, {}).get("label", "General")
+    _report("init", f"Loading {vertical_label} context for SOW...")
+
+    vertical_resources = load_vertical_resources(vertical)
+
+    rate_sheet_text = ""
+    if rate_sheet_data:
+        for sheet_type, data in rate_sheet_data.items():
+            if isinstance(data, dict) and "raw_text" in data:
+                rate_sheet_text += f"\n### {sheet_type.replace('_', ' ').title()}\n{data['raw_text']}\n"
+
+    user_template_text = ""
+    if user_templates:
+        for ttype, text in user_templates.items():
+            user_template_text += f"\n### {ttype.replace('_', ' ').title()}\n{text}\n"
+
+    images = drawing_images or []
+    system_prompt = _build_sow_system_prompt(
+        vertical,
+        vertical_resources,
+        company_name=company_name,
+        company_standards=company_standards,
+        staff_roles_data=staff_roles_data,
+        equipment_data=equipment_data,
+        travel_data=travel_data,
+        user_template_text=user_template_text,
+        rate_sheet_text=rate_sheet_text,
+        has_drawings=bool(images),
+    )
+
+    _report("analysis", f"Generating {vertical_label} Scope of Work...")
+
+    user_content: list = []
+    for img in images:
+        user_content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": img["media_type"],
+                "data": img["data"],
+            },
+        })
+    text_intro = (
+        f"Please produce a Scope of Work for a {vertical_label} project based "
+        "on the following customer documents"
+    )
+    if images:
+        text_intro += " and the attached engineering drawings"
+    text_intro += ". Return JSON only per the schema in the system prompt."
+    user_content.append({
+        "type": "text",
+        "text": (
+            f"{text_intro}\n\n"
+            "---BEGIN CUSTOMER DOCUMENTS---\n"
+            f"{rfp_text}\n"
+            "---END CUSTOMER DOCUMENTS---"
+        ),
+    })
+
+    client = _make_client(api_key)
+
+    response_text = ""
+    with client.messages.stream(
+        model=model,
+        max_tokens=8000,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_content}],
+    ) as stream:
+        for chunk in stream.text_stream:
+            response_text += chunk
+
+    _report("post_processing", "Parsing SOW sections...")
+    parsed = _parse_sow_response(response_text)
+
+    return {
+        "in_scope": parsed["in_scope"],
+        "out_of_scope": parsed["out_of_scope"],
+        "assumptions": parsed["assumptions"],
+        "raw": response_text,
+        "vertical": vertical,
+        "vertical_label": vertical_label,
+        "model": model,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "drawings_count": len(images),
+    }
+
+
+def _parse_sow_response(text: str) -> dict:
+    """Extract the three SOW sections from the AI's JSON response.
+
+    Tolerates the model wrapping JSON in code fences or adding a short preamble.
+    Falls back to an empty structure if parsing fails — the raw response is
+    preserved by the caller so a user can still manually recover the content.
+    """
+    empty = {"in_scope": [], "out_of_scope": [], "assumptions": []}
+    if not text or not text.strip():
+        return empty
+
+    # Find the first {...} block that parses as JSON.
+    candidates: list[str] = []
+    # Strip code fences if present.
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fenced:
+        candidates.append(fenced.group(1))
+    # Also try the greediest outer brace match.
+    brace = re.search(r"\{.*\}", text, re.DOTALL)
+    if brace:
+        candidates.append(brace.group(0))
+
+    for cand in candidates:
+        try:
+            data = json.loads(cand)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        def _norm(items, keep_ref=True):
+            out = []
+            if not isinstance(items, list):
+                return out
+            for item in items:
+                if isinstance(item, str):
+                    txt = item.strip()
+                    if txt:
+                        out.append({"text": txt, "rfp_reference": ""} if keep_ref else {"text": txt})
+                elif isinstance(item, dict):
+                    txt = (item.get("text") or "").strip()
+                    if not txt:
+                        continue
+                    if keep_ref:
+                        out.append({
+                            "text": txt,
+                            "rfp_reference": (item.get("rfp_reference") or "").strip(),
+                        })
+                    else:
+                        out.append({"text": txt})
+            return out
+
+        return {
+            "in_scope": _norm(data.get("in_scope", []), keep_ref=True),
+            "out_of_scope": _norm(data.get("out_of_scope", []), keep_ref=True),
+            "assumptions": _norm(data.get("assumptions", []), keep_ref=False),
+        }
+
+    return empty
+
+
+def sow_items_to_markdown(items: list[dict], include_ref: bool = True) -> str:
+    """Render a list of SOW items back to a markdown bullet list."""
+    lines: list[str] = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        text = (it.get("text") or "").strip()
+        if not text:
+            continue
+        ref = (it.get("rfp_reference") or "").strip() if include_ref else ""
+        if ref:
+            lines.append(f"- {text} _(ref: {ref})_")
+        else:
+            lines.append(f"- {text}")
+    return "\n".join(lines)
+
+
+def sow_markdown_to_items(md_text: str) -> list[dict]:
+    """Parse a markdown bullet list back into structured items.
+
+    Accepts `- item`, `* item`, and `1. item` bullets; trailing `(ref: ...)`
+    or `_(ref: ...)_` annotations are captured as rfp_reference.
+    """
+    items: list[dict] = []
+    if not md_text:
+        return items
+    for raw in md_text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = re.match(r"^(?:[-*]|\d+\.)\s+(.*)$", line)
+        if m:
+            body = m.group(1).strip()
+        else:
+            body = line
+        ref = ""
+        ref_match = re.search(r"_?\(ref:\s*(.+?)\)_?\s*$", body)
+        if ref_match:
+            ref = ref_match.group(1).strip()
+            body = body[:ref_match.start()].rstrip()
+        if body:
+            items.append({"text": body, "rfp_reference": ref})
+    return items
+
+
+def assemble_sow_markdown(in_scope_md: str, out_of_scope_md: str,
+                          assumptions_md: str, heading_prefix: str = "") -> str:
+    """Assemble the three SOW sections into a single markdown document."""
+    h = heading_prefix
+    parts = [f"# {h}Scope of Work\n" if h else "# Scope of Work\n"]
+    parts.append("## In Scope\n")
+    parts.append((in_scope_md or "_No in-scope items._") + "\n")
+    parts.append("## Out of Scope\n")
+    parts.append((out_of_scope_md or "_No out-of-scope items listed._") + "\n")
+    parts.append("## Assumptions\n")
+    parts.append((assumptions_md or "_No assumptions listed._") + "\n")
+    return "\n".join(parts)
 
 
 def revise_proposal(current_markdown: str,
