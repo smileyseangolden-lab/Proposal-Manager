@@ -4,6 +4,13 @@ services:
     restart: unless-stopped
     security_opt:
       - apparmor:unconfined
+    # Disable IPv6 inside the container. The Docker bridge network is IPv4-only
+    # (no ip6tables MASQUERADE rule on this host), so any AAAA record resolution
+    # leads to "Network is unreachable" and the Anthropic SDK reports it as
+    # "Connection error." Forcing IPv4-only DNS avoids that entirely.
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
     ports:
       # Published on loopback only — nginx reverse-proxies the public port here.
       # Override via HOST_PORT in .env (default 15010 avoids a stuck dockerd
