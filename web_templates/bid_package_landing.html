@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+
+{% block title %}Bid Package &mdash; {{ project.name }}{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <div class="page-header-row">
+        <div>
+            <h1>Pre-Proposal Triage</h1>
+            <p class="page-subtitle">{{ project.name }} &mdash; {{ project.client_name or 'No client specified' }}</p>
+        </div>
+        <div class="header-actions">
+            <a href="{{ url_for('project_upload', project_id=project.id) }}" class="btn btn-small btn-secondary">Back to Project</a>
+        </div>
+    </div>
+</section>
+
+<div class="card">
+    <h2>Upload a Bid Package</h2>
+    <p class="card-desc">Drop a zip archive of all documents the customer sent (RFP, addenda, drawings, datasheets, etc.). Each file becomes searchable in the index, and the AI will classify and summarize every document so AEs can find what matters fast.</p>
+
+    <form method="post" action="{{ url_for('bid_package_upload', project_id=project.id) }}" enctype="multipart/form-data">
+        <div class="form-row">
+            <div class="form-group" style="flex:2">
+                <label>Bid Package (.zip)</label>
+                <input type="file" name="bid_package_zip" accept=".zip" required>
+            </div>
+            <div class="form-group" style="flex:1; align-self:flex-end;">
+                <button type="submit" class="btn btn-primary">Upload &amp; Ingest</button>
+            </div>
+        </div>
+        <p class="form-hint">Per-package size limit: 2 GB. Files: 500 max. Only document file types are kept (.pdf, .docx, .xlsx, .txt, .md, .csv, .dwg, .dxf).</p>
+    </form>
+</div>
+
+{% if packages %}
+<div class="card">
+    <h2>Bid Packages ({{ packages | length }})</h2>
+    <table class="mini-table">
+        <thead>
+            <tr>
+                <th>Uploaded</th>
+                <th>Source</th>
+                <th>Files</th>
+                <th>Duplicates</th>
+                <th>Size</th>
+                <th>Status</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for p in packages %}
+        <tr>
+            <td>{{ p.ingested_at.strftime('%Y-%m-%d %H:%M') }}</td>
+            <td>{{ p.original_filename or p.source }}</td>
+            <td>{{ p.file_count }}</td>
+            <td>{{ p.duplicate_count }}</td>
+            <td>
+                {% if p.total_size_bytes >= 1073741824 %}{{ "%.2f"|format(p.total_size_bytes / 1073741824) }} GB
+                {% elif p.total_size_bytes >= 1048576 %}{{ "%.1f"|format(p.total_size_bytes / 1048576) }} MB
+                {% elif p.total_size_bytes >= 1024 %}{{ "%.0f"|format(p.total_size_bytes / 1024) }} KB
+                {% else %}{{ p.total_size_bytes }} B{% endif %}
+            </td>
+            <td><span class="badge badge-status-{{ p.status }}">{{ p.status }}</span></td>
+            <td>
+                <a href="{{ url_for('bid_package_index', project_id=project.id, package_id=p.id) }}" class="btn btn-small btn-secondary">Open Index</a>
+            </td>
+        </tr>
+        {% if p.error_message %}
+        <tr><td colspan="7"><span class="form-hint" style="color:#b91c1c;">Error: {{ p.error_message }}</span></td></tr>
+        {% endif %}
+        {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% else %}
+<div class="card">
+    <p class="empty-hint">No bid packages uploaded yet. Upload a zip above to start the triage.</p>
+</div>
+{% endif %}
+{% endblock %}

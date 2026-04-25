@@ -1,0 +1,140 @@
+{% extends "base.html" %}
+
+{% block title %}ETG Knowledge Base &mdash; {{ app_name }}{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <div class="page-header-row">
+        <div>
+            <h1>ETG Knowledge Base</h1>
+            <p class="page-subtitle">Structured company context the AI pulls into every triage and proposal prompt. Add what makes ETG &mdash; not the customer&rsquo;s package &mdash; sound like ETG.</p>
+        </div>
+        <div class="header-actions">
+            <a href="{{ url_for('settings') }}" class="btn btn-small btn-secondary">Back to Settings</a>
+        </div>
+    </div>
+</section>
+
+<div class="card">
+    <h2>Add Knowledge Asset</h2>
+    <form method="post" action="{{ url_for('etg_knowledge_add') }}">
+        <div class="form-row">
+            <div class="form-group">
+                <label>Section</label>
+                <select name="section" required>
+                    {% for key, label in sections %}
+                    <option value="{{ key }}">{{ label }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="form-group" style="flex:2">
+                <label>Title</label>
+                <input type="text" name="title" placeholder="e.g., Life Science Cleanroom Capability Statement" required>
+            </div>
+            <div class="form-group">
+                <label>Vertical</label>
+                <select name="vertical">
+                    <option value="">All verticals</option>
+                    {% for k, v in verticals.items() %}
+                    <option value="{{ k }}">{{ v.label }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+        </div>
+        <div class="form-group">
+            <label>Content (Markdown)</label>
+            <textarea name="content_md" rows="6" placeholder="Plain Markdown describing the asset. Keep it factual and specific to ETG &mdash; the AI uses this as authoritative context."></textarea>
+        </div>
+        <div class="form-row">
+            <div class="form-group">
+                <label>Tags (comma-separated)</label>
+                <input type="text" name="tags" placeholder="cleanroom, gmp, validation">
+            </div>
+            {% if can_edit_global %}
+            <div class="form-group" style="align-self:flex-end;">
+                <label class="checkbox-inline">
+                    <input type="checkbox" name="is_global"> Make this asset visible to the whole company
+                </label>
+            </div>
+            {% endif %}
+        </div>
+        <button type="submit" class="btn btn-primary">Add to Knowledge Base</button>
+    </form>
+</div>
+
+{% for key, label in sections %}
+<div class="card" id="{{ key }}">
+    <h2>{{ label }}</h2>
+    {% set assets = grouped.get(key, []) %}
+    {% if assets %}
+    <table class="mini-table">
+        <thead>
+            <tr>
+                <th>Title</th>
+                <th>Vertical</th>
+                <th>Tags</th>
+                <th>Source</th>
+                <th>Active</th>
+                <th>Preview</th>
+                <th></th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for a in assets %}
+        <tr>
+            <td>
+                <strong>{{ a.title }}</strong>
+                {% if a.user_id is none %}<span class="badge">global</span>{% endif %}
+            </td>
+            <td>{{ a.vertical or '&mdash;' | safe }}</td>
+            <td>{{ a.tags or '&mdash;' | safe }}</td>
+            <td>{{ a.source }}</td>
+            <td>{% if a.is_active %}<span class="badge badge-status-active">yes</span>{% else %}<span class="badge">no</span>{% endif %}</td>
+            <td class="td-desc">{{ (a.content_md or '')[:160] }}{% if a.content_md and a.content_md|length > 160 %}&hellip;{% endif %}</td>
+            <td>
+                <details>
+                    <summary class="btn btn-small btn-secondary">Edit</summary>
+                    <form method="post" action="{{ url_for('etg_knowledge_edit', asset_id=a.id) }}" style="margin-top:8px;">
+                        <div class="form-group">
+                            <label>Title</label>
+                            <input type="text" name="title" value="{{ a.title }}">
+                        </div>
+                        <div class="form-group">
+                            <label>Vertical</label>
+                            <select name="vertical">
+                                <option value="" {% if not a.vertical %}selected{% endif %}>All verticals</option>
+                                {% for k, v in verticals.items() %}
+                                <option value="{{ k }}" {% if a.vertical == k %}selected{% endif %}>{{ v.label }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Tags</label>
+                            <input type="text" name="tags" value="{{ a.tags or '' }}">
+                        </div>
+                        <div class="form-group">
+                            <label>Content</label>
+                            <textarea name="content_md" rows="6">{{ a.content_md or '' }}</textarea>
+                        </div>
+                        <label class="checkbox-inline">
+                            <input type="checkbox" name="is_active" {% if a.is_active %}checked{% endif %}> Active
+                        </label>
+                        <div style="margin-top:8px;">
+                            <button type="submit" class="btn btn-small btn-primary">Save</button>
+                        </div>
+                    </form>
+                    <form method="post" action="{{ url_for('etg_knowledge_delete', asset_id=a.id) }}" style="margin-top:6px;">
+                        <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this asset?')">Delete</button>
+                    </form>
+                </details>
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p class="empty-hint">No assets in this section yet.</p>
+    {% endif %}
+</div>
+{% endfor %}
+{% endblock %}
