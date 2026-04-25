@@ -16,6 +16,7 @@
             </p>
         </div>
         <div class="header-actions">
+            <a href="{{ url_for('bid_package_landing', project_id=project.id) }}" class="btn btn-small btn-secondary">Bid Package Triage</a>
             <a href="{{ url_for('clarification_register', project_id=project.id) }}" class="btn btn-small btn-secondary">Clarifications</a>
             <form method="post" action="{{ url_for('update_project_status', project_id=project.id) }}" class="inline-form">
                 <input type="text" name="dollar_amount" placeholder="Dollar amount" value="{{ project.dollar_amount if project.dollar_amount else '' }}" class="input-small">

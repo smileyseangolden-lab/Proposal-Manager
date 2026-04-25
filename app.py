@@ -55,10 +55,13 @@ from config.settings import (
 from document_parser import parse_document
 from models import (
     ActivityLog,
+    BidPackage,
     ClarificationItem,
     CompanyStandard,
+    DocumentAnalysis,
     DocumentTag,
     EquipmentItem,
+    EtgKnowledgeAsset,
     Notification,
     Project,
     ProjectDocument,
@@ -77,6 +80,7 @@ from models import (
     RevisionTemplate,
     StaffRole,
     TravelExpenseRate,
+    TriageJob,
     User,
     UserRateSheet,
     UserVerticalTemplate,
@@ -262,7 +266,29 @@ with app.app_context():
                 _cur.execute('ALTER TABLE proposal_questions ADD COLUMN resolution_path VARCHAR(20) DEFAULT "internal"')
                 _conn.commit()
 
+            # Pre-Proposal Triage (Phase 1) — add new columns to project_documents
+            _cur.execute("PRAGMA table_info(project_documents)")
+            _pd_cols = {row[1] for row in _cur.fetchall()}
+            _triage_doc_migrations = [
+                ("bid_package_id", 'ALTER TABLE project_documents ADD COLUMN bid_package_id VARCHAR(32) DEFAULT NULL'),
+                ("relative_path", 'ALTER TABLE project_documents ADD COLUMN relative_path VARCHAR(1000) DEFAULT ""'),
+                ("sha256", 'ALTER TABLE project_documents ADD COLUMN sha256 VARCHAR(64) DEFAULT ""'),
+            ]
+            for _col, _sql in _triage_doc_migrations:
+                if _col not in _pd_cols:
+                    _cur.execute(_sql)
+            _conn.commit()
+
             _conn.close()
+
+            # Seed ETG knowledge base (system rows + migrate CompanyStandard).
+            from etg_knowledge_seed import migrate_company_standards, seed_system_assets
+            try:
+                seed_system_assets()
+                migrate_company_standards()
+            except Exception:
+                # Seeding failures must not crash the app boot.
+                db.session.rollback()
         finally:
             _fcntl.flock(_lock_fh, _fcntl.LOCK_UN)
 
@@ -321,6 +347,47 @@ def _can_access_project(project) -> bool:
         or project.assigned_to == current_user.id
         or current_user.is_admin
     )
+
+
+def _company_standards_data(user_id: str):
+    """Return the standards payload the proposal generator expects.
+
+    Reads from EtgKnowledgeAsset (the new structured knowledge base). The
+    legacy CompanyStandard CRUD routes mirror their writes here, so this is
+    the single read path.
+    """
+    sections = (
+        "company_profile",
+        "capabilities",
+        "tech_stack",
+        "sow_boilerplate",
+        "exclusions",
+        "pricing_reference",
+        "past_proposal",
+    )
+    from sqlalchemy import or_ as _or
+    assets = EtgKnowledgeAsset.query.filter(
+        EtgKnowledgeAsset.is_active.is_(True),
+        EtgKnowledgeAsset.section.in_(sections),
+        _or(
+            EtgKnowledgeAsset.user_id == user_id,
+            EtgKnowledgeAsset.user_id.is_(None),
+        ),
+    ).order_by(
+        EtgKnowledgeAsset.section.asc(),
+        EtgKnowledgeAsset.sort_order.asc(),
+        EtgKnowledgeAsset.title.asc(),
+    ).all()
+    if not assets:
+        return None
+    return [
+        {
+            "category": a.section.replace("_", " ").title(),
+            "title": a.title,
+            "content": a.content_md or "",
+        }
+        for a in assets
+    ]
 
 
 def _save_upload(file, subdir: str = "") -> tuple[str, str, int]:
@@ -1423,14 +1490,8 @@ def project_generate(project_id):
             for c in past_corrections
         ]
 
-    # Load company standards for auto-injection
-    standards = CompanyStandard.query.filter_by(user_id=current_user.id, is_active=True).all()
-    company_standards_data = None
-    if standards:
-        company_standards_data = [
-            {"category": s.category, "title": s.title, "content": s.content}
-            for s in standards
-        ]
+    # Load company standards for auto-injection (sourced from the ETG knowledge base).
+    company_standards_data = _company_standards_data(current_user.id)
 
     try:
         result = generate_proposal(
@@ -1724,6 +1785,261 @@ def update_close_details(project_id):
     _log_activity("close_details_update", f"Close details updated ({project.status})", project_id)
     flash("Close details saved.", "success")
     return redirect(request.referrer or url_for("reports"))
+
+
+# ---------------------------------------------------------------------------
+# Pre-Proposal Triage (Phase 1): Bid Package Ingestion & Index
+# ---------------------------------------------------------------------------
+
+BID_PACKAGE_ZIP_EXTENSIONS = {"zip"}
+
+
+@app.route("/projects/<project_id>/bid-package", methods=["GET"])
+@login_required
+def bid_package_landing(project_id):
+    """Bid package overview for a project: upload form + list of packages."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    packages = (
+        BidPackage.query.filter_by(project_id=project_id)
+        .order_by(BidPackage.ingested_at.desc())
+        .all()
+    )
+    return render_template(
+        "bid_package_landing.html",
+        project=project,
+        packages=packages,
+    )
+
+
+@app.route("/projects/<project_id>/bid-package/upload", methods=["POST"])
+@login_required
+def bid_package_upload(project_id):
+    """Accept a zip archive of bid documents and ingest it synchronously.
+
+    Synchronous because most packages fit within the gunicorn timeout. The
+    triage worker handles the per-document analysis afterward.
+    """
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    file = request.files.get("bid_package_zip")
+    if not file or not file.filename:
+        flash("Please choose a zip file to upload.", "error")
+        return redirect(url_for("bid_package_landing", project_id=project_id))
+
+    if not _allowed_file(file.filename, BID_PACKAGE_ZIP_EXTENSIONS):
+        flash("Bid packages must be uploaded as a .zip file.", "error")
+        return redirect(url_for("bid_package_landing", project_id=project_id))
+
+    from bid_package_service import BidPackageError, ingest_zip_filelike
+
+    try:
+        package = ingest_zip_filelike(
+            project_id=project_id,
+            user_id=current_user.id,
+            file_storage=file,
+            original_filename=secure_filename(file.filename),
+        )
+    except BidPackageError as exc:
+        flash(f"Bid package upload rejected: {exc}", "error")
+        return redirect(url_for("bid_package_landing", project_id=project_id))
+    except Exception as exc:
+        flash(f"Bid package upload failed: {exc}", "error")
+        return redirect(url_for("bid_package_landing", project_id=project_id))
+
+    _log_activity(
+        "bid_package_upload",
+        f"Ingested {package.file_count} files ({package.duplicate_count} duplicates)",
+        project_id,
+    )
+    flash(
+        f"Bid package uploaded: {package.file_count} documents accepted, "
+        f"{package.duplicate_count} duplicates skipped.",
+        "success",
+    )
+    return redirect(url_for("bid_package_index", project_id=project_id, package_id=package.id))
+
+
+@app.route("/projects/<project_id>/bid-package/<package_id>", methods=["GET"])
+@login_required
+def bid_package_index(project_id, package_id):
+    """Per-document index for a single bid package: the triage table."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    package = db.session.get(BidPackage, package_id)
+    if not package or package.project_id != project_id:
+        abort(404)
+
+    documents = (
+        ProjectDocument.query.filter_by(bid_package_id=package_id)
+        .order_by(ProjectDocument.relative_path.asc())
+        .all()
+    )
+
+    # Aggregate counts and build per-doc rows including analysis status.
+    rows = []
+    trade_counts: dict[str, int] = {}
+    type_counts: dict[str, int] = {}
+    for doc in documents:
+        analysis = doc.analysis
+        rows.append({
+            "id": doc.id,
+            "name": doc.original_filename,
+            "relative_path": doc.relative_path or doc.original_filename,
+            "file_size": doc.file_size,
+            "trade": (analysis.trade if analysis else "") or "",
+            "document_type": (analysis.document_type_detected if analysis else "") or "",
+            "addendum_label": (analysis.addendum_label if analysis else "") or "",
+            "synopsis": (analysis.synopsis if analysis else "") or "",
+            "needs_ocr": bool(analysis.needs_ocr) if analysis else False,
+            "status": (analysis.status if analysis else "pending"),
+            "reviewer_status": (analysis.reviewer_status if analysis else "unreviewed"),
+            "confidence": float(analysis.confidence) if analysis else 0.0,
+        })
+        if analysis and analysis.trade:
+            trade_counts[analysis.trade] = trade_counts.get(analysis.trade, 0) + 1
+        if analysis and analysis.document_type_detected:
+            t = analysis.document_type_detected
+            type_counts[t] = type_counts.get(t, 0) + 1
+
+    pending_jobs = TriageJob.query.filter(
+        TriageJob.bid_package_id == package_id,
+        TriageJob.status.in_(("pending", "running")),
+    ).count()
+
+    return render_template(
+        "bid_package_index.html",
+        project=project,
+        package=package,
+        rows=rows,
+        trade_counts=sorted(trade_counts.items(), key=lambda x: -x[1]),
+        type_counts=sorted(type_counts.items(), key=lambda x: -x[1]),
+        pending_jobs=pending_jobs,
+        analyzed_count=sum(1 for r in rows if r["status"] in ("analyzed", "needs_review")),
+    )
+
+
+@app.route("/projects/<project_id>/bid-package/<package_id>/analyze", methods=["POST"])
+@login_required
+def bid_package_analyze(project_id, package_id):
+    """Enqueue per-document analysis jobs for the package."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    package = db.session.get(BidPackage, package_id)
+    if not package or package.project_id != project_id:
+        abort(404)
+
+    from triage_worker import enqueue_package_analysis
+
+    enqueued = enqueue_package_analysis(package, user_id=current_user.id)
+    _log_activity("bid_package_analyze", f"Enqueued {enqueued} analyses", project_id)
+    if enqueued == 0:
+        flash("All documents in this bid package are already analyzed.", "success")
+    else:
+        flash(
+            f"Queued {enqueued} document(s) for analysis. The page will update as the worker processes them.",
+            "success",
+        )
+    return redirect(url_for("bid_package_index", project_id=project_id, package_id=package_id))
+
+
+@app.route("/projects/<project_id>/bid-package/<package_id>/document/<document_id>/review", methods=["POST"])
+@login_required
+def bid_package_set_review(project_id, package_id, document_id):
+    """AE marks a document Reviewed / Flagged / Unreviewed and adds notes."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    doc = db.session.get(ProjectDocument, document_id)
+    if not doc or doc.project_id != project_id or doc.bid_package_id != package_id:
+        abort(404)
+    analysis = doc.analysis
+    if analysis is None:
+        flash("Run analysis on this document first.", "error")
+        return redirect(url_for("bid_package_index", project_id=project_id, package_id=package_id))
+
+    new_status = request.form.get("reviewer_status", "").strip()
+    if new_status not in ("unreviewed", "reviewed", "flagged"):
+        flash("Invalid review status.", "error")
+        return redirect(url_for("bid_package_index", project_id=project_id, package_id=package_id))
+
+    analysis.reviewer_status = new_status
+    analysis.reviewer_notes = request.form.get("reviewer_notes", "").strip()
+    analysis.reviewed_by = current_user.id
+    analysis.reviewed_at = datetime.now(timezone.utc)
+    db.session.commit()
+    flash("Document review state saved.", "success")
+    return redirect(url_for("bid_package_index", project_id=project_id, package_id=package_id))
+
+
+@app.route("/projects/<project_id>/bid-package/<package_id>.xlsx", methods=["GET"])
+@login_required
+def bid_package_xlsx(project_id, package_id):
+    """Export the per-document index as an XLSX so it can be shared with stakeholders."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    package = db.session.get(BidPackage, package_id)
+    if not package or package.project_id != project_id:
+        abort(404)
+
+    import io as _io
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Bid Package Index"
+    ws.append([
+        "Relative Path",
+        "Filename",
+        "Trade",
+        "Document Type",
+        "Addendum",
+        "Synopsis",
+        "Status",
+        "Reviewer Status",
+        "Confidence",
+        "Needs OCR",
+        "File Size (bytes)",
+    ])
+
+    documents = (
+        ProjectDocument.query.filter_by(bid_package_id=package_id)
+        .order_by(ProjectDocument.relative_path.asc())
+        .all()
+    )
+    for doc in documents:
+        a = doc.analysis
+        ws.append([
+            doc.relative_path or "",
+            doc.original_filename,
+            (a.trade if a else "") or "",
+            (a.document_type_detected if a else "") or "",
+            (a.addendum_label if a else "") or "",
+            (a.synopsis if a else "") or "",
+            (a.status if a else "pending"),
+            (a.reviewer_status if a else "unreviewed"),
+            float(a.confidence) if a else 0.0,
+            "yes" if (a and a.needs_ocr) else "no",
+            doc.file_size or 0,
+        ])
+
+    buf = _io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    safe_project = secure_filename(project.name) or project_id
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        as_attachment=True,
+        download_name=f"bid_package_index_{safe_project}.xlsx",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2565,11 +2881,7 @@ def apply_feedback(proposal_id):
     # Load supporting context
     owner = _proposal_owner(proposal)
     owner_id = owner.id if owner else current_user.id
-    standards = CompanyStandard.query.filter_by(user_id=owner_id, is_active=True).all()
-    standards_data = [
-        {"category": s.category, "title": s.title, "content": s.content}
-        for s in standards
-    ] if standards else None
+    standards_data = _company_standards_data(owner_id)
 
     corrections = ProposalCorrection.query.filter_by(user_id=owner_id).order_by(
         ProposalCorrection.created_at.desc()
@@ -2960,6 +3272,8 @@ def add_company_standard():
     )
     db.session.add(standard)
     db.session.commit()
+    from etg_knowledge_seed import upsert_from_company_standard
+    upsert_from_company_standard(standard)
     _log_activity("company_standard_add", f"Added standard: {title}")
     flash(f"Company standard '{title}' added.", "success")
     return redirect(url_for("settings") + "#company")
@@ -2977,6 +3291,8 @@ def edit_company_standard(standard_id):
     std.content = request.form.get("standard_content", std.content).strip()
 
     db.session.commit()
+    from etg_knowledge_seed import upsert_from_company_standard
+    upsert_from_company_standard(std)
     _log_activity("company_standard_edit", f"Updated standard: {std.title}")
     flash(f"Standard '{std.title}' updated.", "success")
     return redirect(url_for("settings") + "#company")
@@ -2989,11 +3305,147 @@ def delete_company_standard(standard_id):
     if not std or std.user_id != current_user.id:
         abort(404)
     title = std.title
+    from etg_knowledge_seed import delete_from_company_standard
+    delete_from_company_standard(std)
     db.session.delete(std)
     db.session.commit()
     _log_activity("company_standard_delete", f"Deleted standard: {title}")
     flash(f"Standard '{title}' deleted.", "success")
     return redirect(url_for("settings") + "#company")
+
+
+# ---------------------------------------------------------------------------
+# ETG Knowledge Base (Pre-Proposal Triage Phase 1)
+# ---------------------------------------------------------------------------
+
+ETG_KNOWLEDGE_SECTIONS = [
+    ("company_profile", "Company Profile"),
+    ("capabilities", "Capabilities Matrix"),
+    ("tech_stack", "Technology Stack"),
+    ("sow_boilerplate", "SOW Boilerplate"),
+    ("exclusions", "Exclusions / Assumptions"),
+    ("pricing_reference", "Pricing Reference"),
+    ("past_proposal", "Past Proposal Library"),
+    ("brand_asset", "Brand Assets"),
+    ("taxonomy", "Triage Taxonomy"),
+    ("expected_documents", "Expected Documents Checklist"),
+]
+
+
+def _user_can_edit_global_knowledge() -> bool:
+    return getattr(current_user, "is_admin", False)
+
+
+@app.route("/settings/etg-knowledge", methods=["GET"])
+@login_required
+def etg_knowledge_index():
+    """Browse and manage ETG knowledge assets used to inject context into AI prompts."""
+    from sqlalchemy import or_ as _or
+    assets = (
+        EtgKnowledgeAsset.query.filter(
+            _or(
+                EtgKnowledgeAsset.user_id == current_user.id,
+                EtgKnowledgeAsset.user_id.is_(None),
+            )
+        )
+        .order_by(
+            EtgKnowledgeAsset.section.asc(),
+            EtgKnowledgeAsset.sort_order.asc(),
+            EtgKnowledgeAsset.title.asc(),
+        )
+        .all()
+    )
+    grouped: dict[str, list[EtgKnowledgeAsset]] = {key: [] for key, _ in ETG_KNOWLEDGE_SECTIONS}
+    for asset in assets:
+        grouped.setdefault(asset.section, []).append(asset)
+
+    return render_template(
+        "etg_knowledge.html",
+        sections=ETG_KNOWLEDGE_SECTIONS,
+        grouped=grouped,
+        verticals=VERTICALS,
+        can_edit_global=_user_can_edit_global_knowledge(),
+    )
+
+
+@app.route("/settings/etg-knowledge/add", methods=["POST"])
+@login_required
+def etg_knowledge_add():
+    section = request.form.get("section", "").strip()
+    title = request.form.get("title", "").strip()
+    content_md = request.form.get("content_md", "").strip()
+    vertical = request.form.get("vertical", "").strip()
+    tags = request.form.get("tags", "").strip()
+    is_global = bool(request.form.get("is_global"))
+
+    if section not in {key for key, _ in ETG_KNOWLEDGE_SECTIONS}:
+        flash("Invalid knowledge section.", "error")
+        return redirect(url_for("etg_knowledge_index"))
+    if not title or not content_md:
+        flash("Title and content are required.", "error")
+        return redirect(url_for("etg_knowledge_index"))
+    if is_global and not _user_can_edit_global_knowledge():
+        flash("Only admins can add company-wide (global) knowledge assets.", "error")
+        return redirect(url_for("etg_knowledge_index"))
+
+    asset = EtgKnowledgeAsset(
+        user_id=None if is_global else current_user.id,
+        section=section,
+        title=title,
+        content_md=content_md,
+        vertical=vertical,
+        tags=tags,
+        source="manual",
+    )
+    db.session.add(asset)
+    db.session.commit()
+    _log_activity("etg_knowledge_add", f"Added {section}: {title}")
+    flash(f"Added '{title}' to {section.replace('_', ' ')}.", "success")
+    return redirect(url_for("etg_knowledge_index") + f"#{section}")
+
+
+@app.route("/settings/etg-knowledge/<asset_id>/edit", methods=["POST"])
+@login_required
+def etg_knowledge_edit(asset_id):
+    asset = db.session.get(EtgKnowledgeAsset, asset_id)
+    if not asset:
+        abort(404)
+    if asset.user_id is not None and asset.user_id != current_user.id:
+        abort(404)
+    if asset.user_id is None and not _user_can_edit_global_knowledge():
+        flash("Only admins can edit company-wide knowledge assets.", "error")
+        return redirect(url_for("etg_knowledge_index"))
+
+    asset.title = request.form.get("title", asset.title).strip() or asset.title
+    asset.content_md = request.form.get("content_md", asset.content_md).strip()
+    asset.vertical = request.form.get("vertical", asset.vertical).strip()
+    asset.tags = request.form.get("tags", asset.tags).strip()
+    asset.is_active = bool(request.form.get("is_active"))
+    db.session.commit()
+    _log_activity("etg_knowledge_edit", f"Updated {asset.section}: {asset.title}")
+    flash(f"Updated '{asset.title}'.", "success")
+    return redirect(url_for("etg_knowledge_index") + f"#{asset.section}")
+
+
+@app.route("/settings/etg-knowledge/<asset_id>/delete", methods=["POST"])
+@login_required
+def etg_knowledge_delete(asset_id):
+    asset = db.session.get(EtgKnowledgeAsset, asset_id)
+    if not asset:
+        abort(404)
+    if asset.user_id is not None and asset.user_id != current_user.id:
+        abort(404)
+    if asset.user_id is None and not _user_can_edit_global_knowledge():
+        flash("Only admins can delete company-wide knowledge assets.", "error")
+        return redirect(url_for("etg_knowledge_index"))
+
+    title = asset.title
+    section = asset.section
+    db.session.delete(asset)
+    db.session.commit()
+    _log_activity("etg_knowledge_delete", f"Deleted {section}: {title}")
+    flash(f"Deleted '{title}'.", "success")
+    return redirect(url_for("etg_knowledge_index") + f"#{section}")
 
 
 # ---------------------------------------------------------------------------

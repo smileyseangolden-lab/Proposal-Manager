@@ -110,6 +110,11 @@ class ProjectDocument(db.Model):
     version_group = db.Column(db.String(32), default="")  # Groups document versions together
     version_label = db.Column(db.String(100), default="")  # e.g., "Addendum 1", "Rev B"
 
+    # Pre-Proposal Triage (Phase 1)
+    bid_package_id = db.Column(db.String(32), db.ForeignKey("bid_packages.id"), nullable=True)
+    relative_path = db.Column(db.String(1000), default="")  # path within the bid package (preserves zip subfolder structure)
+    sha256 = db.Column(db.String(64), default="", index=True)
+
     tags = db.relationship("DocumentTag", backref="document", lazy="dynamic", cascade="all, delete-orphan")
 
 
@@ -633,3 +638,143 @@ class RevisionTemplate(db.Model):
     created_at = db.Column(db.DateTime, default=_utcnow)
 
     user = db.relationship("User", backref="revision_templates")
+
+
+# ---------------------------------------------------------------------------
+# Pre-Proposal Triage (Phase 1)
+# ---------------------------------------------------------------------------
+
+
+class BidPackage(db.Model):
+    """A bulk upload of bid documents tied to a single project.
+
+    Created when an AE uploads a zip archive (or chooses a server-side folder)
+    containing all documents from a customer bid package. Acts as the parent
+    record for the per-document triage analysis.
+    """
+    __tablename__ = "bid_packages"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    project_id = db.Column(db.String(32), db.ForeignKey("projects.id"), nullable=False)
+    uploaded_by = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    source = db.Column(db.String(20), default="zip")  # zip, folder, manual
+    original_filename = db.Column(db.String(500), default="")
+    total_size_bytes = db.Column(db.BigInteger, default=0)
+    file_count = db.Column(db.Integer, default=0)
+    duplicate_count = db.Column(db.Integer, default=0)
+    skipped_count = db.Column(db.Integer, default=0)
+    status = db.Column(db.String(20), default="ingesting")  # ingesting, ready, failed
+    error_message = db.Column(db.Text, default="")
+    notes = db.Column(db.Text, default="")
+    ingested_at = db.Column(db.DateTime, default=_utcnow)
+    completed_at = db.Column(db.DateTime, nullable=True)
+
+    project = db.relationship("Project", backref="bid_packages")
+    uploader = db.relationship("User")
+
+
+class DocumentAnalysis(db.Model):
+    """Per-document triage analysis: trade, type, addendum, synopsis, entities.
+
+    Populated by the triage worker after each document is classified. One row
+    per ProjectDocument that has been (or is being) analyzed.
+    """
+    __tablename__ = "document_analyses"
+    __table_args__ = (
+        db.UniqueConstraint("document_id", name="uq_document_analysis"),
+    )
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    document_id = db.Column(db.String(32), db.ForeignKey("project_documents.id"), nullable=False)
+    project_id = db.Column(db.String(32), db.ForeignKey("projects.id"), nullable=False)
+    bid_package_id = db.Column(db.String(32), db.ForeignKey("bid_packages.id"), nullable=True)
+
+    # Classification
+    trade = db.Column(db.String(80), default="")  # electrical, instrumentation, automation, etc.
+    document_type_detected = db.Column(db.String(80), default="")  # specification, datasheet, drawing, etc.
+    addendum_label = db.Column(db.String(80), default="")  # Base, Addendum 1, Rev B, etc.
+
+    # Content
+    synopsis = db.Column(db.Text, default="")  # ~25-word factual summary
+    key_entities = db.Column(db.Text, default="")  # JSON: {"systems": [...], "io_count": N, ...}
+
+    # Quality flags
+    text_length = db.Column(db.Integer, default=0)
+    needs_ocr = db.Column(db.Boolean, default=False)
+    confidence = db.Column(db.Float, default=0.0)  # 0.0..1.0 from the model
+
+    # Pipeline state
+    status = db.Column(db.String(20), default="pending")  # pending, analyzing, analyzed, needs_review, failed
+    error_message = db.Column(db.Text, default="")
+    llm_model = db.Column(db.String(100), default="")
+    analyzed_at = db.Column(db.DateTime, nullable=True)
+
+    # AE review
+    reviewer_status = db.Column(db.String(20), default="unreviewed")  # unreviewed, reviewed, flagged
+    reviewer_notes = db.Column(db.Text, default="")
+    reviewed_by = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    reviewed_at = db.Column(db.DateTime, nullable=True)
+
+    created_at = db.Column(db.DateTime, default=_utcnow)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow)
+
+    document = db.relationship("ProjectDocument", backref=db.backref("analysis", uselist=False))
+    project = db.relationship("Project")
+    bid_package = db.relationship("BidPackage", backref="analyses")
+    reviewer = db.relationship("User", foreign_keys=[reviewed_by])
+
+
+class EtgKnowledgeAsset(db.Model):
+    """Structured ETG knowledge base used to inject company context into AI prompts.
+
+    Replaces the looser CompanyStandard model with a tagged, vertical-aware
+    library. Each asset has a section (company_profile, capabilities, tech_stack,
+    sow_boilerplate, exclusions, pricing_reference, past_proposal, taxonomy,
+    expected_documents, brand_asset) so the retrieval helper can pull only what's
+    relevant per task without blowing the context window.
+    """
+    __tablename__ = "etg_knowledge_assets"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)  # null = system/global
+    section = db.Column(db.String(40), nullable=False, index=True)
+    title = db.Column(db.String(300), nullable=False)
+    content_md = db.Column(db.Text, default="")
+    file_path = db.Column(db.String(1000), default="")
+    vertical = db.Column(db.String(50), default="")  # blank = applies to all verticals
+    tags = db.Column(db.Text, default="")  # comma-separated tags for retrieval filtering
+    is_active = db.Column(db.Boolean, default=True)
+    sort_order = db.Column(db.Integer, default=0)
+    source = db.Column(db.String(40), default="manual")  # manual, migrated_company_standard, system_seed
+    created_at = db.Column(db.DateTime, default=_utcnow)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow)
+
+    user = db.relationship("User", backref="etg_knowledge_assets")
+
+
+class TriageJob(db.Model):
+    """Background work items for the triage worker.
+
+    SQLite-backed queue: the worker daemon polls this table for pending rows,
+    claims them with a status update inside a transaction, and runs the
+    associated handler. Keeps the architecture single-service and simple.
+    """
+    __tablename__ = "triage_jobs"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    project_id = db.Column(db.String(32), db.ForeignKey("projects.id"), nullable=True)
+    bid_package_id = db.Column(db.String(32), db.ForeignKey("bid_packages.id"), nullable=True)
+    document_id = db.Column(db.String(32), db.ForeignKey("project_documents.id"), nullable=True)
+    user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+
+    job_type = db.Column(db.String(40), nullable=False)  # ingest_zip, analyze_document
+    payload = db.Column(db.Text, default="")  # JSON for handler-specific args
+    status = db.Column(db.String(20), default="pending", index=True)  # pending, running, done, failed
+    attempts = db.Column(db.Integer, default=0)
+    max_attempts = db.Column(db.Integer, default=2)
+    error_message = db.Column(db.Text, default="")
+
+    created_at = db.Column(db.DateTime, default=_utcnow)
+    started_at = db.Column(db.DateTime, nullable=True)
+    finished_at = db.Column(db.DateTime, nullable=True)
+    heartbeat_at = db.Column(db.DateTime, nullable=True)

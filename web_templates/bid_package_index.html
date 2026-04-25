@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+
+{% block title %}Bid Package Index &mdash; {{ project.name }}{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <div class="page-header-row">
+        <div>
+            <h1>Bid Package Index</h1>
+            <p class="page-subtitle">{{ project.name }} &mdash; {{ package.original_filename or package.id }}</p>
+        </div>
+        <div class="header-actions">
+            <a href="{{ url_for('bid_package_landing', project_id=project.id) }}" class="btn btn-small btn-secondary">All Packages</a>
+            <a href="{{ url_for('bid_package_xlsx', project_id=project.id, package_id=package.id) }}" class="btn btn-small btn-secondary">Export XLSX</a>
+            <form method="post" action="{{ url_for('bid_package_analyze', project_id=project.id, package_id=package.id) }}" class="inline-form">
+                <button type="submit" class="btn btn-small btn-primary">Run Analysis</button>
+            </form>
+        </div>
+    </div>
+</section>
+
+<div class="card">
+    <div class="form-row">
+        <div class="form-group">
+            <strong>{{ rows | length }}</strong> documents &middot;
+            <strong>{{ analyzed_count }}</strong> analyzed
+            {% if pending_jobs %}&middot; <span class="badge">{{ pending_jobs }} in queue</span>{% endif %}
+        </div>
+        <div class="form-group">
+            {% if package.duplicate_count %}<span class="form-hint">{{ package.duplicate_count }} duplicate(s) skipped at upload.</span>{% endif %}
+            {% if package.skipped_count %}<span class="form-hint">{{ package.skipped_count }} file(s) skipped (errors).</span>{% endif %}
+        </div>
+    </div>
+
+    {% if trade_counts %}
+    <p class="form-hint"><strong>By trade:</strong>
+        {% for t, n in trade_counts %}<span class="badge">{{ t }} &times; {{ n }}</span>{% if not loop.last %} {% endif %}{% endfor %}
+    </p>
+    {% endif %}
+    {% if type_counts %}
+    <p class="form-hint"><strong>By document type:</strong>
+        {% for t, n in type_counts %}<span class="badge">{{ t }} &times; {{ n }}</span>{% if not loop.last %} {% endif %}{% endfor %}
+    </p>
+    {% endif %}
+</div>
+
+<div class="card">
+    <h2>Documents</h2>
+    {% if rows %}
+    <input type="text" id="bid-filter" placeholder="Filter by filename, trade, or synopsis..." class="input-small" style="width:100%; margin-bottom:8px;">
+    <table class="mini-table" id="bid-table">
+        <thead>
+            <tr>
+                <th>Path / File</th>
+                <th>Trade</th>
+                <th>Type</th>
+                <th>Addendum</th>
+                <th>Synopsis</th>
+                <th>Status</th>
+                <th>Review</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for r in rows %}
+        <tr data-search="{{ (r.relative_path ~ ' ' ~ r.name ~ ' ' ~ r.trade ~ ' ' ~ r.document_type ~ ' ' ~ r.synopsis) | lower }}">
+            <td>
+                <div><strong>{{ r.name }}</strong></div>
+                {% if r.relative_path and r.relative_path != r.name %}<div class="form-hint">{{ r.relative_path }}</div>{% endif %}
+                {% if r.needs_ocr %}<span class="badge badge-status-flagged">needs OCR</span>{% endif %}
+            </td>
+            <td>{% if r.trade %}<span class="badge">{{ r.trade }}</span>{% else %}&mdash;{% endif %}</td>
+            <td>{% if r.document_type %}<span class="badge">{{ r.document_type }}</span>{% else %}&mdash;{% endif %}</td>
+            <td>{{ r.addendum_label or '&mdash;' | safe }}</td>
+            <td>{{ r.synopsis or '&mdash;' | safe }}</td>
+            <td>
+                <span class="badge badge-status-{{ r.status }}">{{ r.status }}</span>
+                {% if r.confidence %}<div class="form-hint">conf {{ "%.0f"|format(r.confidence * 100) }}%</div>{% endif %}
+            </td>
+            <td>
+                <form method="post" action="{{ url_for('bid_package_set_review', project_id=project.id, package_id=package.id, document_id=r.id) }}" class="inline-form">
+                    <select name="reviewer_status" class="status-select">
+                        <option value="unreviewed" {% if r.reviewer_status == 'unreviewed' %}selected{% endif %}>Unreviewed</option>
+                        <option value="reviewed" {% if r.reviewer_status == 'reviewed' %}selected{% endif %}>Reviewed</option>
+                        <option value="flagged" {% if r.reviewer_status == 'flagged' %}selected{% endif %}>Flagged</option>
+                    </select>
+                    <button type="submit" class="btn btn-small btn-secondary">Save</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p class="empty-hint">No documents in this package.</p>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+    var filter = document.getElementById('bid-filter');
+    var table = document.getElementById('bid-table');
+    if (!filter || !table) return;
+    filter.addEventListener('input', function(){
+        var q = filter.value.trim().toLowerCase();
+        var rows = table.querySelectorAll('tbody tr');
+        for (var i = 0; i < rows.length; i++) {
+            var hay = rows[i].getAttribute('data-search') || '';
+            rows[i].style.display = (!q || hay.indexOf(q) !== -1) ? '' : 'none';
+        }
+    });
+})();
+</script>
+{% endblock %}

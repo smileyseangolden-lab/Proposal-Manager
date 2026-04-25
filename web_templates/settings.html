@@ -232,6 +232,7 @@
     <div class="card">
         <h2>Company Standards & Posture</h2>
         <p class="card-desc">Define your company's standard content that the AI will automatically include in proposals: mission statement, certifications, past performance, safety record, quality standards, etc.</p>
+        <p class="form-hint">Looking for richer, structured ETG context? Try the new <a href="{{ url_for('etg_knowledge_index') }}">ETG Knowledge Base</a> &mdash; same auto-inject, plus capabilities, tech stack, exclusions, and per-vertical scope.</p>
 
         <form method="post" action="{{ url_for('add_company_standard') }}" enctype="multipart/form-data" class="upload-inline">
             <div class="form-row">

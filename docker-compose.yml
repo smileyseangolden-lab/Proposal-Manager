@@ -29,3 +29,24 @@ services:
       - ./reference_documents:/app/reference_documents
       - ./config:/app/config
       - ./data:/app/data
+
+  triage-worker:
+    build: .
+    restart: unless-stopped
+    # Runs the pre-proposal triage queue. Polls the SQLite-backed
+    # triage_jobs table and processes per-document analysis tasks. Sharing
+    # the host network keeps DB access (sqlite file mount) and outbound
+    # Anthropic API egress simple.
+    network_mode: host
+    command: ["python", "triage_worker.py"]
+    env_file:
+      - .env
+    volumes:
+      - ./uploads:/app/uploads
+      - ./generated_proposals:/app/generated_proposals
+      - ./templates:/app/templates
+      - ./reference_documents:/app/reference_documents
+      - ./config:/app/config
+      - ./data:/app/data
+    depends_on:
+      - proposal-manager
