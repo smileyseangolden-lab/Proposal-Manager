@@ -984,13 +984,220 @@ def dashboard():
 
 
 # ---------------------------------------------------------------------------
-# Proposals list, Posture & Setup Wizard (fleshed out in later builds)
+# Proposals list page
 # ---------------------------------------------------------------------------
+
+PROPOSAL_FILTERS = [
+    ("all", "All", ""),
+    ("mine", "My Proposals", ""),
+    ("overdue", "Overdue", "pf-red"),
+    ("unassigned", "Unassigned", "pf-gold"),
+    ("awaiting_generation", "Awaiting Generation", "pf-gold"),
+    ("in_review", "In Review", ""),
+    ("revisions", "Revisions Requested", "pf-gold"),
+    ("awaiting_customer", "Awaiting Customer", "pf-violet"),
+    ("won", "Won", "pf-ok"),
+    ("lost", "Lost", "pf-red"),
+]
+
+
+def _build_proposal_rows():
+    """Load all accessible projects enriched with their latest proposal state."""
+    if current_user.is_admin:
+        projects = Project.query.order_by(Project.updated_at.desc()).all()
+    else:
+        projects = Project.query.filter(_my_projects_filter()).order_by(
+            Project.updated_at.desc()
+        ).all()
+
+    now_naive = datetime.utcnow()
+    rows = []
+    for p in projects:
+        latest = (
+            Proposal.query.filter_by(project_id=p.id)
+            .order_by(Proposal.generated_at.desc())
+            .first()
+        )
+        doc_count = ProjectDocument.query.filter_by(project_id=p.id).count()
+        pending_req = 0
+        if latest:
+            pending_req = RevisionRequest.query.filter_by(
+                proposal_id=latest.id, status="pending"
+            ).count()
+
+        overdue = False
+        if p.due_date and p.status == "active":
+            due = p.due_date.replace(tzinfo=None) if p.due_date.tzinfo else p.due_date
+            overdue = due < now_naive
+
+        health = latest.confidence_score if latest else None
+        if health is not None and health >= 80:
+            health_class = "health-good"
+        elif health is not None and health >= 60:
+            health_class = "health-fair"
+        elif health is not None:
+            health_class = "health-poor"
+        else:
+            health_class = ""
+
+        if latest:
+            status_label = LIFECYCLE_LABELS.get(latest.review_status, latest.review_status)
+            status_class = f"badge-review badge-review-{latest.review_status}"
+        else:
+            status_label = "Awaiting Generation" if doc_count else "Needs Documents"
+            status_class = "badge-status-open" if doc_count else "badge-status-draft"
+        if p.status in ("won", "lost", "archived", "submitted") and not latest:
+            status_label = p.status.title()
+            status_class = f"badge-status-{p.status}"
+
+        rows.append({
+            "project": p,
+            "proposal": latest,
+            "doc_count": doc_count,
+            "pending_req": pending_req,
+            "overdue": overdue,
+            "health": health,
+            "health_class": health_class,
+            "status_label": status_label,
+            "status_class": status_class,
+        })
+    return rows
+
+
+def _filter_proposal_rows(rows, flt):
+    uid = current_user.id
+    if flt == "mine":
+        return [r for r in rows if r["project"].user_id == uid]
+    if flt == "overdue":
+        return [r for r in rows if r["overdue"]]
+    if flt == "unassigned":
+        return [r for r in rows if r["project"].status == "active" and not r["project"].assigned_to]
+    if flt == "awaiting_generation":
+        return [r for r in rows if r["project"].status == "active" and r["doc_count"] > 0 and not r["proposal"]]
+    if flt == "in_review":
+        return [r for r in rows if r["proposal"] and r["proposal"].review_status in ("in_review", "revision_requested")]
+    if flt == "revisions":
+        return [r for r in rows if (r["proposal"] and r["proposal"].review_status == "revision_requested") or r["pending_req"] > 0]
+    if flt == "awaiting_customer":
+        return [r for r in rows if r["proposal"] and r["proposal"].review_status in ("submitted_to_customer", "customer_feedback")]
+    if flt == "won":
+        return [r for r in rows if r["project"].status == "won"]
+    if flt == "lost":
+        return [r for r in rows if r["project"].status == "lost"]
+    return rows
+
+
+def _apply_row_query_filters(rows):
+    """Apply search / status / vertical filters + sorting from query params."""
+    q = request.args.get("q", "").strip().lower()
+    f_status = request.args.get("status", "")
+    f_vertical = request.args.get("vertical", "")
+    sort = request.args.get("sort", "updated")
+    direction = request.args.get("dir", "desc")
+
+    if q:
+        rows = [r for r in rows
+                if q in (r["project"].name or "").lower()
+                or q in (r["project"].client_name or "").lower()]
+    if f_status:
+        rows = [r for r in rows if r["project"].status == f_status]
+    if f_vertical:
+        rows = [r for r in rows if r["project"].vertical == f_vertical]
+
+    keymap = {
+        "title": lambda r: (r["project"].name or "").lower(),
+        "client": lambda r: (r["project"].client_name or "").lower(),
+        "vertical": lambda r: (r["project"].vertical_label or "").lower(),
+        "value": lambda r: r["project"].dollar_amount or 0,
+        "status": lambda r: r["status_label"],
+        "due": lambda r: r["project"].due_date.replace(tzinfo=None) if r["project"].due_date else datetime.max,
+        "health": lambda r: r["health"] if r["health"] is not None else -1,
+        "updated": lambda r: r["project"].updated_at or datetime.min,
+    }
+    keyfn = keymap.get(sort, keymap["updated"])
+    rows.sort(key=keyfn, reverse=(direction != "asc"))
+    return rows
+
 
 @app.route("/proposals")
 @login_required
 def proposals_list():
-    return redirect(url_for("dashboard"))
+    flt = request.args.get("filter", "all")
+    if flt not in {f[0] for f in PROPOSAL_FILTERS}:
+        flt = "all"
+
+    all_rows = _build_proposal_rows()
+    counts = {key: len(_filter_proposal_rows(all_rows, key)) for key, _, _ in PROPOSAL_FILTERS}
+    rows = _apply_row_query_filters(_filter_proposal_rows(all_rows, flt))
+
+    proposal_users = User.query.filter(User.role.in_(["proposal", "admin"])).order_by(User.display_name).all()
+
+    close_category_labels = {
+        "price": "Price", "scope": "Scope", "schedule": "Schedule / Timing",
+        "relationship": "Relationship / Incumbent", "technical": "Technical Approach",
+        "compliance": "Compliance / Requirements", "other": "Other",
+    }
+
+    return render_template(
+        "proposals.html",
+        rows=rows,
+        counts=counts,
+        active_filter=flt,
+        filters=PROPOSAL_FILTERS,
+        verticals=VERTICALS,
+        proposal_users=proposal_users,
+        close_category_labels=close_category_labels,
+        q=request.args.get("q", ""),
+        f_status=request.args.get("status", ""),
+        f_vertical=request.args.get("vertical", ""),
+        sort=request.args.get("sort", "updated"),
+        direction=request.args.get("dir", "desc"),
+        view=request.args.get("view", "table"),
+    )
+
+
+@app.route("/proposals/export.csv")
+@login_required
+def proposals_export_csv():
+    """Export the current (filtered) proposals list as CSV."""
+    import csv
+    import io
+    from flask import Response
+
+    flt = request.args.get("filter", "all")
+    if flt not in {f[0] for f in PROPOSAL_FILTERS}:
+        flt = "all"
+    rows = _apply_row_query_filters(_filter_proposal_rows(_build_proposal_rows(), flt))
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Title", "Client", "Vertical", "Value", "Status", "Health",
+                     "Due Date", "Assigned To", "Created", "Updated"])
+    for r in rows:
+        p = r["project"]
+        writer.writerow([
+            p.name,
+            p.client_name or "",
+            p.vertical_label or "",
+            p.dollar_amount or 0,
+            r["status_label"],
+            r["health"] if r["health"] is not None else "",
+            p.due_date.strftime("%Y-%m-%d") if p.due_date else "",
+            (p.assignee.display_name or p.assignee.username) if p.assignee else "",
+            p.created_at.strftime("%Y-%m-%d") if p.created_at else "",
+            p.updated_at.strftime("%Y-%m-%d") if p.updated_at else "",
+        ])
+    output.seek(0)
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=proposals_{flt}.csv"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Posture & Setup Wizard (fleshed out in Build 5)
+# ---------------------------------------------------------------------------
 
 
 @app.route("/posture")
