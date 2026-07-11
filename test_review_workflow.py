@@ -578,9 +578,9 @@ with app.app_context():
     tmpl = RevisionTemplate.query.first()
     test("Template directive saved", 'percentage point' in tmpl.directive_template)
 
-    # Shows up in settings page
-    resp = client.get('/settings')
-    test("Settings shows revision template", b'Bump margin 1%' in resp.data)
+    # Shows up on the Proposal Posture page (moved from Settings)
+    resp = client.get('/posture')
+    test("Posture shows revision template", b'Bump margin 1%' in resp.data)
 
     # Delete
     resp = client.post(f'/settings/delete-revision-template/{tmpl.id}', follow_redirects=True)
@@ -617,16 +617,18 @@ with app.app_context():
         },
     )
 
-    # Owner dashboard shows "Out for Review"
+    # Owner dashboard focus list shows the in-review project
     resp = client.get('/')
-    test("Owner dashboard shows Out for Review", b'Out for Review' in resp.data)
+    test("Owner dashboard shows focus list", b'Pick up where you left off' in resp.data)
     test("Owner dashboard lists Proj 2", b'Proj 2' in resp.data)
+    test("Owner dashboard shows In review chip", b'In review' in resp.data)
 
     # Engineer dashboard shows "Pending My Review"
     client.get('/logout')
     login_as(client, "engineer")
     resp = client.get('/')
-    test("Engineer dashboard shows Pending My Review", b'Pending My Review' in resp.data)
+    test("Engineer dashboard shows review request", b'Review requested' in resp.data)
+    test("Engineer dashboard shows Start review action", b'Start review' in resp.data)
     test("Engineer dashboard lists Proj 2", b'Proj 2' in resp.data)
 
     # =========================================================================

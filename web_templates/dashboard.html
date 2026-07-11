@@ -2,91 +2,109 @@
 
 {% block title %}Dashboard &mdash; {{ app_name }}{% endblock %}
 
+{% block breadcrumb %}<span class="crumb-current">Dashboard</span>{% endblock %}
+
 {% block content %}
-<section class="page-header">
-    <div class="page-header-row">
-        <div>
-            <h1>Dashboard</h1>
-            <p class="page-subtitle">Welcome back, {{ current_user.display_name or current_user.username }}
-                <span class="role-badge role-{{ user_role }}">{{ user_role | title }}</span>
-            </p>
-        </div>
-        <div class="header-actions">
-            <a href="{{ url_for('new_project') }}" class="btn btn-primary">+ New Project</a>
-            {% if notifications %}
-            <a href="{{ url_for('notifications_page') }}" class="btn btn-secondary notif-btn">
-                Notifications <span class="notif-badge">{{ notifications|length }}</span>
-            </a>
-            {% endif %}
-        </div>
-    </div>
+{% include "_setup_banner.html" %}
+
+<!-- Serif greeting -->
+<section style="padding: 26px 0 4px;">
+    <h1 class="greeting">{{ greeting_word }}, {{ first_name }}. <em>Here's where to focus today.</em></h1>
+    <p class="greeting-sub">
+        {{ today_str }} &middot;
+        {% if overdue_count %}
+        <strong>{{ overdue_count }} proposal{{ 's are' if overdue_count != 1 else ' is' }} overdue</strong> and need{{ '' if overdue_count != 1 else 's' }} action
+        {% elif due_soon_count %}
+        {{ due_soon_count }} proposal{{ 's' if due_soon_count != 1 }} due in the next 7 days
+        {% else %}
+        <span class="greeting-ok">nothing overdue</span> — you're on top of it
+        {% endif %}
+    </p>
 </section>
 
-<!-- Notifications Banner -->
-{% if notifications %}
-<div class="card notif-card">
-    <div class="notif-card-header">
-        <h2>Recent Notifications</h2>
-        <form method="post" action="{{ url_for('mark_all_notifications_read') }}" class="inline-form">
-            <button type="submit" class="btn btn-small btn-secondary">Mark All Read</button>
+<!-- Hero: start session + focus list -->
+<div class="hero-grid">
+    <div class="session-card">
+        <h2>Start a new proposal session</h2>
+        <p>Drop an RFP or RFQ and the AI will draft a proposal against your posture in minutes.</p>
+
+        <form method="post" action="{{ url_for('quick_start') }}" enctype="multipart/form-data" id="quick-start-form">
+            <div class="session-drop" id="quick-drop">
+                <div class="session-drop-icon" id="quick-drop-icon">&#8682;</div>
+                <div class="session-drop-text" id="quick-drop-text">Drop an RFP/RFQ here</div>
+                <div class="session-drop-formats">PDF, DOCX, TXT, MD or XLSX &middot; up to 50 MB</div>
+                <input type="file" name="documents" id="quick-file-input" multiple accept=".pdf,.docx,.doc,.txt,.md,.xlsx,.xls">
+            </div>
         </form>
-    </div>
-    <div class="notif-list">
-        {% for n in notifications[:5] %}
-        <div class="notif-item notif-{{ n.category }}">
-            <div class="notif-icon">
-                {% if n.category == 'proposal_generated' %}&#128196;{% elif n.category == 'rfp_uploaded' %}&#128228;{% elif n.category == 'assignment' %}&#128100;{% else %}&#128276;{% endif %}
-            </div>
-            <div class="notif-content">
-                <span class="notif-title">{{ n.title }}</span>
-                <span class="notif-time">{{ n.created_at.strftime('%b %d, %H:%M') }}</span>
-            </div>
-            {% if n.link %}
-            <a href="{{ n.link }}" class="btn btn-small btn-secondary">View</a>
-            {% endif %}
+
+        <div class="session-actions">
+            <button type="button" class="btn btn-hero-primary" id="quick-upload-btn">+ Upload RFP</button>
+            <a href="{{ url_for('new_project') }}" class="btn btn-hero-secondary">Start blank project</a>
         </div>
-        {% endfor %}
     </div>
-    {% if notifications|length > 5 %}
-    <a href="{{ url_for('notifications_page') }}" class="btn btn-small btn-secondary" style="margin-top:8px;">View all {{ notifications|length }} notifications</a>
-    {% endif %}
-</div>
-{% endif %}
 
-<!-- Overdue + Upcoming Deadlines -->
-{% if overdue_projects or upcoming_deadlines %}
-<div class="card-grid deadline-card-grid">
-    {% if overdue_projects %}
-    <div class="card card-danger">
-        <h2>Overdue <span class="badge badge-danger">{{ overdue_projects|length }}</span></h2>
-        <ul class="deadline-list">
-            {% for p in overdue_projects %}
-            <li>
-                <span class="deadline-date">{{ p.due_date.strftime('%Y-%m-%d') }}</span>
-                <a href="{{ url_for('project_upload', project_id=p.id) }}">{{ p.name }}</a>
+    <div class="focus-card">
+        <div class="focus-card-header">
+            <h2>Pick up where you left off</h2>
+            {% if focus_items %}<span class="focus-count">{{ focus_items | length }}</span>{% endif %}
+        </div>
+        <p class="focus-card-sub">Every open item in one list, sorted by impact — overdue first.</p>
+
+        <div class="focus-tabs" id="focus-tabs">
+            <button type="button" class="focus-tab active" data-tab="all">All</button>
+            <button type="button" class="focus-tab" data-tab="assigned">Assigned to me</button>
+            <button type="button" class="focus-tab" data-tab="customer">Awaiting customer</button>
+        </div>
+
+        {% if focus_items %}
+        <ul class="focus-list" id="focus-list">
+            {% for item in focus_items %}
+            <li class="focus-item{% if item.overdue %} focus-critical{% elif item.chip[1] == 'chip-gold' %} focus-warn{% endif %}"
+                data-assigned="{{ '1' if item.assigned_to_me else '0' }}"
+                data-customer="{{ '1' if item.with_customer else '0' }}">
+                <div class="focus-item-main">
+                    <a href="{{ item.url }}" class="focus-item-title">{{ item.title }}</a>
+                    <div class="focus-item-meta">
+                        <span class="mono">{{ item.code }}</span>
+                        {% if item.client %}<span>{{ item.client }}</span>{% endif %}
+                        <span class="chip {{ item.chip[1] }}"><span class="chip-dot"></span>{{ item.chip[0] }}</span>
+                    </div>
+                    <div class="focus-item-sub">
+                        {% if item.due_str %}<span class="{{ 'focus-overdue' if item.overdue }}">{{ item.due_str }}</span>{% if item.sub or item.value %} &middot; {% endif %}{% endif %}
+                        {% if item.value %}${{ "{:,.1f}".format(item.value / 1000000) }}M{% if item.sub %} &middot; {% endif %}{% endif %}
+                        {{ item.sub }}
+                    </div>
+                </div>
+                <div class="focus-item-side">
+                    <a href="{{ item.action_url }}" class="btn btn-primary btn-small">{{ item.action_label }} &rarr;</a>
+                </div>
             </li>
             {% endfor %}
         </ul>
+        <div class="focus-footer">
+            <span>Showing <strong id="focus-shown">{{ focus_items | length }}</strong> of {{ focus_items | length }} open item{{ 's' if focus_items | length != 1 }}
+                {% if combined_exposure %} &middot; <strong>${{ "{:,.1f}".format(combined_exposure / 1000000) }}M</strong> combined exposure{% endif %}
+            </span>
+            <a href="{{ url_for('proposals_list') }}">See all proposals &rarr;</a>
+        </div>
+        {% else %}
+        <div class="focus-empty">
+            <p>No open sessions. Drop an RFP on the left to start one.</p>
+        </div>
+        <div class="focus-footer">
+            <span></span>
+            <a href="{{ url_for('proposals_list') }}">See all proposals &rarr;</a>
+        </div>
+        {% endif %}
     </div>
-    {% endif %}
-    {% if upcoming_deadlines %}
-    <div class="card card-highlight">
-        <h2>Due Soon (7 days) <span class="badge">{{ upcoming_deadlines|length }}</span></h2>
-        <ul class="deadline-list">
-            {% for p in upcoming_deadlines %}
-            <li>
-                <span class="deadline-date">{{ p.due_date.strftime('%Y-%m-%d') }}</span>
-                <a href="{{ url_for('project_upload', project_id=p.id) }}">{{ p.name }}</a>
-            </li>
-            {% endfor %}
-        </ul>
-        <a href="{{ url_for('calendar_view') }}" class="btn btn-small btn-secondary">Open Calendar</a>
-    </div>
-    {% endif %}
 </div>
-{% endif %}
 
-<!-- Stats cards -->
+<!-- Portfolio dashboard -->
+<div class="eyebrow-row">
+    <span class="eyebrow">Portfolio dashboard</span>
+    <a href="{{ url_for('reports') }}">Full reports &rarr;</a>
+</div>
+
 <section class="stats-grid">
     <div class="stat-card">
         <span class="stat-number">{{ stats.total_projects }}</span>
@@ -130,393 +148,69 @@
 </div>
 {% endif %}
 
-<!-- PROPOSAL ROLE: Pending Work Queue -->
-{% if user_role == 'proposal' and pending_docs_projects %}
-<div class="card card-highlight">
-    <h2>Awaiting Proposal Generation</h2>
-    <p class="card-desc">Projects with uploaded documents but no generated proposal yet.</p>
-    <div class="pending-projects-grid">
-        {% for item in pending_docs_projects %}
-        <div class="pending-project-card">
-            <div class="pending-project-name">{{ item.project.name }}</div>
-            <div class="pending-project-meta">
-                <span>{{ item.project.client_name or 'No client' }}</span>
-                <span>{{ item.doc_count }} doc(s)</span>
-            </div>
-            <a href="{{ url_for('project_upload', project_id=item.project.id) }}" class="btn btn-small btn-primary" style="margin-top:8px;">Generate Proposal</a>
-        </div>
-        {% endfor %}
+<!-- All proposals live on the Proposals page -->
+<section class="section" style="margin-top: 6px;">
+    <div class="empty-state" style="padding: 22px;">
+        <p>Looking for the full pipeline? <a href="{{ url_for('proposals_list') }}">Open the Proposals page</a> for every project with filters, sorting, and status controls.</p>
     </div>
-</div>
-{% endif %}
-
-<!-- PROPOSAL ROLE: Recent Proposals -->
-{% if user_role == 'proposal' and recent_proposals %}
-<div class="card">
-    <h2>Recently Generated Proposals</h2>
-    <table class="mini-table">
-        <thead><tr><th>Project</th><th>Vertical</th><th>Confidence</th><th>Generated</th><th></th></tr></thead>
-        <tbody>
-        {% for prop in recent_proposals %}
-        <tr>
-            <td>{{ prop.project.name if prop.project else 'Unknown' }}</td>
-            <td><span class="badge badge-vertical">{{ prop.vertical_label }}</span></td>
-            <td>
-                <div class="confidence-bar">
-                    <div><div class="confidence-fill" style="width:{{ prop.confidence_score }}%"></div></div>
-                    <span>{{ prop.confidence_score }}%</span>
-                </div>
-            </td>
-            <td>{{ prop.generated_at.strftime('%Y-%m-%d %H:%M') if prop.generated_at else 'N/A' }}</td>
-            <td><a href="{{ url_for('view_proposal', proposal_id=prop.id) }}" class="btn btn-small btn-primary">View</a></td>
-        </tr>
-        {% endfor %}
-        </tbody>
-    </table>
-</div>
-{% endif %}
-
-<!-- Part 3: Pending My Review -->
-{% if my_reviews_pending %}
-<div class="card card-highlight">
-    <h2>Pending My Review <span class="pill">{{ my_reviews_pending|length }}</span></h2>
-    <p class="card-desc">Proposals where you've been assigned as a reviewer and haven't yet recorded your decision on the latest version.</p>
-    <table class="proposals-table">
-        <thead>
-            <tr>
-                <th>Project</th>
-                <th>Review Role</th>
-                <th>Version</th>
-                <th>Deadline</th>
-                <th></th>
-            </tr>
-        </thead>
-        <tbody>
-        {% for item in my_reviews_pending %}
-        <tr>
-            <td>{{ item.project.name if item.project else 'Unknown' }}</td>
-            <td><span class="badge badge-vertical">{{ item.reviewer.review_role | title }}</span></td>
-            <td>v{{ item.version_number }}</td>
-            <td>
-                {% if item.deadline %}
-                    <span {% if item.overdue %}class="overdue"{% endif %}>
-                        {{ item.deadline.strftime('%b %d') }}{% if item.overdue %} (overdue){% endif %}
-                    </span>
-                {% else %}
-                    &mdash;
-                {% endif %}
-            </td>
-            <td><a href="{{ url_for('proposal_review_page', proposal_id=item.proposal.id) }}" class="btn btn-small btn-primary">Review</a></td>
-        </tr>
-        {% endfor %}
-        </tbody>
-    </table>
-</div>
-{% endif %}
-
-<!-- Part 3: Out for Review (owner-side) -->
-{% if out_for_review %}
-<div class="card">
-    <h2>Out for Review <span class="pill">{{ out_for_review|length }}</span></h2>
-    <p class="card-desc">Your proposals currently in the internal review cycle.</p>
-    <table class="proposals-table">
-        <thead>
-            <tr>
-                <th>Project</th>
-                <th>Status</th>
-                <th>Approvals</th>
-                <th>Pending Requests</th>
-                <th></th>
-            </tr>
-        </thead>
-        <tbody>
-        {% for item in out_for_review %}
-        <tr>
-            <td>{{ item.project.name }}</td>
-            <td><span class="badge badge-review badge-review-{{ item.proposal.review_status }}">{{ lifecycle_labels.get(item.proposal.review_status, item.proposal.review_status) }}</span></td>
-            <td>{{ item.state.approved_count }}/{{ item.state.required_count }}</td>
-            <td>{{ item.pending_req_count }}</td>
-            <td><a href="{{ url_for('view_proposal', proposal_id=item.proposal.id) }}" class="btn btn-small btn-primary">Open</a></td>
-        </tr>
-        {% endfor %}
-        </tbody>
-    </table>
-</div>
-{% endif %}
-
-<!-- Part 3: Awaiting Customer Response -->
-{% if awaiting_customer_items %}
-<div class="card">
-    <h2>Awaiting Customer Response <span class="pill">{{ awaiting_customer_items|length }}</span></h2>
-    <p class="card-desc">Proposals currently with the customer.</p>
-    <table class="proposals-table">
-        <thead>
-            <tr>
-                <th>Project</th>
-                <th>Client</th>
-                <th>Status</th>
-                <th></th>
-            </tr>
-        </thead>
-        <tbody>
-        {% for item in awaiting_customer_items %}
-        <tr>
-            <td>{{ item.project.name }}</td>
-            <td>{{ item.project.client_name or '&mdash;' }}</td>
-            <td><span class="badge badge-review badge-review-{{ item.proposal.review_status }}">{{ lifecycle_labels.get(item.proposal.review_status, item.proposal.review_status) }}</span></td>
-            <td><a href="{{ url_for('view_proposal', proposal_id=item.proposal.id) }}" class="btn btn-small btn-primary">Open</a></td>
-        </tr>
-        {% endfor %}
-        </tbody>
-    </table>
-</div>
-{% endif %}
-
-<!-- Assigned to Me -->
-{% if assigned_to_me %}
-<div class="card card-highlight">
-    <h2>Assigned to Me</h2>
-    <p class="card-desc">Projects that have been assigned to you for proposal work.</p>
-    <table class="proposals-table">
-        <thead>
-            <tr>
-                <th>Project Name</th>
-                <th>Client</th>
-                <th>Owner</th>
-                <th>Status</th>
-                <th></th>
-            </tr>
-        </thead>
-        <tbody>
-        {% for p in assigned_to_me %}
-        <tr class="clickable-row" data-href="{{ url_for('project_upload', project_id=p.id) }}">
-            <td><a href="{{ url_for('project_upload', project_id=p.id) }}" class="project-link">{{ p.name }}</a></td>
-            <td>{{ p.client_name or '&mdash;' }}</td>
-            <td>{{ p.owner.display_name or p.owner.username if p.owner else '&mdash;' }}</td>
-            <td><span class="badge badge-status-{{ p.status }}">{{ p.status }}</span></td>
-            <td class="row-actions" onclick="event.stopPropagation()">
-                <a href="{{ url_for('project_upload', project_id=p.id) }}" class="btn btn-small btn-primary">Open</a>
-            </td>
-        </tr>
-        {% endfor %}
-        </tbody>
-    </table>
-</div>
-{% endif %}
-
-<!-- Active Projects -->
-<section class="section">
-    <h2>Active Projects</h2>
-    {% if active_projects %}
-    <table class="proposals-table">
-        <thead>
-            <tr>
-                <th>Project Name</th>
-                <th>Client</th>
-                <th>Vertical</th>
-                <th>Due</th>
-                <th>Assigned To</th>
-                <th>Created</th>
-                <th>Status</th>
-                <th>Actions</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for p in active_projects %}
-            <tr class="clickable-row" data-href="{{ url_for('project_upload', project_id=p.id) }}">
-                <td><a href="{{ url_for('project_upload', project_id=p.id) }}" class="project-link">{{ p.name }}</a></td>
-                <td>{{ p.client_name or '&mdash;' }}</td>
-                <td><span class="badge badge-vertical">{{ p.vertical_label or 'Not set' }}</span></td>
-                <td class="row-actions" onclick="event.stopPropagation()">
-                    <form method="post" action="{{ url_for('set_project_due_date', project_id=p.id) }}" class="inline-form">
-                        <input type="date" name="due_date" value="{{ p.due_date.strftime('%Y-%m-%d') if p.due_date else '' }}" onchange="this.form.submit()" class="date-input-small" title="Set due date">
-                    </form>
-                </td>
-                <td class="row-actions" onclick="event.stopPropagation()">
-                    {% if p.user_id == current_user.id or current_user.is_admin %}
-                    <form method="post" action="{{ url_for('assign_project', project_id=p.id) }}" class="inline-form">
-                        <select name="assigned_to" onchange="this.form.submit()" class="status-select" title="Assign to user">
-                            <option value="">Unassigned</option>
-                            {% for pu in proposal_users %}
-                            <option value="{{ pu.id }}" {{ 'selected' if p.assigned_to == pu.id }}>{{ pu.display_name or pu.username }}</option>
-                            {% endfor %}
-                        </select>
-                    </form>
-                    {% else %}
-                    {{ p.assignee.display_name or p.assignee.username if p.assignee else '&mdash;' }}
-                    {% endif %}
-                </td>
-                <td>{{ p.created_at.strftime('%Y-%m-%d') }}</td>
-                <td>
-                    <span class="badge badge-status-{{ p.status }}">{{ p.status }}</span>
-                    {% if p.clarification_sub_status and p.clarification_sub_status != 'none' %}
-                    <a href="{{ url_for('clarification_register', project_id=p.id) }}" class="badge badge-status-{{ p.clarification_sub_status }}" style="text-decoration:none;margin-left:2px;">
-                        {{ p.clarification_sub_status | replace('_', ' ') | title }}
-                    </a>
-                    {% endif %}
-                </td>
-                <td class="row-actions" onclick="event.stopPropagation()">
-                    <form method="post" action="{{ url_for('update_project_status', project_id=p.id) }}" class="inline-form js-status-form" data-project-name="{{ p.name }}">
-                        <select name="status" class="status-select">
-                            <option value="active" {{ 'selected' if p.status == 'active' }}>Active</option>
-                            <option value="submitted" {{ 'selected' if p.status == 'submitted' }}>Submitted</option>
-                            <option value="won" {{ 'selected' if p.status == 'won' }}>Won</option>
-                            <option value="lost" {{ 'selected' if p.status == 'lost' }}>Lost</option>
-                            <option value="archived" {{ 'selected' if p.status == 'archived' }}>Archived</option>
-                        </select>
-                        <input type="hidden" name="close_category" value="">
-                        <input type="hidden" name="competitor_name" value="">
-                        <input type="hidden" name="close_reason" value="">
-                        <input type="hidden" name="dollar_amount" value="{{ p.dollar_amount or '' }}">
-                    </form>
-                </td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
-    {% else %}
-    <div class="empty-state">
-        <p>No active projects. <a href="{{ url_for('new_project') }}">Start a new project</a> to get going.</p>
-    </div>
-    {% endif %}
 </section>
-
-<!-- Past Projects -->
-{% if past_projects %}
-<section class="section">
-    <h2>Past Projects</h2>
-    <table class="proposals-table">
-        <thead>
-            <tr>
-                <th>Project Name</th>
-                <th>Client</th>
-                <th>Vertical</th>
-                <th>Value</th>
-                <th>Status</th>
-                <th>Actions</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for p in past_projects %}
-            <tr class="clickable-row" data-href="{{ url_for('project_upload', project_id=p.id) }}">
-                <td><a href="{{ url_for('project_upload', project_id=p.id) }}" class="project-link">{{ p.name }}</a></td>
-                <td>{{ p.client_name or '&mdash;' }}</td>
-                <td><span class="badge badge-vertical">{{ p.vertical_label or 'N/A' }}</span></td>
-                <td>{{ "${:,.0f}".format(p.dollar_amount) if p.dollar_amount else '&mdash;' }}</td>
-                <td><span class="badge badge-status-{{ p.status }}">{{ p.status }}</span></td>
-                <td class="row-actions" onclick="event.stopPropagation()">
-                    <form method="post" action="{{ url_for('update_project_status', project_id=p.id) }}" class="inline-form">
-                        <input type="hidden" name="dollar_amount" value="{{ p.dollar_amount }}">
-                        <select name="status" onchange="this.form.submit()" class="status-select">
-                            <option value="active" {{ 'selected' if p.status == 'active' }}>Active</option>
-                            <option value="submitted" {{ 'selected' if p.status == 'submitted' }}>Submitted</option>
-                            <option value="won" {{ 'selected' if p.status == 'won' }}>Won</option>
-                            <option value="lost" {{ 'selected' if p.status == 'lost' }}>Lost</option>
-                            <option value="archived" {{ 'selected' if p.status == 'archived' }}>Archived</option>
-                        </select>
-                    </form>
-                </td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
-</section>
-{% endif %}
-<!-- Close Details Modal -->
-<div id="close-details-modal" class="modal-backdrop" style="display:none;">
-    <div class="modal-card">
-        <h2 id="close-modal-title">Capture Close Details</h2>
-        <p class="form-hint">Help build better win/loss reports by capturing what happened.</p>
-        <div class="form-group">
-            <label>Category</label>
-            <select id="close-modal-category">
-                <option value="">Select a category…</option>
-                {% for key, label in (close_category_labels or {}).items() %}
-                <option value="{{ key }}">{{ label }}</option>
-                {% endfor %}
-            </select>
-        </div>
-        <div class="form-group">
-            <label>Competitor (if known)</label>
-            <input type="text" id="close-modal-competitor" placeholder="e.g., Acme Controls">
-        </div>
-        <div class="form-group">
-            <label>Reason / Notes</label>
-            <textarea id="close-modal-reason" rows="3" placeholder="Briefly, why was this won/lost?"></textarea>
-        </div>
-        <div class="form-group">
-            <label>Dollar value (optional)</label>
-            <input type="text" id="close-modal-amount" placeholder="e.g., 150000">
-        </div>
-        <div class="modal-actions">
-            <button type="button" class="btn btn-secondary" id="close-modal-cancel">Cancel</button>
-            <button type="button" class="btn btn-primary" id="close-modal-submit">Save &amp; Close Project</button>
-        </div>
-    </div>
-</div>
 {% endblock %}
 
 {% block scripts %}
 <script>
-document.querySelectorAll(".clickable-row").forEach(function(row) {
-    row.addEventListener("click", function() {
-        window.location.href = this.dataset.href;
-    });
-});
-
-// Status change — if won/lost, show modal for close details; otherwise submit immediately
+// Quick-start dropzone: auto-submit on file selection
 (function(){
-    var modal = document.getElementById("close-details-modal");
-    var cancelBtn = document.getElementById("close-modal-cancel");
-    var submitBtn = document.getElementById("close-modal-submit");
-    var titleEl = document.getElementById("close-modal-title");
-    var categoryEl = document.getElementById("close-modal-category");
-    var competitorEl = document.getElementById("close-modal-competitor");
-    var reasonEl = document.getElementById("close-modal-reason");
-    var amountEl = document.getElementById("close-modal-amount");
-    var activeForm = null;
+    var form = document.getElementById("quick-start-form");
+    var drop = document.getElementById("quick-drop");
+    var input = document.getElementById("quick-file-input");
+    var text = document.getElementById("quick-drop-text");
+    var icon = document.getElementById("quick-drop-icon");
+    var uploadBtn = document.getElementById("quick-upload-btn");
+    if (!form || !drop || !input) return;
 
-    document.querySelectorAll(".js-status-form select[name='status']").forEach(function(sel){
-        sel.addEventListener("change", function(){
-            var form = sel.closest("form");
-            var status = sel.value;
-            if (status === "won" || status === "lost") {
-                // Populate modal defaults from current form
-                activeForm = form;
-                titleEl.textContent = "Close as " + status.charAt(0).toUpperCase() + status.slice(1) +
-                    ": " + form.dataset.projectName;
-                categoryEl.value = "";
-                competitorEl.value = "";
-                reasonEl.value = "";
-                amountEl.value = form.querySelector("input[name='dollar_amount']").value || "";
-                modal.style.display = "flex";
-            } else {
-                form.submit();
-            }
-        });
-    });
+    function startUpload(files) {
+        if (!files || !files.length) return;
+        text.textContent = "Starting session with " + files.length + " file(s)…";
+        icon.innerHTML = "&#8987;";
+        form.submit();
+    }
 
-    cancelBtn.addEventListener("click", function(){
-        modal.style.display = "none";
-        // Reset the select to the previously selected option — since we don't know it,
-        // reload the page to get fresh state.
-        window.location.reload();
-    });
-
-    submitBtn.addEventListener("click", function(){
-        if (!activeForm) return;
-        activeForm.querySelector("input[name='close_category']").value = categoryEl.value;
-        activeForm.querySelector("input[name='competitor_name']").value = competitorEl.value;
-        activeForm.querySelector("input[name='close_reason']").value = reasonEl.value;
-        activeForm.querySelector("input[name='dollar_amount']").value = amountEl.value;
-        activeForm.submit();
-    });
-
-    modal.addEventListener("click", function(e){
-        if (e.target === modal) {
-            cancelBtn.click();
+    drop.addEventListener("dragover", function(e){ e.preventDefault(); drop.classList.add("dragover"); });
+    drop.addEventListener("dragleave", function(){ drop.classList.remove("dragover"); });
+    drop.addEventListener("drop", function(e){
+        e.preventDefault();
+        drop.classList.remove("dragover");
+        if (e.dataTransfer.files.length) {
+            input.files = e.dataTransfer.files;
+            startUpload(e.dataTransfer.files);
         }
     });
+    input.addEventListener("change", function(){ startUpload(input.files); });
+    if (uploadBtn) uploadBtn.addEventListener("click", function(){ input.click(); });
 })();
+
+// Focus list tabs
+(function(){
+    var tabs = document.querySelectorAll("#focus-tabs .focus-tab");
+    var items = document.querySelectorAll("#focus-list .focus-item");
+    var shown = document.getElementById("focus-shown");
+    tabs.forEach(function(tab){
+        tab.addEventListener("click", function(){
+            tabs.forEach(function(t){ t.classList.remove("active"); });
+            tab.classList.add("active");
+            var mode = tab.dataset.tab;
+            var count = 0;
+            items.forEach(function(item){
+                var show = mode === "all"
+                    || (mode === "assigned" && item.dataset.assigned === "1")
+                    || (mode === "customer" && item.dataset.customer === "1");
+                item.style.display = show ? "" : "none";
+                if (show) count++;
+            });
+            if (shown) shown.textContent = count;
+        });
+    });
+})();
+
 </script>
 {% endblock %}

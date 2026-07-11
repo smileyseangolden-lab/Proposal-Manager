@@ -59,7 +59,8 @@ ALLOWED_EXTENSIONS = {"pdf", "docx", "doc", "txt", "md"}
 DEFAULT_OUTPUT_FORMAT = os.getenv("DEFAULT_OUTPUT_FORMAT", "docx")
 
 # Branding — change these to rebrand the entire app
-APP_NAME = os.getenv("APP_NAME", "ETG Proposal Manager")
-APP_SHORT_NAME = os.getenv("APP_SHORT_NAME", "ETG")
-APP_COMPANY = os.getenv("APP_COMPANY", "E Tech Group")
-APP_FOOTER = os.getenv("APP_FOOTER", "ETG Proposal Manager — E Tech Group — Powered by Claude")
+APP_NAME = os.getenv("APP_NAME", "Proposal Manager")
+APP_SHORT_NAME = os.getenv("APP_SHORT_NAME", "PM")
+APP_COMPANY = os.getenv("APP_COMPANY", "Proposal Manager")
+APP_TAGLINE = os.getenv("APP_TAGLINE", "AI-Powered Proposal Platform")
+APP_FOOTER = os.getenv("APP_FOOTER", "Proposal Manager — AI-Powered Proposal Platform")

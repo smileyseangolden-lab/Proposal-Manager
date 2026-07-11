@@ -1,0 +1,22 @@
+{# Chevron phase stepper. Expects `phases` (list of {key,label,state}) and
+   optionally `stepper_note` (text) + `stepper_percent` (0-100). #}
+<div class="stepper-card">
+    <div class="stepper">
+        {% for ph in phases %}
+        <div class="step step-{{ ph.state }}" title="{{ ph.label }}">
+            <span class="step-check">
+                {% if ph.state == 'complete' %}&#10003;{% elif ph.state == 'lost' %}&#10007;{% elif ph.state == 'current' %}&#9679;{% else %}&#9675;{% endif %}
+            </span>
+            <span>{{ ph.label }}</span>
+        </div>
+        {% endfor %}
+    </div>
+    {% if stepper_note or stepper_percent is defined %}
+    <div class="stepper-progress">
+        {% if stepper_note %}<span><span class="sp-dot"></span>{{ stepper_note }}</span>{% endif %}
+        {% if stepper_percent is defined and stepper_percent is not none %}
+        <div class="stepper-progress-track"><div class="stepper-progress-fill" style="width: {{ stepper_percent }}%;"></div></div>
+        {% endif %}
+    </div>
+    {% endif %}
+</div>

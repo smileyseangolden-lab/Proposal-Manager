@@ -26,6 +26,7 @@ EXPOSE 5000
 # long-running jobs finish cleanly. The host nginx proxy_read_timeout
 # MUST be >= this value or nginx will cut the connection first.
 # --graceful-timeout lets an in-flight request finish during worker reload.
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", \
-     "--timeout", "900", "--graceful-timeout", "900", \
-     "--keep-alive", "75", "app:app"]
+#
+# Binds to $PORT when the platform injects one (DigitalOcean App Platform,
+# Heroku-style hosts) and falls back to 5000 for local/VPS Docker runs.
+CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT:-5000} --workers 2 --timeout 900 --graceful-timeout 900 --keep-alive 75 app:app"]

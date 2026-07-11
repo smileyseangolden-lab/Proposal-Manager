@@ -53,11 +53,14 @@ with app.app_context():
     print("\n=== Settings Page Rendering ===")
     resp = client.get('/settings')
     test("Settings page loads", resp.status_code == 200)
+    # Company setup moved to the Proposal Posture page
+    resp = client.get('/posture')
+    test("Posture page loads", resp.status_code == 200)
     test("Has Staff Rates section", b'Staff Hourly Sell Rates' in resp.data)
-    test("Has Equipment section", b'Equipment' in resp.data and b'Materials Price List' in resp.data)
+    test("Has Equipment section", b'Equipment' in resp.data and b'Pricing' in resp.data)
     test("Has Travel section", b'Travel' in resp.data and b'Expense Rates' in resp.data)
-    test("Has Company Standards section", b'Company Standards' in resp.data and b'Posture' in resp.data)
-    test("Has Rate Sheets section", b'Rate &amp; Price Sheets' in resp.data or b'Rate' in resp.data)
+    test("Has Company Standards section", b'Company Standards' in resp.data)
+    test("Has Rate Sheets section", b'Rate' in resp.data)
 
     # ===== STAFF ROLES CRUD =====
     print("\n=== Staff Roles CRUD ===")
@@ -206,8 +209,8 @@ with app.app_context():
     test("Shows travel rate count", b'rate(s) configured' in resp.data)
 
     # ===== SETTINGS WITH DATA =====
-    print("\n=== Settings with Populated Data ===")
-    resp = client.get('/settings')
+    print("\n=== Posture with Populated Data ===")
+    resp = client.get('/posture')
     test("Shows existing staff role", b'Lead Engineer' in resp.data)
     test("Shows staff rate", b'185.00' in resp.data)
     test("Shows equipment item", b'VFD' in resp.data)
@@ -249,7 +252,7 @@ with app.app_context():
     resp = client.get(f'/proposal/{prop.id}')
     test("View proposal loads", resp.status_code == 200)
     test("Has Edit button", b'Edit Proposal' in resp.data)
-    test("Has Redline button", b'Download Redline' in resp.data)
+    test("Has Redlines toggle", b'Redlines' in resp.data)
 
     # Editor page
     resp = client.get(f'/proposal/{prop.id}/edit')
@@ -451,7 +454,7 @@ with app.app_context():
     # Dashboard should show upcoming deadline
     resp = client.get('/')
     test("Dashboard loads with deadlines", resp.status_code == 200)
-    test("Dashboard shows upcoming deadline", b'Due Soon' in resp.data)
+    test("Dashboard shows upcoming deadline", b'due in the next 7 days' in resp.data or b'day(s)' in resp.data)
 
     # ===== PART 2: WIN/LOSS CAPTURE =====
     print("\n=== Part 2: Win/Loss Analysis ===")

@@ -62,6 +62,7 @@ from models import (
     Notification,
     Project,
     ProjectDocument,
+    ProjectScope,
     Proposal,
     ProposalApproval,
     ProposalComment,
@@ -75,6 +76,7 @@ from models import (
     ReviewCycle,
     RevisionRequest,
     RevisionTemplate,
+    ScopeItem,
     StaffRole,
     TravelExpenseRate,
     User,
@@ -85,6 +87,7 @@ from models import (
 )
 from proposal_agent import (
     analyze_addendum_impact,
+    draft_scope_of_work,
     friendly_api_error,
     generate_proposal,
     parse_customer_email,
@@ -312,6 +315,115 @@ def inject_notifications():
     return dict(unread_notifications=0)
 
 
+def _setup_progress(user) -> dict:
+    """Compute workspace-setup wizard progress for a user.
+
+    Returns dict with 'steps' (list of {key,title,desc,done,url_endpoint,anchor}),
+    'done' count, 'total' count, and 'complete' bool.
+    """
+    steps = [
+        {
+            "key": "company",
+            "title": "Add your company profile",
+            "desc": "Company name used to brand generated proposals.",
+            "endpoint": "settings",
+            "anchor": "",
+            "done": bool((user.company_name or "").strip()),
+        },
+        {
+            "key": "logo",
+            "title": "Upload your company logo",
+            "desc": "Placed on proposal cover pages and headers.",
+            "endpoint": "posture",
+            "anchor": "#branding",
+            "done": bool(user.company_logo_path),
+        },
+        {
+            "key": "template",
+            "title": "Upload a proposal template",
+            "desc": "The AI follows your structure when drafting.",
+            "endpoint": "posture",
+            "anchor": "#templates",
+            "done": UserVerticalTemplate.query.filter_by(user_id=user.id).count() > 0,
+        },
+        {
+            "key": "standards",
+            "title": "Add company standards & terms",
+            "desc": "Mission, certifications, T&Cs auto-injected into proposals.",
+            "endpoint": "posture",
+            "anchor": "#standards",
+            "done": CompanyStandard.query.filter_by(user_id=user.id).count() > 0,
+        },
+        {
+            "key": "staff",
+            "title": "Define staff rates",
+            "desc": "Hourly sell rates for labor cost estimates.",
+            "endpoint": "posture",
+            "anchor": "#staff-rates",
+            "done": StaffRole.query.filter_by(user_id=user.id).count() > 0
+                    or UserRateSheet.query.filter_by(user_id=user.id).count() > 0,
+        },
+        {
+            "key": "equipment",
+            "title": "Add products & equipment pricing",
+            "desc": "Price list used for Bill of Materials estimates.",
+            "endpoint": "posture",
+            "anchor": "#equipment",
+            "done": EquipmentItem.query.filter_by(user_id=user.id).count() > 0,
+        },
+        {
+            "key": "travel",
+            "title": "Set travel & expense rates",
+            "desc": "Per diem, mileage, airfare used in travel estimates.",
+            "endpoint": "posture",
+            "anchor": "#travel",
+            "done": TravelExpenseRate.query.filter_by(user_id=user.id).count() > 0,
+        },
+        {
+            "key": "project",
+            "title": "Create your first project",
+            "desc": "Upload an RFP/RFQ to start a proposal session.",
+            "endpoint": "new_project",
+            "anchor": "",
+            "done": Project.query.filter_by(user_id=user.id).count() > 0,
+        },
+        {
+            "key": "proposal",
+            "title": "Generate your first proposal",
+            "desc": "Let the AI draft against your posture.",
+            "endpoint": "proposals_list",
+            "anchor": "",
+            "done": Proposal.query.join(Project).filter(Project.user_id == user.id).count() > 0,
+        },
+    ]
+    done = sum(1 for s in steps if s["done"])
+    return {
+        "steps": steps,
+        "done": done,
+        "total": len(steps),
+        "complete": done == len(steps),
+        "percent": round(done / len(steps) * 100),
+    }
+
+
+@app.context_processor
+def inject_nav_context():
+    """Sidebar counts + setup wizard progress for the app shell."""
+    if not (hasattr(current_user, "id") and current_user.is_authenticated):
+        return dict(setup_progress=None, nav_active_projects=0)
+    active_count = Project.query.filter(
+        db.or_(
+            Project.user_id == current_user.id,
+            Project.assigned_to == current_user.id,
+        ),
+        Project.status == "active",
+    ).count()
+    return dict(
+        setup_progress=_setup_progress(current_user),
+        nav_active_projects=active_count,
+    )
+
+
 def _can_access_project(project) -> bool:
     """Check if current user can access a project (owner, assigned, or admin)."""
     if not project:
@@ -475,8 +587,275 @@ def logout():
 
 
 # ---------------------------------------------------------------------------
+# Phase flow (chevron stepper)
+# ---------------------------------------------------------------------------
+
+def compute_phases(project, proposal, doc_count=None, scope_status=None) -> list[dict]:
+    """Map a project + latest proposal onto the 8-phase proposal flow.
+
+    Phases: Upload → Scope of Work → Draft Proposal → Internal Review →
+    Send to Customer → Negotiate → Awarded/Not Awarded → Storage.
+
+    Returns a list of {key, label, state} where state is one of
+    'complete', 'current', 'pending', 'lost'.
+    """
+    if doc_count is None:
+        doc_count = ProjectDocument.query.filter_by(project_id=project.id).count()
+
+    rs = (proposal.review_status or "draft") if proposal else None
+    won = project.status == "won" or rs in ("won", "customer_approved")
+    lost = project.status == "lost" or rs in ("lost", "customer_declined")
+    archived = project.status == "archived"
+
+    upload_done = doc_count > 0
+    scope_done = scope_status == "approved" or proposal is not None
+    draft_done = proposal is not None
+    review_done = rs in ("internally_approved", "submitted_to_customer", "customer_feedback",
+                         "customer_approved", "customer_declined", "won", "lost")
+    review_current = rs in ("draft", "in_review", "revision_requested")
+    send_done = rs in ("submitted_to_customer", "customer_feedback",
+                       "customer_approved", "customer_declined", "won", "lost")
+    send_current = rs == "internally_approved"
+    neg_done = rs in ("customer_approved", "customer_declined", "won", "lost")
+    neg_current = rs in ("submitted_to_customer", "customer_feedback")
+
+    def state(done, current):
+        if done:
+            return "complete"
+        if current:
+            return "current"
+        return "pending"
+
+    if won:
+        award_label, award_state = "Awarded", "complete"
+    elif lost:
+        award_label, award_state = "Not Awarded", "lost"
+    else:
+        award_label, award_state = "Award", "pending"
+
+    return [
+        {"key": "upload", "label": "Upload",
+         "state": state(upload_done, not upload_done)},
+        {"key": "scope", "label": "Scope of Work",
+         "state": state(scope_done, upload_done and not scope_done)},
+        {"key": "draft", "label": "Draft Proposal",
+         "state": state(draft_done, scope_done and not draft_done)},
+        {"key": "review", "label": "Internal Review",
+         "state": state(review_done, bool(proposal) and review_current)},
+        {"key": "send", "label": "Send to Customer",
+         "state": state(send_done, send_current)},
+        {"key": "negotiate", "label": "Negotiate",
+         "state": state(neg_done, neg_current)},
+        {"key": "award", "label": award_label, "state": award_state},
+        {"key": "storage", "label": "Storage",
+         "state": "complete" if archived else ("current" if (won or lost) else "pending")},
+    ]
+
+
+def _inline_redline_markdown(old_md: str, new_md: str) -> str:
+    """Produce a word-level inline diff of two markdown documents, wrapping
+    additions in <ins> and removals in <del> so the rendered HTML shows a
+    readable redline. Newlines are kept outside the tags so markdown block
+    structure survives."""
+    def tokenize(text):
+        return re.findall(r"[^\s]+|\n|[ \t]+", text)
+
+    def wrap(tokens, tag):
+        out = []
+        buf = []
+        for t in tokens:
+            if t == "\n":
+                if buf:
+                    out.append(f"<{tag}>{''.join(buf)}</{tag}>")
+                    buf = []
+                out.append("\n")
+            else:
+                buf.append(t)
+        if buf:
+            out.append(f"<{tag}>{''.join(buf)}</{tag}>")
+        return "".join(out)
+
+    old_tokens = tokenize(old_md)
+    new_tokens = tokenize(new_md)
+    sm = difflib.SequenceMatcher(None, old_tokens, new_tokens, autojunk=False)
+    parts = []
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            parts.append("".join(new_tokens[j1:j2]))
+        elif op == "insert":
+            parts.append(wrap(new_tokens[j1:j2], "ins"))
+        elif op == "delete":
+            parts.append(wrap(old_tokens[i1:i2], "del"))
+        else:  # replace
+            parts.append(wrap(old_tokens[i1:i2], "del"))
+            parts.append(wrap(new_tokens[j1:j2], "ins"))
+    return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Dashboard
 # ---------------------------------------------------------------------------
+
+def _project_focus_entry(p, now_naive):
+    """Build a 'pick up where you left off' entry for an active project.
+
+    Determines the single next action based on the latest proposal's
+    lifecycle state (or the pre-generation state of the project).
+    """
+    latest_prop = (
+        Proposal.query.filter_by(project_id=p.id)
+        .order_by(Proposal.generated_at.desc())
+        .first()
+    )
+    doc_count = ProjectDocument.query.filter_by(project_id=p.id).count()
+    pending_questions = ProposalQuestion.query.filter_by(
+        project_id=p.id, status="pending"
+    ).count()
+
+    action_label = "Open"
+    action_url = url_for("project_upload", project_id=p.id)
+    chip = ("Active", "chip-sea")
+    sub = ""
+
+    if pending_questions > 0:
+        action_label = "Answer questions"
+        action_url = url_for("project_questions", project_id=p.id)
+        chip = ("Your move", "chip-gold")
+        sub = f"{pending_questions} clarification question(s) awaiting answers"
+    elif latest_prop is None:
+        scope = ProjectScope.query.filter_by(project_id=p.id).first()
+        if doc_count == 0:
+            action_label = "Upload documents"
+            chip = ("Needs documents", "chip-neutral")
+            sub = "No RFP/RFQ uploaded yet"
+        elif scope is None:
+            action_label = "Draft scope of work"
+            chip = ("Your move", "chip-gold")
+            sub = f"{doc_count} document(s) ready · scope not drafted yet"
+        elif scope.status == "draft":
+            action_label = "Approve scope"
+            action_url = url_for("project_scope", project_id=p.id)
+            chip = ("Your move", "chip-gold")
+            sub = "AI scope drafted · awaiting your approval"
+        else:
+            action_label = "Generate proposal"
+            chip = ("Your move", "chip-gold")
+            sub = "Scope approved · awaiting AI draft"
+    else:
+        rs = latest_prop.review_status or "draft"
+        pending_req = RevisionRequest.query.filter_by(
+            proposal_id=latest_prop.id, status="pending"
+        ).count()
+        if rs == "draft":
+            action_label = "Send for review"
+            action_url = url_for("view_proposal", proposal_id=latest_prop.id)
+            chip = ("Your move", "chip-gold")
+            sub = "AI draft ready · not yet in internal review"
+        elif rs in ("in_review", "revision_requested"):
+            state = approval_state(latest_prop)
+            if pending_req > 0:
+                action_label = "Apply feedback"
+                action_url = url_for("apply_feedback", proposal_id=latest_prop.id)
+                chip = ("Your move", "chip-gold")
+                sub = f"{pending_req} pending revision request(s)"
+            else:
+                action_label = "Open"
+                action_url = url_for("view_proposal", proposal_id=latest_prop.id)
+                chip = ("In review", "chip-sea")
+                sub = f"{state['approved_count']} of {state['required_count']} reviewers approved"
+        elif rs == "internally_approved":
+            action_label = "Submit to customer"
+            action_url = url_for("view_proposal", proposal_id=latest_prop.id)
+            chip = ("Approved", "chip-ok")
+            sub = "Internally approved · ready to send"
+        elif rs == "submitted_to_customer":
+            action_label = "Open"
+            action_url = url_for("view_proposal", proposal_id=latest_prop.id)
+            chip = ("Their move", "chip-violet")
+            sub = "With the customer · awaiting response"
+        elif rs == "customer_feedback":
+            action_label = "Apply feedback"
+            action_url = url_for("apply_feedback", proposal_id=latest_prop.id)
+            chip = ("Customer feedback", "chip-violet")
+            sub = f"{pending_req} customer request(s) to apply" if pending_req else "Customer replied with feedback"
+        else:
+            return None  # terminal states don't belong in the focus list
+
+    overdue = False
+    due_str = ""
+    if p.due_date:
+        due = p.due_date.replace(tzinfo=None) if p.due_date.tzinfo else p.due_date
+        days = (due - now_naive).days
+        if due < now_naive:
+            overdue = True
+            due_str = f"{abs(days)} day(s) overdue"
+        elif days <= 7:
+            due_str = f"due in {days} day(s)"
+        else:
+            due_str = "due " + due.strftime("%b %d")
+
+    return {
+        "kind": "project",
+        "title": p.name,
+        "url": url_for("project_upload", project_id=p.id),
+        "client": p.client_name or "",
+        "code": (latest_prop.document_type if latest_prop else "RFP") + "-" + p.id[:6].upper(),
+        "chip": chip,
+        "sub": sub,
+        "due_str": due_str,
+        "overdue": overdue,
+        "value": p.dollar_amount or 0,
+        "action_label": action_label,
+        "action_url": action_url,
+        "assigned_to_me": p.assigned_to == current_user.id,
+        "with_customer": bool(latest_prop and latest_prop.review_status in ("submitted_to_customer", "customer_feedback")),
+    }
+
+
+@app.route("/quick-start", methods=["POST"])
+@login_required
+def quick_start():
+    """Create a project directly from dropped RFP/RFQ files (dashboard hero)."""
+    files = request.files.getlist("documents")
+    valid = [
+        f for f in files
+        if f and f.filename and _allowed_file(f.filename, ALLOWED_EXTENSIONS | {"xlsx", "xls"})
+    ]
+    if not valid:
+        flash("Please drop a PDF, DOCX, TXT, MD, or XLSX file to start a proposal session.", "error")
+        return redirect(url_for("dashboard"))
+
+    # Derive a readable project name from the first file
+    stem = Path(valid[0].filename).stem.replace("_", " ").replace("-", " ").strip()
+    project_name = (stem[:280] or "New Proposal") + " Proposal"
+
+    project = Project(user_id=current_user.id, name=project_name)
+    db.session.add(project)
+    db.session.flush()
+
+    for f in valid:
+        safe, path, size = _save_upload(f, f"projects/{project.id}")
+        db.session.add(ProjectDocument(
+            project_id=project.id,
+            filename=f"{uuid.uuid4().hex[:8]}_{safe}",
+            original_filename=safe,
+            file_type="rfp",
+            file_path=path,
+            file_size=size,
+        ))
+
+    db.session.commit()
+    _log_activity("project_quick_start", f"Quick-started project from {len(valid)} file(s)", project.id)
+    _notify_role(
+        "proposal", "rfp_uploaded",
+        f"New proposal session: {project.name}",
+        f"{current_user.display_name or current_user.username} started a session with {len(valid)} document(s).",
+        link=f"/projects/{project.id}/upload",
+        exclude_user_id=current_user.id,
+    )
+    flash(f"Session started — {len(valid)} document(s) uploaded. Review and generate when ready.", "success")
+    return redirect(url_for("project_upload", project_id=project.id))
+
 
 @app.route("/")
 @login_required
@@ -651,8 +1030,58 @@ def dashboard():
         proj = db.session.get(Project, prop.project_id)
         awaiting_customer_items.append({"proposal": prop, "project": proj})
 
+    # --- "Pick up where you left off" focus list -----------------------------
+    focus_items = []
+
+    # Reviews waiting on my decision come first — they block teammates.
+    for item in my_reviews_pending:
+        proj = item["project"]
+        focus_items.append({
+            "kind": "review",
+            "title": proj.name if proj else "Proposal review",
+            "url": url_for("proposal_review_page", proposal_id=item["proposal"].id),
+            "client": proj.client_name if proj else "",
+            "code": f"REV-{item['proposal'].id[:6].upper()}",
+            "chip": ("Review requested", "chip-gold"),
+            "sub": f"You're the {item['reviewer'].review_role.title()} reviewer on v{item['version_number']}",
+            "due_str": ("due " + item["deadline"].strftime("%b %d")) if item["deadline"] else "",
+            "overdue": item["overdue"],
+            "value": (proj.dollar_amount or 0) if proj else 0,
+            "action_label": "Start review",
+            "action_url": url_for("proposal_review_page", proposal_id=item["proposal"].id),
+            "assigned_to_me": True,
+            "with_customer": False,
+        })
+
+    for p in active_projects:
+        entry = _project_focus_entry(p, now_naive)
+        if entry:
+            focus_items.append(entry)
+
+    # Critical (overdue) first, then largest exposure
+    focus_items.sort(key=lambda i: (not i["overdue"], -(i["value"] or 0)))
+    combined_exposure = sum(i["value"] or 0 for i in focus_items)
+
+    # Greeting
+    hour = datetime.now().hour
+    if hour < 12:
+        greeting_word = "Good morning"
+    elif hour < 17:
+        greeting_word = "Good afternoon"
+    else:
+        greeting_word = "Good evening"
+    first_name = (current_user.display_name or current_user.username).split(" ")[0]
+    today_str = datetime.now().strftime("%A, %B %-d") if os.name != "nt" else datetime.now().strftime("%A, %B %d")
+
     return render_template(
         "dashboard.html",
+        focus_items=focus_items,
+        combined_exposure=combined_exposure,
+        greeting_word=greeting_word,
+        first_name=first_name,
+        today_str=today_str,
+        overdue_count=len(overdue_projects),
+        due_soon_count=len(upcoming_deadlines),
         active_projects=active_projects,
         past_projects=past_projects,
         stats=stats,
@@ -671,6 +1100,306 @@ def dashboard():
         awaiting_customer_items=awaiting_customer_items,
         lifecycle_labels=LIFECYCLE_LABELS,
     )
+
+
+# ---------------------------------------------------------------------------
+# Proposals list page
+# ---------------------------------------------------------------------------
+
+BOARD_COLUMNS = [
+    ("scoping", "Upload & Scope"),
+    ("drafting", "Drafting"),
+    ("review", "Internal Review"),
+    ("customer", "With Customer"),
+    ("won", "Won"),
+    ("lost", "Lost"),
+    ("storage", "Storage"),
+]
+
+PROPOSAL_FILTERS = [
+    ("all", "All", ""),
+    ("mine", "My Proposals", ""),
+    ("overdue", "Overdue", "pf-red"),
+    ("unassigned", "Unassigned", "pf-gold"),
+    ("awaiting_generation", "Awaiting Generation", "pf-gold"),
+    ("in_review", "In Review", ""),
+    ("revisions", "Revisions Requested", "pf-gold"),
+    ("awaiting_customer", "Awaiting Customer", "pf-violet"),
+    ("won", "Won", "pf-ok"),
+    ("lost", "Lost", "pf-red"),
+]
+
+
+def _build_proposal_rows():
+    """Load all accessible projects enriched with their latest proposal state."""
+    if current_user.is_admin:
+        projects = Project.query.order_by(Project.updated_at.desc()).all()
+    else:
+        projects = Project.query.filter(_my_projects_filter()).order_by(
+            Project.updated_at.desc()
+        ).all()
+
+    now_naive = datetime.utcnow()
+    rows = []
+    for p in projects:
+        latest = (
+            Proposal.query.filter_by(project_id=p.id)
+            .order_by(Proposal.generated_at.desc())
+            .first()
+        )
+        doc_count = ProjectDocument.query.filter_by(project_id=p.id).count()
+        pending_req = 0
+        if latest:
+            pending_req = RevisionRequest.query.filter_by(
+                proposal_id=latest.id, status="pending"
+            ).count()
+
+        overdue = False
+        if p.due_date and p.status == "active":
+            due = p.due_date.replace(tzinfo=None) if p.due_date.tzinfo else p.due_date
+            overdue = due < now_naive
+
+        health = latest.confidence_score if latest else None
+        if health is not None and health >= 80:
+            health_class = "health-good"
+        elif health is not None and health >= 60:
+            health_class = "health-fair"
+        elif health is not None:
+            health_class = "health-poor"
+        else:
+            health_class = ""
+
+        if latest:
+            status_label = LIFECYCLE_LABELS.get(latest.review_status, latest.review_status)
+            status_class = f"badge-review badge-review-{latest.review_status}"
+        else:
+            status_label = "Awaiting Generation" if doc_count else "Needs Documents"
+            status_class = "badge-status-open" if doc_count else "badge-status-draft"
+        if p.status in ("won", "lost", "archived", "submitted") and not latest:
+            status_label = p.status.title()
+            status_class = f"badge-status-{p.status}"
+
+        # Board column (Kanban view)
+        rs = latest.review_status if latest else None
+        if p.status == "archived":
+            board_col = "storage"
+        elif p.status == "won" or rs in ("won", "customer_approved"):
+            board_col = "won"
+        elif p.status == "lost" or rs in ("lost", "customer_declined"):
+            board_col = "lost"
+        elif rs in ("submitted_to_customer", "customer_feedback"):
+            board_col = "customer"
+        elif rs in ("in_review", "revision_requested", "internally_approved"):
+            board_col = "review"
+        elif rs == "draft":
+            board_col = "drafting"
+        else:
+            board_col = "scoping"
+
+        rows.append({
+            "project": p,
+            "proposal": latest,
+            "doc_count": doc_count,
+            "pending_req": pending_req,
+            "overdue": overdue,
+            "health": health,
+            "health_class": health_class,
+            "status_label": status_label,
+            "status_class": status_class,
+            "board_col": board_col,
+        })
+    return rows
+
+
+def _filter_proposal_rows(rows, flt):
+    uid = current_user.id
+    if flt == "mine":
+        return [r for r in rows if r["project"].user_id == uid]
+    if flt == "overdue":
+        return [r for r in rows if r["overdue"]]
+    if flt == "unassigned":
+        return [r for r in rows if r["project"].status == "active" and not r["project"].assigned_to]
+    if flt == "awaiting_generation":
+        return [r for r in rows if r["project"].status == "active" and r["doc_count"] > 0 and not r["proposal"]]
+    if flt == "in_review":
+        return [r for r in rows if r["proposal"] and r["proposal"].review_status in ("in_review", "revision_requested")]
+    if flt == "revisions":
+        return [r for r in rows if (r["proposal"] and r["proposal"].review_status == "revision_requested") or r["pending_req"] > 0]
+    if flt == "awaiting_customer":
+        return [r for r in rows if r["proposal"] and r["proposal"].review_status in ("submitted_to_customer", "customer_feedback")]
+    if flt == "won":
+        return [r for r in rows if r["project"].status == "won"]
+    if flt == "lost":
+        return [r for r in rows if r["project"].status == "lost"]
+    return rows
+
+
+def _apply_row_query_filters(rows):
+    """Apply search / status / vertical filters + sorting from query params."""
+    q = request.args.get("q", "").strip().lower()
+    f_status = request.args.get("status", "")
+    f_vertical = request.args.get("vertical", "")
+    sort = request.args.get("sort", "updated")
+    direction = request.args.get("dir", "desc")
+
+    if q:
+        rows = [r for r in rows
+                if q in (r["project"].name or "").lower()
+                or q in (r["project"].client_name or "").lower()]
+    if f_status:
+        rows = [r for r in rows if r["project"].status == f_status]
+    if f_vertical:
+        rows = [r for r in rows if r["project"].vertical == f_vertical]
+
+    keymap = {
+        "title": lambda r: (r["project"].name or "").lower(),
+        "client": lambda r: (r["project"].client_name or "").lower(),
+        "vertical": lambda r: (r["project"].vertical_label or "").lower(),
+        "value": lambda r: r["project"].dollar_amount or 0,
+        "status": lambda r: r["status_label"],
+        "due": lambda r: r["project"].due_date.replace(tzinfo=None) if r["project"].due_date else datetime.max,
+        "health": lambda r: r["health"] if r["health"] is not None else -1,
+        "updated": lambda r: r["project"].updated_at or datetime.min,
+    }
+    keyfn = keymap.get(sort, keymap["updated"])
+    rows.sort(key=keyfn, reverse=(direction != "asc"))
+    return rows
+
+
+@app.route("/proposals")
+@login_required
+def proposals_list():
+    flt = request.args.get("filter", "all")
+    if flt not in {f[0] for f in PROPOSAL_FILTERS}:
+        flt = "all"
+
+    all_rows = _build_proposal_rows()
+    counts = {key: len(_filter_proposal_rows(all_rows, key)) for key, _, _ in PROPOSAL_FILTERS}
+    rows = _apply_row_query_filters(_filter_proposal_rows(all_rows, flt))
+
+    proposal_users = User.query.filter(User.role.in_(["proposal", "admin"])).order_by(User.display_name).all()
+
+    close_category_labels = {
+        "price": "Price", "scope": "Scope", "schedule": "Schedule / Timing",
+        "relationship": "Relationship / Incumbent", "technical": "Technical Approach",
+        "compliance": "Compliance / Requirements", "other": "Other",
+    }
+
+    return render_template(
+        "proposals.html",
+        rows=rows,
+        counts=counts,
+        active_filter=flt,
+        filters=PROPOSAL_FILTERS,
+        board_columns=BOARD_COLUMNS,
+        verticals=VERTICALS,
+        proposal_users=proposal_users,
+        close_category_labels=close_category_labels,
+        q=request.args.get("q", ""),
+        f_status=request.args.get("status", ""),
+        f_vertical=request.args.get("vertical", ""),
+        sort=request.args.get("sort", "updated"),
+        direction=request.args.get("dir", "desc"),
+        view=request.args.get("view", "table"),
+    )
+
+
+@app.route("/proposals/export.csv")
+@login_required
+def proposals_export_csv():
+    """Export the current (filtered) proposals list as CSV."""
+    import csv
+    import io
+    from flask import Response
+
+    flt = request.args.get("filter", "all")
+    if flt not in {f[0] for f in PROPOSAL_FILTERS}:
+        flt = "all"
+    rows = _apply_row_query_filters(_filter_proposal_rows(_build_proposal_rows(), flt))
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Title", "Client", "Vertical", "Value", "Status", "Health",
+                     "Due Date", "Assigned To", "Created", "Updated"])
+    for r in rows:
+        p = r["project"]
+        writer.writerow([
+            p.name,
+            p.client_name or "",
+            p.vertical_label or "",
+            p.dollar_amount or 0,
+            r["status_label"],
+            r["health"] if r["health"] is not None else "",
+            p.due_date.strftime("%Y-%m-%d") if p.due_date else "",
+            (p.assignee.display_name or p.assignee.username) if p.assignee else "",
+            p.created_at.strftime("%Y-%m-%d") if p.created_at else "",
+            p.updated_at.strftime("%Y-%m-%d") if p.updated_at else "",
+        ])
+    output.seek(0)
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=proposals_{flt}.csv"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Proposal Posture (company setup: templates, standards, rates, branding)
+# ---------------------------------------------------------------------------
+
+
+@app.route("/posture")
+@login_required
+def posture():
+    rate_sheets = UserRateSheet.query.filter_by(user_id=current_user.id).order_by(UserRateSheet.uploaded_at.desc()).all()
+    user_templates = UserVerticalTemplate.query.filter_by(user_id=current_user.id, is_company_default=False).order_by(UserVerticalTemplate.uploaded_at.desc()).all()
+    staff_roles = StaffRole.query.filter_by(user_id=current_user.id).order_by(StaffRole.category, StaffRole.role_name).all()
+    equipment_items = EquipmentItem.query.filter_by(user_id=current_user.id).order_by(EquipmentItem.category, EquipmentItem.item_name).all()
+    travel_rates = TravelExpenseRate.query.filter_by(user_id=current_user.id).order_by(TravelExpenseRate.expense_type).all()
+    company_standards = CompanyStandard.query.filter_by(user_id=current_user.id).order_by(CompanyStandard.category, CompanyStandard.title).all()
+    revision_templates = RevisionTemplate.query.filter_by(user_id=current_user.id).order_by(
+        RevisionTemplate.category, RevisionTemplate.name
+    ).all()
+
+    # "Posture version" summary: most recent change across all posture content
+    timestamps = []
+    for coll, attr in (
+        (rate_sheets, "uploaded_at"), (user_templates, "uploaded_at"),
+        (staff_roles, "updated_at"), (equipment_items, "updated_at"),
+        (travel_rates, "updated_at"), (company_standards, "updated_at"),
+        (revision_templates, "created_at"),
+    ):
+        for item in coll:
+            ts = getattr(item, attr, None)
+            if ts:
+                timestamps.append(ts)
+    last_updated = max(timestamps) if timestamps else None
+    total_items = (len(rate_sheets) + len(user_templates) + len(staff_roles)
+                   + len(equipment_items) + len(travel_rates)
+                   + len(company_standards) + len(revision_templates))
+
+    return render_template(
+        "posture.html",
+        rate_sheets=rate_sheets,
+        user_templates=user_templates,
+        staff_roles=staff_roles,
+        equipment_items=equipment_items,
+        travel_rates=travel_rates,
+        company_standards=company_standards,
+        revision_templates=revision_templates,
+        revision_categories=REVISION_CATEGORIES,
+        verticals=VERTICALS,
+        logo_max_dimension=LOGO_MAX_DIMENSION,
+        last_updated=last_updated,
+        total_items=total_items,
+    )
+
+
+@app.route("/setup")
+@login_required
+def setup_wizard():
+    progress = _setup_progress(current_user)
+    return render_template("setup.html", progress=progress)
 
 
 # ---------------------------------------------------------------------------
@@ -702,6 +1431,8 @@ def settings():
         db.session.commit()
         _log_activity("settings_update", "Updated user settings")
         flash("Settings saved.", "success")
+        if request.form.get("from_posture"):
+            return redirect(url_for("posture") + "#branding")
         return redirect(url_for("settings"))
 
     # Rate sheets
@@ -744,7 +1475,7 @@ def upload_rate_sheet():
 
     if not file or not _allowed_file(file.filename, RATE_SHEET_EXTENSIONS):
         flash("Please upload an Excel file (.xlsx).", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#staff-rates")
 
     safe, path, size = _save_upload(file, f"rate_sheets/{current_user.id}")
 
@@ -759,7 +1490,7 @@ def upload_rate_sheet():
     db.session.commit()
     _log_activity("rate_sheet_upload", f"Uploaded {sheet_type}: {safe}")
     flash("Rate sheet uploaded.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#staff-rates")
 
 
 @app.route("/settings/upload-template", methods=["POST"])
@@ -771,7 +1502,7 @@ def upload_user_template():
 
     if not file or not _allowed_file(file.filename, TEMPLATE_EXTENSIONS):
         flash("Please upload a Word or PDF file.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#templates")
 
     safe, path, size = _save_upload(file, f"user_templates/{current_user.id}")
 
@@ -788,7 +1519,7 @@ def upload_user_template():
     db.session.commit()
     _log_activity("template_upload", f"Uploaded {template_type} for {vertical}: {safe}")
     flash("Template uploaded.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#templates")
 
 
 @app.route("/settings/delete-rate-sheet/<sheet_id>", methods=["POST"])
@@ -800,7 +1531,7 @@ def delete_rate_sheet(sheet_id):
     db.session.delete(sheet)
     db.session.commit()
     flash("Rate sheet deleted.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#staff-rates")
 
 
 @app.route("/settings/delete-template/<template_id>", methods=["POST"])
@@ -812,7 +1543,7 @@ def delete_user_template(template_id):
     db.session.delete(tmpl)
     db.session.commit()
     flash("Template deleted.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#templates")
 
 
 # ---------------------------------------------------------------------------
@@ -825,20 +1556,20 @@ def upload_company_logo():
     file = request.files.get("company_logo")
     if not file or not file.filename:
         flash("Please choose an image file to upload.", "error")
-        return redirect(url_for("settings") + "#profile")
+        return redirect(url_for("posture") + "#branding")
 
     if not _allowed_file(file.filename, LOGO_EXTENSIONS):
         flash(
             "Unsupported image type. Please upload a PNG, JPG, JPEG, WebP, GIF, or BMP.",
             "error",
         )
-        return redirect(url_for("settings") + "#profile")
+        return redirect(url_for("posture") + "#branding")
 
     try:
         original_name, saved_path, saved_size = _process_and_save_logo(file, current_user.id)
     except ValueError as e:
         flash(f"Could not process image: {e}", "error")
-        return redirect(url_for("settings") + "#profile")
+        return redirect(url_for("posture") + "#branding")
 
     # Remove old logo file if any
     if current_user.company_logo_path:
@@ -861,7 +1592,7 @@ def upload_company_logo():
         "You can now choose how it appears on your proposals.",
         "success",
     )
-    return redirect(url_for("settings") + "#profile")
+    return redirect(url_for("posture") + "#branding")
 
 
 @app.route("/settings/delete-logo", methods=["POST"])
@@ -879,7 +1610,7 @@ def delete_company_logo():
     db.session.commit()
     _log_activity("logo_delete", "Removed company logo")
     flash("Company logo removed.", "success")
-    return redirect(url_for("settings") + "#profile")
+    return redirect(url_for("posture") + "#branding")
 
 
 @app.route("/settings/logo-preview")
@@ -916,7 +1647,7 @@ def add_staff_role():
         db.session.commit()
         _log_activity("rate_sheet_upload", f"Uploaded staff rate sheet: {safe}")
         flash(f"Rate sheet '{safe}' uploaded.", "success")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#staff-rates")
 
     role_name = request.form.get("role_name", "").strip()
     category = request.form.get("category", "").strip()
@@ -926,18 +1657,18 @@ def add_staff_role():
 
     if not role_name or not hourly_rate:
         flash("Role name and hourly rate are required.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#staff-rates")
 
     try:
         hourly_rate = float(hourly_rate.replace(",", "").replace("$", ""))
         overtime_rate = float(overtime_rate.replace(",", "").replace("$", "")) if overtime_rate else 0.0
     except ValueError:
         flash("Invalid rate format.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#staff-rates")
 
     if hourly_rate < 0 or overtime_rate < 0:
         flash("Rates cannot be negative.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#staff-rates")
 
     role = StaffRole(
         user_id=current_user.id,
@@ -951,7 +1682,7 @@ def add_staff_role():
     db.session.commit()
     _log_activity("staff_role_add", f"Added staff role: {role_name} @ ${hourly_rate}/hr")
     flash(f"Staff role '{role_name}' added.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#staff-rates")
 
 
 @app.route("/settings/edit-staff-role/<role_id>", methods=["POST"])
@@ -971,12 +1702,12 @@ def edit_staff_role(role_id):
         role.overtime_rate = float(ot.replace(",", "").replace("$", "")) if ot else 0.0
     except ValueError:
         flash("Invalid rate format.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#staff-rates")
 
     db.session.commit()
     _log_activity("staff_role_edit", f"Updated staff role: {role.role_name}")
     flash(f"Staff role '{role.role_name}' updated.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#staff-rates")
 
 
 @app.route("/settings/delete-staff-role/<role_id>", methods=["POST"])
@@ -990,7 +1721,7 @@ def delete_staff_role(role_id):
     db.session.commit()
     _log_activity("staff_role_delete", f"Deleted staff role: {name}")
     flash(f"Staff role '{name}' deleted.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#staff-rates")
 
 
 # ---------------------------------------------------------------------------
@@ -1015,7 +1746,7 @@ def add_equipment_item():
         db.session.commit()
         _log_activity("rate_sheet_upload", f"Uploaded equipment price list: {safe}")
         flash(f"Price list '{safe}' uploaded.", "success")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#equipment")
 
     item_name = request.form.get("item_name", "").strip()
     category = request.form.get("eq_category", "").strip()
@@ -1027,17 +1758,17 @@ def add_equipment_item():
 
     if not item_name or not unit_cost:
         flash("Item name and unit cost are required.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#equipment")
 
     try:
         unit_cost = float(unit_cost.replace(",", "").replace("$", ""))
     except ValueError:
         flash("Invalid cost format.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#equipment")
 
     if unit_cost < 0:
         flash("Cost cannot be negative.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#equipment")
 
     item = EquipmentItem(
         user_id=current_user.id,
@@ -1053,7 +1784,7 @@ def add_equipment_item():
     db.session.commit()
     _log_activity("equipment_add", f"Added equipment: {item_name} @ ${unit_cost}/{unit}")
     flash(f"Equipment item '{item_name}' added.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#equipment")
 
 
 @app.route("/settings/delete-equipment-item/<item_id>", methods=["POST"])
@@ -1067,7 +1798,7 @@ def delete_equipment_item(item_id):
     db.session.commit()
     _log_activity("equipment_delete", f"Deleted equipment: {name}")
     flash(f"Equipment item '{name}' deleted.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#equipment")
 
 
 # ---------------------------------------------------------------------------
@@ -1092,7 +1823,7 @@ def add_travel_rate():
         db.session.commit()
         _log_activity("rate_sheet_upload", f"Uploaded travel rate schedule: {safe}")
         flash(f"Travel rate schedule '{safe}' uploaded.", "success")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#travel")
 
     expense_type = request.form.get("expense_type", "").strip()
     description = request.form.get("travel_description", "").strip()
@@ -1101,17 +1832,17 @@ def add_travel_rate():
 
     if not expense_type or not rate:
         flash("Expense type and rate are required.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#travel")
 
     try:
         rate = float(rate.replace(",", "").replace("$", ""))
     except ValueError:
         flash("Invalid rate format.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#travel")
 
     if rate < 0:
         flash("Rate cannot be negative.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#travel")
 
     tr = TravelExpenseRate(
         user_id=current_user.id,
@@ -1124,7 +1855,7 @@ def add_travel_rate():
     db.session.commit()
     _log_activity("travel_rate_add", f"Added travel rate: {expense_type} @ ${rate}/{unit}")
     flash(f"Travel rate '{expense_type}' added.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#travel")
 
 
 @app.route("/settings/delete-travel-rate/<rate_id>", methods=["POST"])
@@ -1138,7 +1869,7 @@ def delete_travel_rate(rate_id):
     db.session.commit()
     _log_activity("travel_rate_delete", f"Deleted travel rate: {name}")
     flash(f"Travel rate '{name}' deleted.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#travel")
 
 
 # ---------------------------------------------------------------------------
@@ -1260,6 +1991,25 @@ def project_upload(project_id):
         is_company_default=True
     ).first() is not None
 
+    latest_prop = (
+        Proposal.query.filter_by(project_id=project_id)
+        .order_by(Proposal.generated_at.desc())
+        .first()
+    )
+    scope = ProjectScope.query.filter_by(project_id=project_id).first()
+    scope_included = ScopeItem.query.filter_by(
+        scope_id=scope.id, status="included"
+    ).count() if scope else 0
+    phases = compute_phases(project, latest_prop, doc_count=len(documents),
+                            scope_status=scope.status if scope else None)
+    pending_questions = ProposalQuestion.query.filter_by(
+        project_id=project_id, status="pending"
+    ).count()
+    open_clarifications = ClarificationItem.query.filter_by(project_id=project_id).filter(
+        ClarificationItem.status.in_(["open", "draft", "sent", "response_received"])
+    ).count()
+    proposal_users = User.query.filter(User.role.in_(["proposal", "admin"])).order_by(User.display_name).all()
+
     return render_template(
         "project_upload.html",
         project=project,
@@ -1273,6 +2023,14 @@ def project_upload(project_id):
         travel_rate_count=travel_rate_count,
         has_user_template=has_user_template,
         has_company_template=has_company_template,
+        latest_prop=latest_prop,
+        phases=phases,
+        pending_questions=pending_questions,
+        open_clarifications=open_clarifications,
+        proposal_users=proposal_users,
+        lifecycle_labels=LIFECYCLE_LABELS,
+        scope=scope,
+        scope_included=scope_included,
     )
 
 
@@ -1432,6 +2190,18 @@ def project_generate(project_id):
             for s in standards
         ]
 
+    # Human-approved Scope of Work guides the draft when present
+    approved_scope_items = None
+    scope = ProjectScope.query.filter_by(project_id=project_id).first()
+    if scope and scope.status == "approved":
+        included = ScopeItem.query.filter_by(scope_id=scope.id, status="included").order_by(
+            ScopeItem.sort_order, ScopeItem.created_at
+        ).all()
+        if included:
+            approved_scope_items = [i.item_text for i in included]
+            if vertical == "auto" and scope.vertical:
+                vertical = scope.vertical
+
     try:
         result = generate_proposal(
             combined_text,
@@ -1447,6 +2217,7 @@ def project_generate(project_id):
             travel_data=travel_data,
             past_corrections=corrections_data,
             company_standards=company_standards_data,
+            approved_scope=approved_scope_items,
         )
 
         # Check if the agent has questions
@@ -1563,6 +2334,246 @@ def project_generate(project_id):
     except Exception as e:
         flash(f"Proposal generation failed: {friendly_api_error(e)}", "error")
         return redirect(url_for("project_upload", project_id=project_id))
+
+
+# ---------------------------------------------------------------------------
+# Scope of Work (human-approved before generation)
+# ---------------------------------------------------------------------------
+
+def _project_rfp_text(project_id: str) -> str:
+    """Combined text of the project's RFP/supporting documents."""
+    documents = ProjectDocument.query.filter_by(project_id=project_id).all()
+    rfp_docs = [d for d in documents if d.file_type in ("rfp", "supporting")]
+    combined = ""
+    for doc in rfp_docs:
+        try:
+            text = parse_document(doc.file_path)
+            combined += f"\n\n--- Document: {doc.original_filename} ---\n\n{text}"
+        except Exception:
+            continue
+    return combined.strip()
+
+
+@app.route("/projects/<project_id>/scope")
+@login_required
+def project_scope(project_id):
+    """Review the AI-proposed Scope of Work: accept, remove, or add items."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    scope = ProjectScope.query.filter_by(project_id=project_id).first()
+    if not scope:
+        flash("No scope drafted yet. Use 'Draft Scope with AI' on the project page.", "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    items = ScopeItem.query.filter_by(scope_id=scope.id).order_by(
+        ScopeItem.sort_order, ScopeItem.created_at
+    ).all()
+    included_count = sum(1 for i in items if i.status == "included")
+
+    latest_prop = (
+        Proposal.query.filter_by(project_id=project_id)
+        .order_by(Proposal.generated_at.desc())
+        .first()
+    )
+    phases = compute_phases(project, latest_prop, scope_status=scope.status)
+
+    return render_template(
+        "project_scope.html",
+        project=project,
+        scope=scope,
+        items=items,
+        included_count=included_count,
+        phases=phases,
+        latest_prop=latest_prop,
+    )
+
+
+@app.route("/projects/<project_id>/scope/generate", methods=["POST"])
+@login_required
+def generate_scope(project_id):
+    """AI-draft (or re-draft) the Scope of Work from the uploaded documents."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    combined_text = _project_rfp_text(project_id)
+    if not combined_text:
+        flash("Upload an RFP/RFQ document before drafting the scope of work.", "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    vertical = request.form.get("vertical", "auto")
+
+    try:
+        result = draft_scope_of_work(
+            combined_text,
+            vertical=vertical,
+            company_name=current_user.company_name,
+            user_api_key=current_user.api_key_encrypted or None,
+            user_model=current_user.llm_model or None,
+        )
+    except RuntimeError as e:
+        flash(str(e), "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+    except Exception as e:
+        flash(f"Scope drafting failed: {friendly_api_error(e)}", "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    # Replace any existing scope (regeneration starts fresh)
+    existing = ProjectScope.query.filter_by(project_id=project_id).first()
+    if existing:
+        ScopeItem.query.filter_by(scope_id=existing.id).delete()
+        db.session.delete(existing)
+        db.session.flush()
+
+    scope = ProjectScope(
+        project_id=project_id,
+        status="draft",
+        ai_summary=result["summary"],
+        vertical=result["vertical"],
+        vertical_label=result["vertical_label"],
+    )
+    db.session.add(scope)
+    db.session.flush()
+
+    for idx, entry in enumerate(result["items"]):
+        db.session.add(ScopeItem(
+            scope_id=scope.id,
+            project_id=project_id,
+            item_text=entry["item"],
+            category=entry["category"],
+            source="ai",
+            status="included",
+            sort_order=idx,
+        ))
+
+    project.vertical = result["vertical"]
+    project.vertical_label = result["vertical_label"]
+    db.session.commit()
+    _log_activity("scope_generate", f"AI drafted {len(result['items'])} scope item(s)", project_id)
+    flash(f"AI proposed {len(result['items'])} scope item(s). Review and approve below.", "success")
+    return redirect(url_for("project_scope", project_id=project_id))
+
+
+@app.route("/projects/<project_id>/scope/items/<item_id>/toggle", methods=["POST"])
+@login_required
+def toggle_scope_item(project_id, item_id):
+    """Include/remove a single scope item."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    item = db.session.get(ScopeItem, item_id)
+    if not item or item.project_id != project_id:
+        abort(404)
+
+    item.status = "removed" if item.status == "included" else "included"
+
+    # Any change to an approved scope re-opens it for approval
+    scope = db.session.get(ProjectScope, item.scope_id)
+    if scope and scope.status == "approved":
+        scope.status = "draft"
+        flash("Scope modified — re-approve it before generating.", "success")
+    db.session.commit()
+    return redirect(url_for("project_scope", project_id=project_id))
+
+
+@app.route("/projects/<project_id>/scope/add", methods=["POST"])
+@login_required
+def add_scope_item(project_id):
+    """Human adds a scope item the AI missed."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    scope = ProjectScope.query.filter_by(project_id=project_id).first()
+    if not scope:
+        abort(404)
+
+    text = request.form.get("item_text", "").strip()
+    if not text:
+        flash("Scope item text is required.", "error")
+        return redirect(url_for("project_scope", project_id=project_id))
+
+    category = request.form.get("category", "general").strip().lower()
+    if category not in ("engineering", "installation", "commissioning",
+                        "documentation", "management", "general"):
+        category = "general"
+
+    max_order = db.session.query(db.func.max(ScopeItem.sort_order)).filter_by(
+        scope_id=scope.id
+    ).scalar() or 0
+    db.session.add(ScopeItem(
+        scope_id=scope.id,
+        project_id=project_id,
+        item_text=text,
+        category=category,
+        source="human",
+        status="included",
+        sort_order=max_order + 1,
+    ))
+    if scope.status == "approved":
+        scope.status = "draft"
+    db.session.commit()
+    _log_activity("scope_item_add", f"Added scope item: {text[:80]}", project_id)
+    flash("Scope item added.", "success")
+    return redirect(url_for("project_scope", project_id=project_id))
+
+
+@app.route("/projects/<project_id>/scope/items/<item_id>/delete", methods=["POST"])
+@login_required
+def delete_scope_item(project_id, item_id):
+    """Delete a human-added scope item entirely (AI items are toggled instead)."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    item = db.session.get(ScopeItem, item_id)
+    if not item or item.project_id != project_id:
+        abort(404)
+    db.session.delete(item)
+    db.session.commit()
+    flash("Scope item deleted.", "success")
+    return redirect(url_for("project_scope", project_id=project_id))
+
+
+@app.route("/projects/<project_id>/scope/approve", methods=["POST"])
+@login_required
+def approve_scope(project_id):
+    """Human signs off on the scope; generation will honor it."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    scope = ProjectScope.query.filter_by(project_id=project_id).first()
+    if not scope:
+        abort(404)
+
+    included = ScopeItem.query.filter_by(scope_id=scope.id, status="included").count()
+    if included == 0:
+        flash("Approve at least one included scope item.", "error")
+        return redirect(url_for("project_scope", project_id=project_id))
+
+    scope.status = "approved"
+    scope.approved_at = datetime.now(timezone.utc)
+    scope.approved_by = current_user.id
+    db.session.commit()
+    _log_activity("scope_approve", f"Approved scope of work ({included} item(s))", project_id)
+    flash(f"Scope of work approved ({included} item(s)). The AI will draft against it.", "success")
+    return redirect(url_for("project_upload", project_id=project_id))
+
+
+@app.route("/projects/<project_id>/scope/reopen", methods=["POST"])
+@login_required
+def reopen_scope(project_id):
+    """Reopen an approved scope for edits."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    scope = ProjectScope.query.filter_by(project_id=project_id).first()
+    if not scope:
+        abort(404)
+    scope.status = "draft"
+    db.session.commit()
+    flash("Scope reopened for edits.", "success")
+    return redirect(url_for("project_scope", project_id=project_id))
 
 
 @app.route("/projects/<project_id>/questions", methods=["GET", "POST"])
@@ -1748,8 +2759,32 @@ def view_proposal(proposal_id):
         return redirect(url_for("dashboard"))
 
     proposal_md = md_path.read_text(encoding="utf-8")
-    proposal_html = md.markdown(proposal_md, extensions=["tables", "fenced_code"])
     action_items = re.findall(r"\[ACTION REQUIRED:\s*(.+?)\]", proposal_md)
+
+    # Version history for the viewer dropdown
+    versions = ProposalVersion.query.filter_by(proposal_id=proposal_id).order_by(
+        ProposalVersion.version_number.desc()
+    ).all()
+
+    # Clean vs Redlines view. Redline = inline word diff of AI original (v1)
+    # against the current latest version.
+    view_mode = request.args.get("view", "clean")
+    redline_available = len(versions) > 1
+    if view_mode == "redline" and redline_available:
+        try:
+            v1 = versions[-1]
+            latest_v = versions[0]
+            proposal_md_render = _inline_redline_markdown(
+                v1.markdown_content, latest_v.markdown_content
+            )
+        except Exception:
+            view_mode = "clean"
+            proposal_md_render = proposal_md
+    else:
+        view_mode = "clean"
+        proposal_md_render = proposal_md
+
+    proposal_html = md.markdown(proposal_md_render, extensions=["tables", "fenced_code"])
 
     meta = {
         "source_file": project.name,
@@ -1779,6 +2814,8 @@ def view_proposal(proposal_id):
         proposal_id=proposal_id
     ).order_by(ProposalStatusHistory.created_at.desc()).limit(10).all()
 
+    phases = compute_phases(project, proposal)
+
     return render_template(
         "proposal.html",
         meta=meta,
@@ -1795,6 +2832,10 @@ def view_proposal(proposal_id):
         my_reviewer=my_reviewer,
         status_history=status_history,
         lifecycle_labels=LIFECYCLE_LABELS,
+        phases=phases,
+        versions=versions,
+        view_mode=view_mode,
+        redline_available=redline_available,
     )
 
 
@@ -2894,7 +3935,7 @@ def add_revision_template():
 
     if not name or not directive:
         flash("Name and directive are required.", "error")
-        return redirect(url_for("settings") + "#revision-templates")
+        return redirect(url_for("posture") + "#revision-presets")
 
     if category not in {c[0] for c in REVISION_CATEGORIES}:
         category = "other"
@@ -2910,7 +3951,7 @@ def add_revision_template():
     db.session.commit()
     _log_activity("revision_template_add", f"Added revision template: {name}")
     flash(f"Revision template '{name}' added.", "success")
-    return redirect(url_for("settings") + "#revision-templates")
+    return redirect(url_for("posture") + "#revision-presets")
 
 
 @app.route("/settings/delete-revision-template/<template_id>", methods=["POST"])
@@ -2924,7 +3965,7 @@ def delete_revision_template(template_id):
     db.session.commit()
     _log_activity("revision_template_delete", f"Deleted revision template: {name}")
     flash(f"Revision template '{name}' deleted.", "success")
-    return redirect(url_for("settings") + "#revision-templates")
+    return redirect(url_for("posture") + "#revision-presets")
 
 
 # ---------------------------------------------------------------------------
@@ -2940,7 +3981,7 @@ def add_company_standard():
 
     if not category or not title:
         flash("Category and title are required.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#standards")
 
     # Handle file upload as alternative to text content
     uploaded_file = request.files.get("standard_file")
@@ -2950,7 +3991,7 @@ def add_company_standard():
 
     if not content:
         flash("Either content or a file is required.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#standards")
 
     standard = CompanyStandard(
         user_id=current_user.id,
@@ -2962,7 +4003,7 @@ def add_company_standard():
     db.session.commit()
     _log_activity("company_standard_add", f"Added standard: {title}")
     flash(f"Company standard '{title}' added.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#standards")
 
 
 @app.route("/settings/edit-company-standard/<standard_id>", methods=["POST"])
@@ -2979,7 +4020,7 @@ def edit_company_standard(standard_id):
     db.session.commit()
     _log_activity("company_standard_edit", f"Updated standard: {std.title}")
     flash(f"Standard '{std.title}' updated.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#standards")
 
 
 @app.route("/settings/delete-company-standard/<standard_id>", methods=["POST"])
@@ -2993,7 +4034,7 @@ def delete_company_standard(standard_id):
     db.session.commit()
     _log_activity("company_standard_delete", f"Deleted standard: {title}")
     flash(f"Standard '{title}' deleted.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#standards")
 
 
 # ---------------------------------------------------------------------------
@@ -4719,7 +5760,11 @@ def faq_page():
     faqs = [
         {
             "q": "How do I generate a proposal?",
-            "a": "Create a new project, upload your RFP/RFQ documents, select the industry vertical and cost estimation options, then click 'Generate Proposal'. The AI will analyze your documents and produce a draft proposal in seconds."
+            "a": "Create a new project (or drop an RFP on the dashboard), upload your RFP/RFQ documents, optionally draft and approve a Scope of Work, select the industry vertical and cost estimation options, then click 'Generate Proposal'. The AI will analyze your documents and produce a draft proposal in minutes."
+        },
+        {
+            "q": "What is the Scope of Work step?",
+            "a": "Before generating, you can have the AI read the RFP and propose a Scope of Work checklist. You accept or strike each item (and add your own), then approve. The generated proposal then covers exactly the approved scope — nothing more, nothing less."
         },
         {
             "q": "What file formats can I upload?",
@@ -4731,11 +5776,11 @@ def faq_page():
         },
         {
             "q": "What are Company Standards?",
-            "a": "Company Standards are boilerplate content blocks (mission statement, certifications, safety record, past performance, etc.) that the AI automatically weaves into every proposal. Configure them in Settings > Proposal Setup."
+            "a": "Company Standards are boilerplate content blocks (mission statement, certifications, safety record, past performance, etc.) that the AI automatically weaves into every proposal. Configure them in the Proposal Posture page (sidebar > Library > Proposal Posture)."
         },
         {
             "q": "How does cost estimation work?",
-            "a": "First, configure your staff sell rates, equipment price list, and travel rates in Settings > Proposal Setup. When generating a proposal, check the boxes for which cost estimates you want included. The AI will use your actual rates to build cost tables in the proposal."
+            "a": "First, configure your staff sell rates, equipment price list, and travel rates in the Proposal Posture page. When generating a proposal, check the boxes for which cost estimates you want included. The AI will use your actual rates to build cost tables in the proposal."
         },
         {
             "q": "Can I revert to a previous version of a proposal?",
@@ -4780,13 +5825,13 @@ def chat_help():
         ("generate", "proposal", "create"): "To generate a proposal: Create a new project, upload your RFP/RFQ documents, choose cost estimation options, and click 'Generate Proposal'. The AI will analyze your docs and produce a draft in seconds.",
         ("upload", "file", "document", "format"): "You can upload PDF, Word (.docx), text (.txt), Markdown (.md), and Excel (.xlsx) files. Use the project page to upload RFP documents, and Settings for rate sheets.",
         ("learn", "teach", "finalize", "correction"): "After editing a proposal, click 'Finalize & Teach AI' in the editor. The system captures your editing patterns and uses them to improve future proposals.",
-        ("rate", "pricing", "cost", "staff", "equipment", "travel"): "Configure your rates in Settings > Proposal Setup. Add staff hourly rates, equipment prices, and travel rates. The AI uses these when you check the cost estimation boxes during generation.",
+        ("rate", "pricing", "cost", "staff", "equipment", "travel"): "Configure your rates in the Proposal Posture page. Add staff hourly rates, equipment prices, and travel rates. The AI uses these when you check the cost estimation boxes during generation.",
         ("version", "history", "revert", "restore"): "Open the proposal editor to see Version History in the right sidebar. You can view any version and restore previous ones. Restoring creates a new version so nothing is ever lost.",
         ("redline", "tracked", "changes", "diff"): "Download Redline DOCX from the proposal view page. It shows AI-original vs your edits with red strikethrough (deletions) and blue underline (insertions).",
         ("api", "key", "provider", "model", "llm"): "Go to Settings > Profile & AI to configure your AI provider, model, and API key. Currently supports Anthropic Claude, OpenAI GPT, and Google Gemini.",
         ("vertical", "industry", "template"): "Verticals are industry-specific templates: Data Center, Life Science, Food & Beverage, and General. Choose during proposal generation or let the AI auto-detect from your RFP.",
         ("admin", "user", "manage"): "Admins can view company-wide metrics, manage user permissions, and track activity from the Admin panel in the sidebar.",
-        ("standard", "boilerplate", "mission", "certification"): "Company Standards are reusable content blocks. Go to Settings > Proposal Setup to add mission statements, certifications, past performance, etc. The AI includes these in every proposal.",
+        ("standard", "boilerplate", "mission", "certification"): "Company Standards are reusable content blocks. Go to the Proposal Posture page to add mission statements, certifications, past performance, etc. The AI includes these in every proposal.",
     }
 
     best_match = None

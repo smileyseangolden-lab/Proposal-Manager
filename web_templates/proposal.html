@@ -1,241 +1,317 @@
 {% extends "base.html" %}
 
-{% block title %}Proposal &mdash; {{ meta.source_file }}{% endblock %}
+{% block title %}{{ meta.source_file }} &mdash; {{ app_name }}{% endblock %}
+
+{% block breadcrumb %}
+<a href="{{ url_for('dashboard') }}">Workspace</a>
+<span class="crumb-sep">&rsaquo;</span>
+<a href="{{ url_for('proposals_list') }}">Proposals</a>
+<span class="crumb-sep">&rsaquo;</span>
+<span class="crumb-current">{{ meta.source_file | truncate(38) }}</span>
+{% endblock %}
 
 {% block content %}
-<section class="proposal-header">
-    <div class="proposal-meta">
-        <h1>Generated Proposal</h1>
-        <div class="meta-grid">
-            <div class="meta-item">
-                <span class="meta-label">Project</span>
-                <span class="meta-value">{{ meta.source_file }}</span>
-            </div>
-            <div class="meta-item">
-                <span class="meta-label">Vertical</span>
-                <span class="meta-value">
-                    <span class="badge badge-vertical">{{ meta.vertical_label | default('General') }}</span>
+<section class="page-header" style="padding-bottom: 12px;">
+    <div class="page-header-row">
+        <div>
+            <h1>{{ meta.source_file }}</h1>
+            <p class="page-subtitle" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                <span class="badge badge-review badge-review-{{ proposal.review_status }}">
+                    {{ lifecycle_labels.get(proposal.review_status, proposal.review_status) }}
                 </span>
-            </div>
-            <div class="meta-item">
-                <span class="meta-label">Type</span>
-                <span class="meta-value">
-                    <span class="badge badge-{{ meta.document_type|lower }}">{{ meta.document_type }}</span>
-                </span>
-            </div>
-            <div class="meta-item">
-                <span class="meta-label">Confidence</span>
-                <span class="meta-value">
-                    <div class="confidence-bar">
-                        <div class="confidence-fill" style="width: {{ meta.confidence_score }}%"></div>
-                        <span>{{ meta.confidence_score }}%</span>
-                    </div>
-                </span>
-            </div>
-            <div class="meta-item">
-                <span class="meta-label">Review Status</span>
-                <span class="meta-value">
-                    <span class="badge badge-review badge-review-{{ proposal.review_status }}">
-                        {{ lifecycle_labels.get(proposal.review_status, proposal.review_status) }}
-                    </span>
-                </span>
-            </div>
-            <div class="meta-item">
-                <span class="meta-label">Generated</span>
-                <span class="meta-value">{{ meta.generated_at[:19] }}</span>
-            </div>
+                <span class="badge badge-{{ meta.document_type | lower }}">{{ meta.document_type }}</span>
+                <span class="badge badge-vertical">{{ meta.vertical_label | default('General') }}</span>
+                {% if project %}
+                <span>{{ project.client_name or 'No client' }}</span>
+                {% if project.dollar_amount %}<span>&middot; ${{ "{:,.0f}".format(project.dollar_amount) }}</span>{% endif %}
+                {% if project.due_date %}<span>&middot; Due {{ project.due_date.strftime('%b %d, %Y') }}</span>{% endif %}
+                {% endif %}
+            </p>
         </div>
-        <div class="proposal-actions">
+        <div class="header-actions">
             {% if is_owner %}
-            <a href="{{ url_for('edit_proposal', proposal_id=proposal.id) }}" class="btn btn-primary">Edit Proposal</a>
+            <a href="{{ url_for('edit_proposal', proposal_id=proposal.id) }}" class="btn btn-secondary">&#9998; Edit Proposal</a>
             {% endif %}
-            <a href="{{ url_for('proposal_reviews', proposal_id=proposal.id) }}" class="btn btn-secondary">Review & Comments</a>
+            <a href="{{ url_for('proposal_reviews', proposal_id=proposal.id) }}" class="btn btn-secondary">&#128172; Review &amp; Comments</a>
             {% if project %}
             <a href="{{ url_for('clarification_register', project_id=project.id) }}" class="btn btn-secondary">Clarifications</a>
-            {% endif %}
-            <a href="{{ url_for('download', proposal_id=proposal.id, fmt='docx') }}" class="btn btn-secondary">Download DOCX</a>
-            <a href="{{ url_for('download_redline', proposal_id=proposal.id) }}" class="btn btn-secondary">Download Redline DOCX</a>
-            <a href="{{ url_for('download', proposal_id=proposal.id, fmt='md') }}" class="btn btn-secondary">Download Markdown</a>
-            {% if project %}
             <a href="{{ url_for('project_upload', project_id=project.id) }}" class="btn btn-secondary">Back to Project</a>
             {% endif %}
-            <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Dashboard</a>
         </div>
     </div>
 </section>
 
-<!-- Review Lifecycle Banner -->
-<section class="card review-banner review-banner-{{ proposal.review_status }}">
-    <div class="review-banner-main">
-        <div>
-            <h2>Review Lifecycle &mdash; {{ lifecycle_labels.get(proposal.review_status, 'Draft') }}</h2>
-            {% if proposal.review_status == 'draft' %}
-            <p>This proposal has not yet been sent for internal review.</p>
-            {% elif proposal.review_status == 'in_review' %}
-            <p>Out for internal review &mdash; <strong>{{ state.approved_count }} of {{ state.required_count }}</strong> required reviewers have approved v{{ state.version_number }}.</p>
-            {% elif proposal.review_status == 'revision_requested' %}
-            <p><strong>{{ pending_req_count }}</strong> pending revision request(s). Apply them to generate the next version.</p>
-            {% elif proposal.review_status == 'internally_approved' %}
-            <p class="review-banner-ok"><strong>Internally approved.</strong> Ready to send to the customer.</p>
-            {% elif proposal.review_status == 'submitted_to_customer' %}
-            <p>Submitted to the customer. Awaiting feedback or final decision.</p>
-            {% elif proposal.review_status == 'customer_feedback' %}
-            <p>Customer requested changes. <strong>{{ pending_req_count }}</strong> pending request(s).</p>
-            {% elif proposal.review_status == 'won' or proposal.review_status == 'customer_approved' %}
-            <p class="review-banner-ok">Customer accepted the proposal &mdash; project won.</p>
-            {% elif proposal.review_status == 'lost' or proposal.review_status == 'customer_declined' %}
-            <p class="review-banner-lost">Customer declined the proposal &mdash; project lost.</p>
-            {% endif %}
-        </div>
-        <div class="review-banner-actions">
-            {% if is_owner %}
-                {% if proposal.review_status == 'draft' %}
-                <a href="{{ url_for('send_for_review', proposal_id=proposal.id) }}" class="btn btn-primary">Send for Internal Review</a>
-                {% elif proposal.review_status in ('in_review', 'revision_requested', 'customer_feedback') and pending_req_count > 0 %}
-                <a href="{{ url_for('apply_feedback', proposal_id=proposal.id) }}" class="btn btn-primary">Apply Feedback &amp; Generate v{{ (state.version_number or 1) + 1 }}</a>
-                {% endif %}
-                {% if proposal.review_status == 'internally_approved' %}
-                <form method="post" action="{{ url_for('submit_to_customer', proposal_id=proposal.id) }}" class="inline-form">
-                    <button type="submit" class="btn btn-primary">Submit to Customer</button>
-                </form>
-                <button type="button" class="btn btn-secondary" id="run-preflight">Run Pre-flight Check</button>
-                {% endif %}
-                {% if proposal.review_status in ('submitted_to_customer', 'customer_feedback') %}
-                <a href="{{ url_for('customer_feedback', proposal_id=proposal.id) }}" class="btn btn-secondary">Log Customer Feedback</a>
-                <form method="post" action="{{ url_for('customer_decision', proposal_id=proposal.id) }}" class="inline-form">
-                    <input type="hidden" name="decision" value="accepted">
-                    <button type="submit" class="btn btn-primary">Mark Accepted (Won)</button>
-                </form>
-                <form method="post" action="{{ url_for('customer_decision', proposal_id=proposal.id) }}" class="inline-form">
-                    <input type="hidden" name="decision" value="declined">
-                    <button type="submit" class="btn btn-secondary">Mark Declined (Lost)</button>
-                </form>
-                {% endif %}
-            {% endif %}
-            {% if my_reviewer %}
-            <a href="{{ url_for('proposal_review_page', proposal_id=proposal.id) }}" class="btn btn-primary">My Review</a>
-            {% endif %}
-        </div>
-    </div>
-    <div id="preflight-results" class="preflight-box" style="display:none;"></div>
-
-    {% if reviewers %}
-    <div class="reviewer-roster">
-        <h3>Reviewer Roster</h3>
-        <ul class="reviewer-list">
-            {% for r in reviewers %}
-            {% set decided = namespace(found=none) %}
-            {% for ap in state.approved_reviewers %}{% if ap.user_id == r.user_id %}{% set decided.found = 'approved' %}{% endif %}{% endfor %}
-            {% for ap in state.requested_changes_reviewers %}{% if ap.user_id == r.user_id %}{% set decided.found = 'changes' %}{% endif %}{% endfor %}
-            <li class="reviewer-item reviewer-{{ decided.found or 'pending' }}">
-                <span class="reviewer-check">
-                    {% if decided.found == 'approved' %}&#10003;{% elif decided.found == 'changes' %}&#9888;{% else %}&#8230;{% endif %}
-                </span>
-                <span class="reviewer-name">{{ r.user.display_name or r.user.username }}</span>
-                <span class="reviewer-role badge badge-vertical">{{ r.review_role | title }}</span>
-                {% if not r.is_required %}<span class="reviewer-optional">optional</span>{% endif %}
-                {% if r.deadline %}<span class="reviewer-deadline">due {{ r.deadline.strftime('%b %d') }}</span>{% endif %}
-            </li>
-            {% endfor %}
-        </ul>
-    </div>
-    {% endif %}
-</section>
+{% set stepper_note = 'AI analyzed · confidence ' ~ meta.confidence_score ~ '% · ' ~ (action_items | length) ~ ' action item(s) open' %}
+{% set stepper_percent = meta.confidence_score %}
+{% include "_stepper.html" %}
 
 {% if action_items %}
-<section class="action-items-section">
-    <h2>Action Items ({{ action_items|length }})</h2>
-    <p class="action-items-note">These items require human review before the proposal is submitted.</p>
-    <ul class="action-items-list">
-        {% for item in action_items %}
-        <li>{{ item }}</li>
-        {% endfor %}
-    </ul>
-</section>
+<a class="insight-banner" href="#action-items">
+    <div class="insight-banner-icon">&#10024;</div>
+    <div>
+        <div class="insight-banner-title">{{ action_items | length }} action item(s) need input before this proposal is customer-ready</div>
+        <div class="insight-banner-sub">The AI flagged pricing, personnel, and dates that require a human decision.</div>
+    </div>
+    <span class="insight-banner-arrow">&rarr;</span>
+</a>
 {% endif %}
 
-<!-- Status history (audit trail) -->
-{% if status_history %}
-<details class="card">
-    <summary><strong>Lifecycle History</strong> ({{ status_history|length }} entries)</summary>
-    <ul class="status-history-list">
-        {% for h in status_history %}
-        <li>
-            <span class="status-from">{{ lifecycle_labels.get(h.from_status, h.from_status or '—') }}</span>
-            &rarr;
-            <span class="status-to">{{ lifecycle_labels.get(h.to_status, h.to_status) }}</span>
-            <span class="status-meta">by {{ h.actor.display_name if h.actor else 'system' }} at {{ h.created_at.strftime('%Y-%m-%d %H:%M') }}</span>
-            {% if h.note %}<div class="status-note">{{ h.note }}</div>{% endif %}
-        </li>
-        {% endfor %}
-    </ul>
-</details>
-{% endif %}
+<div class="workspace-grid">
+    <div class="workspace-main">
 
-<section class="proposal-content">
-    <div class="proposal-body">
-        {{ proposal_html|safe }}
-    </div>
-</section>
-
-<!-- Review Comments -->
-<section class="comments-section">
-    <div class="comments-header">
-        <h2>Review Comments
-            {% if open_comment_count %}<span class="badge badge-danger">{{ open_comment_count }} open</span>{% endif %}
-        </h2>
-    </div>
-
-    <form method="post" action="{{ url_for('add_proposal_comment', proposal_id=proposal.id) }}" class="comment-form card">
-        <div class="form-group">
-            <label for="section_anchor">Section (optional)</label>
-            <input type="text" id="section_anchor" name="section_anchor" placeholder="e.g., Scope of Work, Pricing Table">
+        <!-- Document viewer -->
+        <div class="viewer-card">
+            <div class="viewer-toolbar">
+                <div class="viewer-file">
+                    <span class="vf-icon">&#128196;</span>
+                    <span>{{ proposal.docx_file or (meta.source_file ~ '.docx') }}</span>
+                    {% if versions %}<span class="version-chip">v{{ versions[0].version_number }} Current</span>{% endif %}
+                </div>
+                <div class="viewer-toolbar-right">
+                    {% if versions and versions | length > 1 %}
+                    <select class="viewer-version-select" id="version-select" title="View a previous version">
+                        {% for v in versions %}
+                        <option value="{% if loop.first %}{{ url_for('view_proposal', proposal_id=proposal.id) }}{% else %}{{ url_for('view_version', proposal_id=proposal.id, version_id=v.id) }}{% endif %}" {{ 'selected' if loop.first }}>
+                            v{{ v.version_number }}{{ ' · current' if loop.first }} — {{ v.edit_source | replace('_', ' ') }}
+                        </option>
+                        {% endfor %}
+                    </select>
+                    {% endif %}
+                    <div class="viewer-zoom" title="Text size">
+                        <button type="button" id="font-minus">&minus;</button>
+                        <span class="vz-label" id="font-label">100%</span>
+                        <button type="button" id="font-plus">+</button>
+                    </div>
+                    <div class="viewer-seg">
+                        <a href="{{ url_for('view_proposal', proposal_id=proposal.id) }}" class="{{ 'active' if view_mode == 'clean' }}">Clean</a>
+                        {% if redline_available %}
+                        <a href="{{ url_for('view_proposal', proposal_id=proposal.id, view='redline') }}" class="{{ 'active' if view_mode == 'redline' }}">&#9776; Redlines</a>
+                        {% else %}
+                        <a href="#" title="Redlines available once the proposal has been edited (2+ versions)" style="opacity:0.4; cursor:not-allowed;" onclick="return false;">&#9776; Redlines</a>
+                        {% endif %}
+                    </div>
+                    <a href="{{ url_for('download', proposal_id=proposal.id, fmt='docx') }}" class="btn btn-small btn-secondary">&#8681; Export .docx</a>
+                    {% if redline_available %}
+                    <a href="{{ url_for('download_redline', proposal_id=proposal.id) }}" class="btn btn-small btn-secondary" title="Word document with tracked changes">&#8681; Redline .docx</a>
+                    {% endif %}
+                    <a href="{{ url_for('download', proposal_id=proposal.id, fmt='md') }}" class="btn btn-small btn-secondary">&#8681; .md</a>
+                </div>
+            </div>
+            {% if view_mode == 'redline' %}
+            <div style="padding: 10px 18px; background: var(--gold-bg); border-bottom: 1px solid var(--gold-line); font-size: 12.5px; color: var(--gold);">
+                Redline view — comparing the AI original (v1) against the current version.
+                <ins style="margin-left:8px;">additions</ins> <del style="margin-left:4px;">removals</del>
+            </div>
+            {% endif %}
+            <div class="viewer-body" id="viewer-body">
+                <div class="proposal-body">
+                    {{ proposal_html|safe }}
+                </div>
+            </div>
         </div>
-        <div class="form-group">
-            <label for="body">Comment</label>
-            <textarea id="body" name="body" rows="3" required placeholder="Add a review note for the team…"></textarea>
-        </div>
-        <button type="submit" class="btn btn-primary btn-small">Post Comment</button>
-    </form>
 
-    {% if comments %}
-    <ul class="comment-list">
-        {% for c in comments %}
-        <li id="comment-{{ c.id }}" class="comment-item{% if c.is_resolved %} comment-resolved{% endif %}">
-            <div class="comment-meta">
-                <strong>{{ c.author.display_name or c.author.username if c.author else 'User' }}</strong>
-                <span class="comment-time">{{ c.created_at.strftime('%Y-%m-%d %H:%M') }}</span>
-                {% if c.section_anchor %}
-                <span class="comment-anchor">&rsaquo; {{ c.section_anchor }}</span>
+        {% if action_items %}
+        <section class="action-items-section" id="action-items">
+            <h2>Action Items ({{ action_items|length }})</h2>
+            <p class="action-items-note">These items require human review before the proposal is submitted.</p>
+            <ul class="action-items-list">
+                {% for item in action_items %}
+                <li>{{ item }}</li>
+                {% endfor %}
+            </ul>
+        </section>
+        {% endif %}
+
+        <!-- Review Comments -->
+        <section class="comments-section">
+            <div class="comments-header">
+                <h2>Review Comments
+                    {% if open_comment_count %}<span class="badge badge-danger">{{ open_comment_count }} open</span>{% endif %}
+                </h2>
+            </div>
+
+            <form method="post" action="{{ url_for('add_proposal_comment', proposal_id=proposal.id) }}" class="comment-form card">
+                <div class="form-group">
+                    <label for="section_anchor">Section (optional)</label>
+                    <input type="text" id="section_anchor" name="section_anchor" placeholder="e.g., Scope of Work, Pricing Table">
+                </div>
+                <div class="form-group">
+                    <label for="body">Comment</label>
+                    <textarea id="body" name="body" rows="3" required placeholder="Add a review note for the team…"></textarea>
+                </div>
+                <button type="submit" class="btn btn-primary btn-small">Post Comment</button>
+            </form>
+
+            {% if comments %}
+            <ul class="comment-list">
+                {% for c in comments %}
+                <li id="comment-{{ c.id }}" class="comment-item{% if c.is_resolved %} comment-resolved{% endif %}">
+                    <div class="comment-meta">
+                        <strong>{{ c.author.display_name or c.author.username if c.author else 'User' }}</strong>
+                        <span class="comment-time">{{ c.created_at.strftime('%Y-%m-%d %H:%M') }}</span>
+                        {% if c.section_anchor %}
+                        <span class="comment-anchor">&rsaquo; {{ c.section_anchor }}</span>
+                        {% endif %}
+                        {% if c.is_resolved %}
+                        <span class="badge badge-success">Resolved</span>
+                        {% endif %}
+                    </div>
+                    <div class="comment-body">{{ c.body }}</div>
+                    <div class="comment-actions">
+                        <form method="post" action="{{ url_for('resolve_proposal_comment', proposal_id=proposal.id, comment_id=c.id) }}" class="inline-form">
+                            <button type="submit" class="btn btn-small btn-secondary">
+                                {{ 'Unresolve' if c.is_resolved else 'Mark Resolved' }}
+                            </button>
+                        </form>
+                        {% if c.author_id == current_user.id or current_user.is_admin %}
+                        <form method="post" action="{{ url_for('delete_proposal_comment', proposal_id=proposal.id, comment_id=c.id) }}" class="inline-form" onsubmit="return confirm('Delete this comment?')">
+                            <button type="submit" class="btn btn-small btn-danger">Delete</button>
+                        </form>
+                        {% endif %}
+                    </div>
+                </li>
+                {% endfor %}
+            </ul>
+            {% else %}
+            <p class="empty-state">No comments yet. Start the review.</p>
+            {% endif %}
+        </section>
+    </div>
+
+    <!-- Right rail -->
+    <aside class="rail">
+        {% if proposal.review_status in ('won', 'customer_approved') %}
+        <div class="rail-card rail-card-terminal">
+            <h3>&#127942; Awarded</h3>
+            <p style="font-size:13px; color:var(--ink-700);">Customer accepted the proposal — project won.
+            Completed {{ status_history[0].created_at.strftime('%b %d, %Y %H:%M') if status_history else '' }}.</p>
+        </div>
+        {% elif proposal.review_status in ('lost', 'customer_declined') %}
+        <div class="rail-card rail-card-terminal rail-lost">
+            <h3>Not Awarded</h3>
+            <p style="font-size:13px; color:var(--ink-700);">Customer declined the proposal — project lost.
+            Capture the reason on the <a href="{{ url_for('proposals_list', filter='lost') }}">Proposals page</a> for win/loss reporting.</p>
+        </div>
+        {% else %}
+        <div class="rail-card">
+            <h3>Current Phase — {{ lifecycle_labels.get(proposal.review_status, 'Draft') }}</h3>
+            <p style="font-size: 13px; color: var(--ink-500); margin-bottom: 12px;">
+                {% if proposal.review_status == 'draft' %}
+                This proposal has not yet been sent for internal review.
+                {% elif proposal.review_status == 'in_review' %}
+                Out for internal review — <strong>{{ state.approved_count }} of {{ state.required_count }}</strong> required reviewers have approved v{{ state.version_number }}.
+                {% elif proposal.review_status == 'revision_requested' %}
+                <strong>{{ pending_req_count }}</strong> pending revision request(s). Apply them to generate the next version.
+                {% elif proposal.review_status == 'internally_approved' %}
+                <strong style="color: var(--ok);">Internally approved.</strong> Ready to send to the customer.
+                {% elif proposal.review_status == 'submitted_to_customer' %}
+                Submitted to the customer. Awaiting feedback or final decision.
+                {% elif proposal.review_status == 'customer_feedback' %}
+                Customer requested changes. <strong>{{ pending_req_count }}</strong> pending request(s).
                 {% endif %}
-                {% if c.is_resolved %}
-                <span class="badge badge-success">Resolved</span>
+            </p>
+            <div class="rail-actions">
+                {% if is_owner %}
+                    {% if proposal.review_status == 'draft' %}
+                    <a href="{{ url_for('send_for_review', proposal_id=proposal.id) }}" class="btn btn-primary">Send for Internal Review</a>
+                    {% elif proposal.review_status in ('in_review', 'revision_requested', 'customer_feedback') and pending_req_count > 0 %}
+                    <a href="{{ url_for('apply_feedback', proposal_id=proposal.id) }}" class="btn btn-primary">Apply Feedback &amp; Generate v{{ (state.version_number or 1) + 1 }}</a>
+                    {% endif %}
+                    {% if proposal.review_status == 'internally_approved' %}
+                    <form method="post" action="{{ url_for('submit_to_customer', proposal_id=proposal.id) }}" class="inline-form">
+                        <button type="submit" class="btn btn-primary">Submit to Customer</button>
+                    </form>
+                    <button type="button" class="btn btn-secondary" id="run-preflight">Run Pre-flight Check</button>
+                    {% endif %}
+                    {% if proposal.review_status in ('submitted_to_customer', 'customer_feedback') %}
+                    <a href="{{ url_for('customer_feedback', proposal_id=proposal.id) }}" class="btn btn-secondary">Log Customer Feedback</a>
+                    <form method="post" action="{{ url_for('customer_decision', proposal_id=proposal.id) }}" class="inline-form">
+                        <input type="hidden" name="decision" value="accepted">
+                        <button type="submit" class="btn btn-primary">Mark Accepted (Won)</button>
+                    </form>
+                    <form method="post" action="{{ url_for('customer_decision', proposal_id=proposal.id) }}" class="inline-form">
+                        <input type="hidden" name="decision" value="declined">
+                        <button type="submit" class="btn btn-secondary">Mark Declined (Lost)</button>
+                    </form>
+                    {% endif %}
+                {% endif %}
+                {% if my_reviewer %}
+                <a href="{{ url_for('proposal_review_page', proposal_id=proposal.id) }}" class="btn btn-primary">My Review</a>
                 {% endif %}
             </div>
-            <div class="comment-body">{{ c.body }}</div>
-            <div class="comment-actions">
-                <form method="post" action="{{ url_for('resolve_proposal_comment', proposal_id=proposal.id, comment_id=c.id) }}" class="inline-form">
-                    <button type="submit" class="btn btn-small btn-secondary">
-                        {{ 'Unresolve' if c.is_resolved else 'Mark Resolved' }}
-                    </button>
-                </form>
-                {% if c.author_id == current_user.id or current_user.is_admin %}
-                <form method="post" action="{{ url_for('delete_proposal_comment', proposal_id=proposal.id, comment_id=c.id) }}" class="inline-form" onsubmit="return confirm('Delete this comment?')">
-                    <button type="submit" class="btn btn-small btn-danger">Delete</button>
-                </form>
-                {% endif %}
-            </div>
-        </li>
-        {% endfor %}
-    </ul>
-    {% else %}
-    <p class="empty-state">No comments yet. Start the review.</p>
-    {% endif %}
-</section>
+            <div id="preflight-results" class="preflight-box" style="display:none;"></div>
+        </div>
+        {% endif %}
+
+        {% if reviewers %}
+        <div class="rail-card">
+            <h3>Reviewer Roster</h3>
+            <ul class="reviewer-list">
+                {% for r in reviewers %}
+                {% set decided = namespace(found=none) %}
+                {% for ap in state.approved_reviewers %}{% if ap.user_id == r.user_id %}{% set decided.found = 'approved' %}{% endif %}{% endfor %}
+                {% for ap in state.requested_changes_reviewers %}{% if ap.user_id == r.user_id %}{% set decided.found = 'changes' %}{% endif %}{% endfor %}
+                <li class="reviewer-item reviewer-{{ decided.found or 'pending' }}">
+                    <span class="reviewer-check">
+                        {% if decided.found == 'approved' %}&#10003;{% elif decided.found == 'changes' %}&#9888;{% else %}&#8230;{% endif %}
+                    </span>
+                    <span class="reviewer-name">{{ r.user.display_name or r.user.username }}</span>
+                    <span class="reviewer-role badge badge-vertical">{{ r.review_role | title }}</span>
+                    {% if not r.is_required %}<span class="reviewer-optional">optional</span>{% endif %}
+                    {% if r.deadline %}<span class="reviewer-deadline">due {{ r.deadline.strftime('%b %d') }}</span>{% endif %}
+                </li>
+                {% endfor %}
+            </ul>
+        </div>
+        {% endif %}
+
+        {% if status_history %}
+        <div class="rail-card">
+            <h3>Lifecycle History</h3>
+            <ul class="timeline">
+                {% for h in status_history %}
+                <li>
+                    <span class="tl-title">{{ lifecycle_labels.get(h.to_status, h.to_status) }}</span>
+                    <div class="tl-meta">by {{ h.actor.display_name if h.actor else 'system' }} · {{ h.created_at.strftime('%b %d, %H:%M') }}</div>
+                    {% if h.note %}<div class="tl-note">{{ h.note }}</div>{% endif %}
+                </li>
+                {% endfor %}
+            </ul>
+        </div>
+        {% endif %}
+    </aside>
+</div>
 {% endblock %}
 
 {% block scripts %}
 <script>
+// Version dropdown navigation
+(function(){
+    var sel = document.getElementById("version-select");
+    if (sel) {
+        sel.addEventListener("change", function(){
+            if (sel.value) window.location.href = sel.value;
+        });
+    }
+})();
+
+// Font size controls
+(function(){
+    var body = document.getElementById("viewer-body");
+    var label = document.getElementById("font-label");
+    var minus = document.getElementById("font-minus");
+    var plus = document.getElementById("font-plus");
+    if (!body || !minus || !plus) return;
+    var size = 100;
+    function apply(){
+        body.style.fontSize = size + "%";
+        label.textContent = size + "%";
+    }
+    minus.addEventListener("click", function(){ size = Math.max(70, size - 10); apply(); });
+    plus.addEventListener("click", function(){ size = Math.min(160, size + 10); apply(); });
+})();
+
+// Pre-flight check
 (function(){
     var btn = document.getElementById("run-preflight");
     var box = document.getElementById("preflight-results");

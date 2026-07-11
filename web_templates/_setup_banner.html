@@ -1,0 +1,40 @@
+{% if setup_progress and not setup_progress.complete %}
+<div class="setup-banner" id="setup-banner" data-user="{{ current_user.id }}">
+    <div class="setup-banner-icon">&#10024;</div>
+    <div>
+        <div class="setup-banner-text">
+            <strong>Finish setting up your workspace</strong> — {{ setup_progress.done }} of {{ setup_progress.total }} steps done
+        </div>
+        <div class="setup-banner-chips" style="margin-top:6px;">
+            {% set pending_steps = setup_progress.steps | rejectattr('done') | list %}
+            {% for step in pending_steps[:2] %}
+            <a class="chip chip-gold" href="{{ url_for(step.endpoint) }}{{ step.anchor }}" style="text-decoration:none;">{{ step.title }}</a>
+            {% endfor %}
+            {% if pending_steps | length > 2 %}
+            <a class="chip chip-neutral" href="{{ url_for('setup_wizard') }}" style="text-decoration:none;">+{{ pending_steps | length - 2 }} more</a>
+            {% endif %}
+        </div>
+    </div>
+    <div class="setup-banner-right">
+        <div class="setup-progress-track"><div class="setup-progress-fill" style="width: {{ setup_progress.percent }}%;"></div></div>
+        <a href="{{ url_for('setup_wizard') }}" class="btn btn-primary btn-small" style="background: var(--sea-800);">Resume setup &rarr;</a>
+        <button type="button" class="setup-banner-close" id="setup-banner-close" aria-label="Dismiss">&times;</button>
+    </div>
+</div>
+<script>
+(function(){
+    var banner = document.getElementById("setup-banner");
+    var close = document.getElementById("setup-banner-close");
+    if (!banner || !close) return;
+    var key = "pm-setup-banner-dismissed-" + banner.dataset.user;
+    if (window.localStorage && localStorage.getItem(key) === "1") {
+        banner.style.display = "none";
+        return;
+    }
+    close.addEventListener("click", function(){
+        banner.style.display = "none";
+        if (window.localStorage) localStorage.setItem(key, "1");
+    });
+})();
+</script>
+{% endif %}
