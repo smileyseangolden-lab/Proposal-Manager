@@ -584,6 +584,112 @@ def logout():
 
 
 # ---------------------------------------------------------------------------
+# Phase flow (chevron stepper)
+# ---------------------------------------------------------------------------
+
+def compute_phases(project, proposal, doc_count=None, scope_status=None) -> list[dict]:
+    """Map a project + latest proposal onto the 8-phase proposal flow.
+
+    Phases: Upload → Scope of Work → Draft Proposal → Internal Review →
+    Send to Customer → Negotiate → Awarded/Not Awarded → Storage.
+
+    Returns a list of {key, label, state} where state is one of
+    'complete', 'current', 'pending', 'lost'.
+    """
+    if doc_count is None:
+        doc_count = ProjectDocument.query.filter_by(project_id=project.id).count()
+
+    rs = (proposal.review_status or "draft") if proposal else None
+    won = project.status == "won" or rs in ("won", "customer_approved")
+    lost = project.status == "lost" or rs in ("lost", "customer_declined")
+    archived = project.status == "archived"
+
+    upload_done = doc_count > 0
+    scope_done = scope_status == "approved" or proposal is not None
+    draft_done = proposal is not None
+    review_done = rs in ("internally_approved", "submitted_to_customer", "customer_feedback",
+                         "customer_approved", "customer_declined", "won", "lost")
+    review_current = rs in ("draft", "in_review", "revision_requested")
+    send_done = rs in ("submitted_to_customer", "customer_feedback",
+                       "customer_approved", "customer_declined", "won", "lost")
+    send_current = rs == "internally_approved"
+    neg_done = rs in ("customer_approved", "customer_declined", "won", "lost")
+    neg_current = rs in ("submitted_to_customer", "customer_feedback")
+
+    def state(done, current):
+        if done:
+            return "complete"
+        if current:
+            return "current"
+        return "pending"
+
+    if won:
+        award_label, award_state = "Awarded", "complete"
+    elif lost:
+        award_label, award_state = "Not Awarded", "lost"
+    else:
+        award_label, award_state = "Award", "pending"
+
+    return [
+        {"key": "upload", "label": "Upload",
+         "state": state(upload_done, not upload_done)},
+        {"key": "scope", "label": "Scope of Work",
+         "state": state(scope_done, upload_done and not scope_done)},
+        {"key": "draft", "label": "Draft Proposal",
+         "state": state(draft_done, scope_done and not draft_done)},
+        {"key": "review", "label": "Internal Review",
+         "state": state(review_done, bool(proposal) and review_current)},
+        {"key": "send", "label": "Send to Customer",
+         "state": state(send_done, send_current)},
+        {"key": "negotiate", "label": "Negotiate",
+         "state": state(neg_done, neg_current)},
+        {"key": "award", "label": award_label, "state": award_state},
+        {"key": "storage", "label": "Storage",
+         "state": "complete" if archived else ("current" if (won or lost) else "pending")},
+    ]
+
+
+def _inline_redline_markdown(old_md: str, new_md: str) -> str:
+    """Produce a word-level inline diff of two markdown documents, wrapping
+    additions in <ins> and removals in <del> so the rendered HTML shows a
+    readable redline. Newlines are kept outside the tags so markdown block
+    structure survives."""
+    def tokenize(text):
+        return re.findall(r"[^\s]+|\n|[ \t]+", text)
+
+    def wrap(tokens, tag):
+        out = []
+        buf = []
+        for t in tokens:
+            if t == "\n":
+                if buf:
+                    out.append(f"<{tag}>{''.join(buf)}</{tag}>")
+                    buf = []
+                out.append("\n")
+            else:
+                buf.append(t)
+        if buf:
+            out.append(f"<{tag}>{''.join(buf)}</{tag}>")
+        return "".join(out)
+
+    old_tokens = tokenize(old_md)
+    new_tokens = tokenize(new_md)
+    sm = difflib.SequenceMatcher(None, old_tokens, new_tokens, autojunk=False)
+    parts = []
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        if op == "equal":
+            parts.append("".join(new_tokens[j1:j2]))
+        elif op == "insert":
+            parts.append(wrap(new_tokens[j1:j2], "ins"))
+        elif op == "delete":
+            parts.append(wrap(old_tokens[i1:i2], "del"))
+        else:  # replace
+            parts.append(wrap(old_tokens[i1:i2], "del"))
+            parts.append(wrap(new_tokens[j1:j2], "ins"))
+    return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Dashboard
 # ---------------------------------------------------------------------------
 
@@ -1799,6 +1905,20 @@ def project_upload(project_id):
         is_company_default=True
     ).first() is not None
 
+    latest_prop = (
+        Proposal.query.filter_by(project_id=project_id)
+        .order_by(Proposal.generated_at.desc())
+        .first()
+    )
+    phases = compute_phases(project, latest_prop, doc_count=len(documents))
+    pending_questions = ProposalQuestion.query.filter_by(
+        project_id=project_id, status="pending"
+    ).count()
+    open_clarifications = ClarificationItem.query.filter_by(project_id=project_id).filter(
+        ClarificationItem.status.in_(["open", "draft", "sent", "response_received"])
+    ).count()
+    proposal_users = User.query.filter(User.role.in_(["proposal", "admin"])).order_by(User.display_name).all()
+
     return render_template(
         "project_upload.html",
         project=project,
@@ -1812,6 +1932,12 @@ def project_upload(project_id):
         travel_rate_count=travel_rate_count,
         has_user_template=has_user_template,
         has_company_template=has_company_template,
+        latest_prop=latest_prop,
+        phases=phases,
+        pending_questions=pending_questions,
+        open_clarifications=open_clarifications,
+        proposal_users=proposal_users,
+        lifecycle_labels=LIFECYCLE_LABELS,
     )
 
 
@@ -2287,8 +2413,32 @@ def view_proposal(proposal_id):
         return redirect(url_for("dashboard"))
 
     proposal_md = md_path.read_text(encoding="utf-8")
-    proposal_html = md.markdown(proposal_md, extensions=["tables", "fenced_code"])
     action_items = re.findall(r"\[ACTION REQUIRED:\s*(.+?)\]", proposal_md)
+
+    # Version history for the viewer dropdown
+    versions = ProposalVersion.query.filter_by(proposal_id=proposal_id).order_by(
+        ProposalVersion.version_number.desc()
+    ).all()
+
+    # Clean vs Redlines view. Redline = inline word diff of AI original (v1)
+    # against the current latest version.
+    view_mode = request.args.get("view", "clean")
+    redline_available = len(versions) > 1
+    if view_mode == "redline" and redline_available:
+        try:
+            v1 = versions[-1]
+            latest_v = versions[0]
+            proposal_md_render = _inline_redline_markdown(
+                v1.markdown_content, latest_v.markdown_content
+            )
+        except Exception:
+            view_mode = "clean"
+            proposal_md_render = proposal_md
+    else:
+        view_mode = "clean"
+        proposal_md_render = proposal_md
+
+    proposal_html = md.markdown(proposal_md_render, extensions=["tables", "fenced_code"])
 
     meta = {
         "source_file": project.name,
@@ -2318,6 +2468,8 @@ def view_proposal(proposal_id):
         proposal_id=proposal_id
     ).order_by(ProposalStatusHistory.created_at.desc()).limit(10).all()
 
+    phases = compute_phases(project, proposal)
+
     return render_template(
         "proposal.html",
         meta=meta,
@@ -2334,6 +2486,10 @@ def view_proposal(proposal_id):
         my_reviewer=my_reviewer,
         status_history=status_history,
         lifecycle_labels=LIFECYCLE_LABELS,
+        phases=phases,
+        versions=versions,
+        view_mode=view_mode,
+        redline_available=redline_available,
     )
 
 
