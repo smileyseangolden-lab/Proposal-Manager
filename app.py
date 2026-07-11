@@ -587,6 +587,157 @@ def logout():
 # Dashboard
 # ---------------------------------------------------------------------------
 
+def _project_focus_entry(p, now_naive):
+    """Build a 'pick up where you left off' entry for an active project.
+
+    Determines the single next action based on the latest proposal's
+    lifecycle state (or the pre-generation state of the project).
+    """
+    latest_prop = (
+        Proposal.query.filter_by(project_id=p.id)
+        .order_by(Proposal.generated_at.desc())
+        .first()
+    )
+    doc_count = ProjectDocument.query.filter_by(project_id=p.id).count()
+    pending_questions = ProposalQuestion.query.filter_by(
+        project_id=p.id, status="pending"
+    ).count()
+
+    action_label = "Open"
+    action_url = url_for("project_upload", project_id=p.id)
+    chip = ("Active", "chip-sea")
+    sub = ""
+
+    if pending_questions > 0:
+        action_label = "Answer questions"
+        action_url = url_for("project_questions", project_id=p.id)
+        chip = ("Your move", "chip-gold")
+        sub = f"{pending_questions} clarification question(s) awaiting answers"
+    elif latest_prop is None:
+        if doc_count == 0:
+            action_label = "Upload documents"
+            chip = ("Needs documents", "chip-neutral")
+            sub = "No RFP/RFQ uploaded yet"
+        else:
+            action_label = "Generate proposal"
+            chip = ("Your move", "chip-gold")
+            sub = f"{doc_count} document(s) ready · awaiting AI draft"
+    else:
+        rs = latest_prop.review_status or "draft"
+        pending_req = RevisionRequest.query.filter_by(
+            proposal_id=latest_prop.id, status="pending"
+        ).count()
+        if rs == "draft":
+            action_label = "Send for review"
+            action_url = url_for("view_proposal", proposal_id=latest_prop.id)
+            chip = ("Your move", "chip-gold")
+            sub = "AI draft ready · not yet in internal review"
+        elif rs in ("in_review", "revision_requested"):
+            state = approval_state(latest_prop)
+            if pending_req > 0:
+                action_label = "Apply feedback"
+                action_url = url_for("apply_feedback", proposal_id=latest_prop.id)
+                chip = ("Your move", "chip-gold")
+                sub = f"{pending_req} pending revision request(s)"
+            else:
+                action_label = "Open"
+                action_url = url_for("view_proposal", proposal_id=latest_prop.id)
+                chip = ("In review", "chip-sea")
+                sub = f"{state['approved_count']} of {state['required_count']} reviewers approved"
+        elif rs == "internally_approved":
+            action_label = "Submit to customer"
+            action_url = url_for("view_proposal", proposal_id=latest_prop.id)
+            chip = ("Approved", "chip-ok")
+            sub = "Internally approved · ready to send"
+        elif rs == "submitted_to_customer":
+            action_label = "Open"
+            action_url = url_for("view_proposal", proposal_id=latest_prop.id)
+            chip = ("Their move", "chip-violet")
+            sub = "With the customer · awaiting response"
+        elif rs == "customer_feedback":
+            action_label = "Apply feedback"
+            action_url = url_for("apply_feedback", proposal_id=latest_prop.id)
+            chip = ("Customer feedback", "chip-violet")
+            sub = f"{pending_req} customer request(s) to apply" if pending_req else "Customer replied with feedback"
+        else:
+            return None  # terminal states don't belong in the focus list
+
+    overdue = False
+    due_str = ""
+    if p.due_date:
+        due = p.due_date.replace(tzinfo=None) if p.due_date.tzinfo else p.due_date
+        days = (due - now_naive).days
+        if due < now_naive:
+            overdue = True
+            due_str = f"{abs(days)} day(s) overdue"
+        elif days <= 7:
+            due_str = f"due in {days} day(s)"
+        else:
+            due_str = "due " + due.strftime("%b %d")
+
+    return {
+        "kind": "project",
+        "title": p.name,
+        "url": url_for("project_upload", project_id=p.id),
+        "client": p.client_name or "",
+        "code": (latest_prop.document_type if latest_prop else "RFP") + "-" + p.id[:6].upper(),
+        "chip": chip,
+        "sub": sub,
+        "due_str": due_str,
+        "overdue": overdue,
+        "value": p.dollar_amount or 0,
+        "action_label": action_label,
+        "action_url": action_url,
+        "assigned_to_me": p.assigned_to == current_user.id,
+        "with_customer": bool(latest_prop and latest_prop.review_status in ("submitted_to_customer", "customer_feedback")),
+    }
+
+
+@app.route("/quick-start", methods=["POST"])
+@login_required
+def quick_start():
+    """Create a project directly from dropped RFP/RFQ files (dashboard hero)."""
+    files = request.files.getlist("documents")
+    valid = [
+        f for f in files
+        if f and f.filename and _allowed_file(f.filename, ALLOWED_EXTENSIONS | {"xlsx", "xls"})
+    ]
+    if not valid:
+        flash("Please drop a PDF, DOCX, TXT, MD, or XLSX file to start a proposal session.", "error")
+        return redirect(url_for("dashboard"))
+
+    # Derive a readable project name from the first file
+    stem = Path(valid[0].filename).stem.replace("_", " ").replace("-", " ").strip()
+    project_name = (stem[:280] or "New Proposal") + " Proposal"
+
+    project = Project(user_id=current_user.id, name=project_name)
+    db.session.add(project)
+    db.session.flush()
+
+    for f in valid:
+        safe, path, size = _save_upload(f, f"projects/{project.id}")
+        db.session.add(ProjectDocument(
+            project_id=project.id,
+            filename=f"{uuid.uuid4().hex[:8]}_{safe}",
+            original_filename=safe,
+            file_type="rfp",
+            file_path=path,
+            file_size=size,
+        ))
+
+    db.session.commit()
+    _log_activity("project_quick_start", f"Quick-started project from {len(valid)} file(s)", project.id)
+    _notify_role(
+        "proposal", "rfp_uploaded",
+        f"New proposal session: {project.name}",
+        f"{current_user.display_name or current_user.username} started a session with {len(valid)} document(s).",
+        link=f"/projects/{project.id}/upload",
+        exclude_user_id=current_user.id,
+    )
+    flash(f"Session started — {len(valid)} document(s) uploaded. Review and generate when ready.", "success")
+    return redirect(url_for("project_upload", project_id=project.id))
+
+
 @app.route("/")
 @login_required
 def dashboard():
@@ -760,8 +911,58 @@ def dashboard():
         proj = db.session.get(Project, prop.project_id)
         awaiting_customer_items.append({"proposal": prop, "project": proj})
 
+    # --- "Pick up where you left off" focus list -----------------------------
+    focus_items = []
+
+    # Reviews waiting on my decision come first — they block teammates.
+    for item in my_reviews_pending:
+        proj = item["project"]
+        focus_items.append({
+            "kind": "review",
+            "title": proj.name if proj else "Proposal review",
+            "url": url_for("proposal_review_page", proposal_id=item["proposal"].id),
+            "client": proj.client_name if proj else "",
+            "code": f"REV-{item['proposal'].id[:6].upper()}",
+            "chip": ("Review requested", "chip-gold"),
+            "sub": f"You're the {item['reviewer'].review_role.title()} reviewer on v{item['version_number']}",
+            "due_str": ("due " + item["deadline"].strftime("%b %d")) if item["deadline"] else "",
+            "overdue": item["overdue"],
+            "value": (proj.dollar_amount or 0) if proj else 0,
+            "action_label": "Start review",
+            "action_url": url_for("proposal_review_page", proposal_id=item["proposal"].id),
+            "assigned_to_me": True,
+            "with_customer": False,
+        })
+
+    for p in active_projects:
+        entry = _project_focus_entry(p, now_naive)
+        if entry:
+            focus_items.append(entry)
+
+    # Critical (overdue) first, then largest exposure
+    focus_items.sort(key=lambda i: (not i["overdue"], -(i["value"] or 0)))
+    combined_exposure = sum(i["value"] or 0 for i in focus_items)
+
+    # Greeting
+    hour = datetime.now().hour
+    if hour < 12:
+        greeting_word = "Good morning"
+    elif hour < 17:
+        greeting_word = "Good afternoon"
+    else:
+        greeting_word = "Good evening"
+    first_name = (current_user.display_name or current_user.username).split(" ")[0]
+    today_str = datetime.now().strftime("%A, %B %-d") if os.name != "nt" else datetime.now().strftime("%A, %B %d")
+
     return render_template(
         "dashboard.html",
+        focus_items=focus_items,
+        combined_exposure=combined_exposure,
+        greeting_word=greeting_word,
+        first_name=first_name,
+        today_str=today_str,
+        overdue_count=len(overdue_projects),
+        due_soon_count=len(upcoming_deadlines),
         active_projects=active_projects,
         past_projects=past_projects,
         stats=stats,
