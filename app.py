@@ -1302,20 +1302,62 @@ def proposals_export_csv():
 
 
 # ---------------------------------------------------------------------------
-# Posture & Setup Wizard (fleshed out in Build 5)
+# Proposal Posture (company setup: templates, standards, rates, branding)
 # ---------------------------------------------------------------------------
 
 
 @app.route("/posture")
 @login_required
 def posture():
-    return redirect(url_for("settings"))
+    rate_sheets = UserRateSheet.query.filter_by(user_id=current_user.id).order_by(UserRateSheet.uploaded_at.desc()).all()
+    user_templates = UserVerticalTemplate.query.filter_by(user_id=current_user.id, is_company_default=False).order_by(UserVerticalTemplate.uploaded_at.desc()).all()
+    staff_roles = StaffRole.query.filter_by(user_id=current_user.id).order_by(StaffRole.category, StaffRole.role_name).all()
+    equipment_items = EquipmentItem.query.filter_by(user_id=current_user.id).order_by(EquipmentItem.category, EquipmentItem.item_name).all()
+    travel_rates = TravelExpenseRate.query.filter_by(user_id=current_user.id).order_by(TravelExpenseRate.expense_type).all()
+    company_standards = CompanyStandard.query.filter_by(user_id=current_user.id).order_by(CompanyStandard.category, CompanyStandard.title).all()
+    revision_templates = RevisionTemplate.query.filter_by(user_id=current_user.id).order_by(
+        RevisionTemplate.category, RevisionTemplate.name
+    ).all()
+
+    # "Posture version" summary: most recent change across all posture content
+    timestamps = []
+    for coll, attr in (
+        (rate_sheets, "uploaded_at"), (user_templates, "uploaded_at"),
+        (staff_roles, "updated_at"), (equipment_items, "updated_at"),
+        (travel_rates, "updated_at"), (company_standards, "updated_at"),
+        (revision_templates, "created_at"),
+    ):
+        for item in coll:
+            ts = getattr(item, attr, None)
+            if ts:
+                timestamps.append(ts)
+    last_updated = max(timestamps) if timestamps else None
+    total_items = (len(rate_sheets) + len(user_templates) + len(staff_roles)
+                   + len(equipment_items) + len(travel_rates)
+                   + len(company_standards) + len(revision_templates))
+
+    return render_template(
+        "posture.html",
+        rate_sheets=rate_sheets,
+        user_templates=user_templates,
+        staff_roles=staff_roles,
+        equipment_items=equipment_items,
+        travel_rates=travel_rates,
+        company_standards=company_standards,
+        revision_templates=revision_templates,
+        revision_categories=REVISION_CATEGORIES,
+        verticals=VERTICALS,
+        logo_max_dimension=LOGO_MAX_DIMENSION,
+        last_updated=last_updated,
+        total_items=total_items,
+    )
 
 
 @app.route("/setup")
 @login_required
 def setup_wizard():
-    return redirect(url_for("settings"))
+    progress = _setup_progress(current_user)
+    return render_template("setup.html", progress=progress)
 
 
 # ---------------------------------------------------------------------------
@@ -1347,6 +1389,8 @@ def settings():
         db.session.commit()
         _log_activity("settings_update", "Updated user settings")
         flash("Settings saved.", "success")
+        if request.form.get("from_posture"):
+            return redirect(url_for("posture") + "#branding")
         return redirect(url_for("settings"))
 
     # Rate sheets
@@ -1389,7 +1433,7 @@ def upload_rate_sheet():
 
     if not file or not _allowed_file(file.filename, RATE_SHEET_EXTENSIONS):
         flash("Please upload an Excel file (.xlsx).", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#staff-rates")
 
     safe, path, size = _save_upload(file, f"rate_sheets/{current_user.id}")
 
@@ -1404,7 +1448,7 @@ def upload_rate_sheet():
     db.session.commit()
     _log_activity("rate_sheet_upload", f"Uploaded {sheet_type}: {safe}")
     flash("Rate sheet uploaded.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#staff-rates")
 
 
 @app.route("/settings/upload-template", methods=["POST"])
@@ -1416,7 +1460,7 @@ def upload_user_template():
 
     if not file or not _allowed_file(file.filename, TEMPLATE_EXTENSIONS):
         flash("Please upload a Word or PDF file.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#templates")
 
     safe, path, size = _save_upload(file, f"user_templates/{current_user.id}")
 
@@ -1433,7 +1477,7 @@ def upload_user_template():
     db.session.commit()
     _log_activity("template_upload", f"Uploaded {template_type} for {vertical}: {safe}")
     flash("Template uploaded.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#templates")
 
 
 @app.route("/settings/delete-rate-sheet/<sheet_id>", methods=["POST"])
@@ -1445,7 +1489,7 @@ def delete_rate_sheet(sheet_id):
     db.session.delete(sheet)
     db.session.commit()
     flash("Rate sheet deleted.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#staff-rates")
 
 
 @app.route("/settings/delete-template/<template_id>", methods=["POST"])
@@ -1457,7 +1501,7 @@ def delete_user_template(template_id):
     db.session.delete(tmpl)
     db.session.commit()
     flash("Template deleted.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#templates")
 
 
 # ---------------------------------------------------------------------------
@@ -1470,20 +1514,20 @@ def upload_company_logo():
     file = request.files.get("company_logo")
     if not file or not file.filename:
         flash("Please choose an image file to upload.", "error")
-        return redirect(url_for("settings") + "#profile")
+        return redirect(url_for("posture") + "#branding")
 
     if not _allowed_file(file.filename, LOGO_EXTENSIONS):
         flash(
             "Unsupported image type. Please upload a PNG, JPG, JPEG, WebP, GIF, or BMP.",
             "error",
         )
-        return redirect(url_for("settings") + "#profile")
+        return redirect(url_for("posture") + "#branding")
 
     try:
         original_name, saved_path, saved_size = _process_and_save_logo(file, current_user.id)
     except ValueError as e:
         flash(f"Could not process image: {e}", "error")
-        return redirect(url_for("settings") + "#profile")
+        return redirect(url_for("posture") + "#branding")
 
     # Remove old logo file if any
     if current_user.company_logo_path:
@@ -1506,7 +1550,7 @@ def upload_company_logo():
         "You can now choose how it appears on your proposals.",
         "success",
     )
-    return redirect(url_for("settings") + "#profile")
+    return redirect(url_for("posture") + "#branding")
 
 
 @app.route("/settings/delete-logo", methods=["POST"])
@@ -1524,7 +1568,7 @@ def delete_company_logo():
     db.session.commit()
     _log_activity("logo_delete", "Removed company logo")
     flash("Company logo removed.", "success")
-    return redirect(url_for("settings") + "#profile")
+    return redirect(url_for("posture") + "#branding")
 
 
 @app.route("/settings/logo-preview")
@@ -1561,7 +1605,7 @@ def add_staff_role():
         db.session.commit()
         _log_activity("rate_sheet_upload", f"Uploaded staff rate sheet: {safe}")
         flash(f"Rate sheet '{safe}' uploaded.", "success")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#staff-rates")
 
     role_name = request.form.get("role_name", "").strip()
     category = request.form.get("category", "").strip()
@@ -1571,18 +1615,18 @@ def add_staff_role():
 
     if not role_name or not hourly_rate:
         flash("Role name and hourly rate are required.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#staff-rates")
 
     try:
         hourly_rate = float(hourly_rate.replace(",", "").replace("$", ""))
         overtime_rate = float(overtime_rate.replace(",", "").replace("$", "")) if overtime_rate else 0.0
     except ValueError:
         flash("Invalid rate format.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#staff-rates")
 
     if hourly_rate < 0 or overtime_rate < 0:
         flash("Rates cannot be negative.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#staff-rates")
 
     role = StaffRole(
         user_id=current_user.id,
@@ -1596,7 +1640,7 @@ def add_staff_role():
     db.session.commit()
     _log_activity("staff_role_add", f"Added staff role: {role_name} @ ${hourly_rate}/hr")
     flash(f"Staff role '{role_name}' added.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#staff-rates")
 
 
 @app.route("/settings/edit-staff-role/<role_id>", methods=["POST"])
@@ -1616,12 +1660,12 @@ def edit_staff_role(role_id):
         role.overtime_rate = float(ot.replace(",", "").replace("$", "")) if ot else 0.0
     except ValueError:
         flash("Invalid rate format.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#staff-rates")
 
     db.session.commit()
     _log_activity("staff_role_edit", f"Updated staff role: {role.role_name}")
     flash(f"Staff role '{role.role_name}' updated.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#staff-rates")
 
 
 @app.route("/settings/delete-staff-role/<role_id>", methods=["POST"])
@@ -1635,7 +1679,7 @@ def delete_staff_role(role_id):
     db.session.commit()
     _log_activity("staff_role_delete", f"Deleted staff role: {name}")
     flash(f"Staff role '{name}' deleted.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#staff-rates")
 
 
 # ---------------------------------------------------------------------------
@@ -1660,7 +1704,7 @@ def add_equipment_item():
         db.session.commit()
         _log_activity("rate_sheet_upload", f"Uploaded equipment price list: {safe}")
         flash(f"Price list '{safe}' uploaded.", "success")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#equipment")
 
     item_name = request.form.get("item_name", "").strip()
     category = request.form.get("eq_category", "").strip()
@@ -1672,17 +1716,17 @@ def add_equipment_item():
 
     if not item_name or not unit_cost:
         flash("Item name and unit cost are required.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#equipment")
 
     try:
         unit_cost = float(unit_cost.replace(",", "").replace("$", ""))
     except ValueError:
         flash("Invalid cost format.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#equipment")
 
     if unit_cost < 0:
         flash("Cost cannot be negative.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#equipment")
 
     item = EquipmentItem(
         user_id=current_user.id,
@@ -1698,7 +1742,7 @@ def add_equipment_item():
     db.session.commit()
     _log_activity("equipment_add", f"Added equipment: {item_name} @ ${unit_cost}/{unit}")
     flash(f"Equipment item '{item_name}' added.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#equipment")
 
 
 @app.route("/settings/delete-equipment-item/<item_id>", methods=["POST"])
@@ -1712,7 +1756,7 @@ def delete_equipment_item(item_id):
     db.session.commit()
     _log_activity("equipment_delete", f"Deleted equipment: {name}")
     flash(f"Equipment item '{name}' deleted.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#equipment")
 
 
 # ---------------------------------------------------------------------------
@@ -1737,7 +1781,7 @@ def add_travel_rate():
         db.session.commit()
         _log_activity("rate_sheet_upload", f"Uploaded travel rate schedule: {safe}")
         flash(f"Travel rate schedule '{safe}' uploaded.", "success")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#travel")
 
     expense_type = request.form.get("expense_type", "").strip()
     description = request.form.get("travel_description", "").strip()
@@ -1746,17 +1790,17 @@ def add_travel_rate():
 
     if not expense_type or not rate:
         flash("Expense type and rate are required.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#travel")
 
     try:
         rate = float(rate.replace(",", "").replace("$", ""))
     except ValueError:
         flash("Invalid rate format.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#travel")
 
     if rate < 0:
         flash("Rate cannot be negative.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#travel")
 
     tr = TravelExpenseRate(
         user_id=current_user.id,
@@ -1769,7 +1813,7 @@ def add_travel_rate():
     db.session.commit()
     _log_activity("travel_rate_add", f"Added travel rate: {expense_type} @ ${rate}/{unit}")
     flash(f"Travel rate '{expense_type}' added.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#travel")
 
 
 @app.route("/settings/delete-travel-rate/<rate_id>", methods=["POST"])
@@ -1783,7 +1827,7 @@ def delete_travel_rate(rate_id):
     db.session.commit()
     _log_activity("travel_rate_delete", f"Deleted travel rate: {name}")
     flash(f"Travel rate '{name}' deleted.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#travel")
 
 
 # ---------------------------------------------------------------------------
@@ -3589,7 +3633,7 @@ def add_revision_template():
 
     if not name or not directive:
         flash("Name and directive are required.", "error")
-        return redirect(url_for("settings") + "#revision-templates")
+        return redirect(url_for("posture") + "#revision-presets")
 
     if category not in {c[0] for c in REVISION_CATEGORIES}:
         category = "other"
@@ -3605,7 +3649,7 @@ def add_revision_template():
     db.session.commit()
     _log_activity("revision_template_add", f"Added revision template: {name}")
     flash(f"Revision template '{name}' added.", "success")
-    return redirect(url_for("settings") + "#revision-templates")
+    return redirect(url_for("posture") + "#revision-presets")
 
 
 @app.route("/settings/delete-revision-template/<template_id>", methods=["POST"])
@@ -3619,7 +3663,7 @@ def delete_revision_template(template_id):
     db.session.commit()
     _log_activity("revision_template_delete", f"Deleted revision template: {name}")
     flash(f"Revision template '{name}' deleted.", "success")
-    return redirect(url_for("settings") + "#revision-templates")
+    return redirect(url_for("posture") + "#revision-presets")
 
 
 # ---------------------------------------------------------------------------
@@ -3635,7 +3679,7 @@ def add_company_standard():
 
     if not category or not title:
         flash("Category and title are required.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#standards")
 
     # Handle file upload as alternative to text content
     uploaded_file = request.files.get("standard_file")
@@ -3645,7 +3689,7 @@ def add_company_standard():
 
     if not content:
         flash("Either content or a file is required.", "error")
-        return redirect(url_for("settings") + "#company")
+        return redirect(url_for("posture") + "#standards")
 
     standard = CompanyStandard(
         user_id=current_user.id,
@@ -3657,7 +3701,7 @@ def add_company_standard():
     db.session.commit()
     _log_activity("company_standard_add", f"Added standard: {title}")
     flash(f"Company standard '{title}' added.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#standards")
 
 
 @app.route("/settings/edit-company-standard/<standard_id>", methods=["POST"])
@@ -3674,7 +3718,7 @@ def edit_company_standard(standard_id):
     db.session.commit()
     _log_activity("company_standard_edit", f"Updated standard: {std.title}")
     flash(f"Standard '{std.title}' updated.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#standards")
 
 
 @app.route("/settings/delete-company-standard/<standard_id>", methods=["POST"])
@@ -3688,7 +3732,7 @@ def delete_company_standard(standard_id):
     db.session.commit()
     _log_activity("company_standard_delete", f"Deleted standard: {title}")
     flash(f"Standard '{title}' deleted.", "success")
-    return redirect(url_for("settings") + "#company")
+    return redirect(url_for("posture") + "#standards")
 
 
 # ---------------------------------------------------------------------------

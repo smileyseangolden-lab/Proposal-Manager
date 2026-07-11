@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+
+{% block title %}Setup Wizard &mdash; {{ app_name }}{% endblock %}
+
+{% block breadcrumb %}
+<a href="{{ url_for('dashboard') }}">Workspace</a>
+<span class="crumb-sep">&rsaquo;</span>
+<span class="crumb-current">Setup Wizard</span>
+{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <div class="page-header-row">
+        <div>
+            <h1>Finish setting up your workspace</h1>
+            <p class="page-subtitle">{{ progress.done }} of {{ progress.total }} steps done — each step makes the AI's proposals sharper.</p>
+        </div>
+        <div class="header-actions" style="align-items:center;">
+            <div class="setup-progress-track" style="width: 180px;"><div class="setup-progress-fill" style="width: {{ progress.percent }}%;"></div></div>
+            <span style="font-size: 13px; font-weight: 700; color: var(--sea-700);">{{ progress.percent }}%</span>
+        </div>
+    </div>
+</section>
+
+{% if progress.complete %}
+<div class="scope-approved-banner">
+    <span>&#127881;</span>
+    <span>Your workspace is fully set up. The AI now drafts proposals with your templates, standards, rates, and branding.</span>
+</div>
+{% endif %}
+
+<div class="wizard-steps">
+    {% for step in progress.steps %}
+    <a class="wizard-step {{ 'done' if step.done }}" href="{{ url_for(step.endpoint) }}{{ step.anchor }}">
+        <span class="wizard-step-num">{% if step.done %}&#10003;{% else %}{{ loop.index }}{% endif %}</span>
+        <span>
+            <span class="wizard-step-title">{{ step.title }}</span>
+            <div class="wizard-step-desc">{{ step.desc }}</div>
+        </span>
+        <span class="wizard-step-go">{{ 'Review' if step.done else 'Set up' }} &rarr;</span>
+    </a>
+    {% endfor %}
+</div>
+{% endblock %}
