@@ -312,6 +312,115 @@ def inject_notifications():
     return dict(unread_notifications=0)
 
 
+def _setup_progress(user) -> dict:
+    """Compute workspace-setup wizard progress for a user.
+
+    Returns dict with 'steps' (list of {key,title,desc,done,url_endpoint,anchor}),
+    'done' count, 'total' count, and 'complete' bool.
+    """
+    steps = [
+        {
+            "key": "company",
+            "title": "Add your company profile",
+            "desc": "Company name used to brand generated proposals.",
+            "endpoint": "settings",
+            "anchor": "",
+            "done": bool((user.company_name or "").strip()),
+        },
+        {
+            "key": "logo",
+            "title": "Upload your company logo",
+            "desc": "Placed on proposal cover pages and headers.",
+            "endpoint": "posture",
+            "anchor": "#branding",
+            "done": bool(user.company_logo_path),
+        },
+        {
+            "key": "template",
+            "title": "Upload a proposal template",
+            "desc": "The AI follows your structure when drafting.",
+            "endpoint": "posture",
+            "anchor": "#templates",
+            "done": UserVerticalTemplate.query.filter_by(user_id=user.id).count() > 0,
+        },
+        {
+            "key": "standards",
+            "title": "Add company standards & terms",
+            "desc": "Mission, certifications, T&Cs auto-injected into proposals.",
+            "endpoint": "posture",
+            "anchor": "#standards",
+            "done": CompanyStandard.query.filter_by(user_id=user.id).count() > 0,
+        },
+        {
+            "key": "staff",
+            "title": "Define staff rates",
+            "desc": "Hourly sell rates for labor cost estimates.",
+            "endpoint": "posture",
+            "anchor": "#staff-rates",
+            "done": StaffRole.query.filter_by(user_id=user.id).count() > 0
+                    or UserRateSheet.query.filter_by(user_id=user.id).count() > 0,
+        },
+        {
+            "key": "equipment",
+            "title": "Add products & equipment pricing",
+            "desc": "Price list used for Bill of Materials estimates.",
+            "endpoint": "posture",
+            "anchor": "#equipment",
+            "done": EquipmentItem.query.filter_by(user_id=user.id).count() > 0,
+        },
+        {
+            "key": "travel",
+            "title": "Set travel & expense rates",
+            "desc": "Per diem, mileage, airfare used in travel estimates.",
+            "endpoint": "posture",
+            "anchor": "#travel",
+            "done": TravelExpenseRate.query.filter_by(user_id=user.id).count() > 0,
+        },
+        {
+            "key": "project",
+            "title": "Create your first project",
+            "desc": "Upload an RFP/RFQ to start a proposal session.",
+            "endpoint": "new_project",
+            "anchor": "",
+            "done": Project.query.filter_by(user_id=user.id).count() > 0,
+        },
+        {
+            "key": "proposal",
+            "title": "Generate your first proposal",
+            "desc": "Let the AI draft against your posture.",
+            "endpoint": "proposals_list",
+            "anchor": "",
+            "done": Proposal.query.join(Project).filter(Project.user_id == user.id).count() > 0,
+        },
+    ]
+    done = sum(1 for s in steps if s["done"])
+    return {
+        "steps": steps,
+        "done": done,
+        "total": len(steps),
+        "complete": done == len(steps),
+        "percent": round(done / len(steps) * 100),
+    }
+
+
+@app.context_processor
+def inject_nav_context():
+    """Sidebar counts + setup wizard progress for the app shell."""
+    if not (hasattr(current_user, "id") and current_user.is_authenticated):
+        return dict(setup_progress=None, nav_active_projects=0)
+    active_count = Project.query.filter(
+        db.or_(
+            Project.user_id == current_user.id,
+            Project.assigned_to == current_user.id,
+        ),
+        Project.status == "active",
+    ).count()
+    return dict(
+        setup_progress=_setup_progress(current_user),
+        nav_active_projects=active_count,
+    )
+
+
 def _can_access_project(project) -> bool:
     """Check if current user can access a project (owner, assigned, or admin)."""
     if not project:
@@ -671,6 +780,28 @@ def dashboard():
         awaiting_customer_items=awaiting_customer_items,
         lifecycle_labels=LIFECYCLE_LABELS,
     )
+
+
+# ---------------------------------------------------------------------------
+# Proposals list, Posture & Setup Wizard (fleshed out in later builds)
+# ---------------------------------------------------------------------------
+
+@app.route("/proposals")
+@login_required
+def proposals_list():
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/posture")
+@login_required
+def posture():
+    return redirect(url_for("settings"))
+
+
+@app.route("/setup")
+@login_required
+def setup_wizard():
+    return redirect(url_for("settings"))
 
 
 # ---------------------------------------------------------------------------
