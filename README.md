@@ -1,6 +1,6 @@
-# Proposal Manager Agent
+# Proposal Manager
 
-An AI-powered proposal generation tool for your intranet. Upload an RFP or RFQ document and get a complete proposal draft generated using your company templates, boilerplate, and past proposals as reference.
+An AI-powered proposal platform. Upload an RFP or RFQ document and get a complete proposal draft generated using your company templates, boilerplate, and past proposals as reference.
 
 **Powered by Claude Opus 4.6**
 
@@ -46,6 +46,24 @@ cp .env.example .env
 
 docker compose up -d
 ```
+
+### DigitalOcean App Platform
+
+The app works on DigitalOcean App Platform out of the box, using either the
+Dockerfile or the Python buildpack (a `Procfile` is included). In both cases
+gunicorn binds to the `$PORT` the platform injects.
+
+1. Create an App from this repository (App Platform auto-detects the Dockerfile).
+2. Set environment variables: `ANTHROPIC_API_KEY` (required) and
+   `FLASK_SECRET_KEY` (set to a long random string). Optionally `APP_NAME`,
+   `MAX_UPLOAD_SIZE_MB`, etc.
+3. Deploy. The database schema is created automatically on first boot.
+
+> **Persistence note:** the app stores its SQLite database in `data/` and
+> uploaded files in `uploads/` / `generated_proposals/`. App Platform
+> containers have ephemeral disks — attach a volume (or run on a Droplet with
+> `docker compose`, which bind-mounts these directories) if you need data to
+> survive redeploys.
 
 ---
 
@@ -129,16 +147,27 @@ docker compose logs -f --tail=50
 
 ---
 
-## How It Works
+## How It Works — the Phase Flow
 
-1. **Upload** — A team member uploads an RFP/RFQ document (PDF, DOCX, or TXT) through the web interface.
-2. **Parse** — The agent extracts all text and identifies the document type.
-3. **Analyze** — Requirements, evaluation criteria, deliverables, and constraints are identified.
-4. **Match** — Past proposals and reference documents are searched for relevant content.
-5. **Generate** — A complete proposal is drafted using your templates, tailored to the specific RFP/RFQ.
-6. **Review** — The generated proposal is presented with action items that require human input, plus inline team review comments.
-7. **Download** — The proposal can be downloaded as DOCX or Markdown.
-8. **Track & Analyze** — When the deal closes, capture win/loss reasons and competitor info for reporting.
+Every project moves through a visible chevron phase flow:
+
+**Upload → Scope of Work → Draft Proposal → Internal Review → Send to Customer → Negotiate → Awarded / Not Awarded → Storage**
+
+1. **Upload** — Drop an RFP/RFQ (PDF, DOCX, TXT) on the dashboard hero or a project page. Dropping a file on the dashboard creates the project for you.
+2. **Scope of Work** — Optionally have the AI extract a Scope of Work checklist from the RFP. Accept or strike each item, add your own, then approve. The generated proposal covers exactly the approved scope.
+3. **Draft Proposal** — The AI drafts against your Proposal Posture (templates, standards, rates, branding) with cost estimates from your configured rates.
+4. **Internal Review** — Assign reviewers, collect approvals and revision requests, and batch-apply feedback to generate new versions. View changes inline with the Clean/Redlines toggle.
+5. **Send to Customer** — Run the pre-flight check, then mark the proposal as submitted.
+6. **Negotiate** — Log customer feedback (typed or AI-parsed from an email) and apply it to generate revised versions.
+7. **Awarded / Not Awarded** — Record the outcome with reason category and competitor for win/loss reporting.
+8. **Storage** — Archive the project; documents stay searchable in the Document Library.
+
+### Key pages
+
+- **Dashboard** — serif greeting, "Start a new proposal session" drop zone, and a "Pick up where you left off" list of every open item sorted by impact.
+- **Proposals** — the full pipeline with quick-filter pills (Overdue, Unassigned, In Review, Awaiting Customer, Won, Lost…), sortable table or Kanban board view, and CSV export.
+- **Proposal Posture** — your templates, company standards & terms, staff/equipment/travel rates, branding, and revision presets, organized as accordion categories.
+- **Setup Wizard** — a 9-step checklist that walks new workspaces through posture setup.
 
 ---
 
@@ -236,4 +265,4 @@ The web interface highlights these in a summary panel so the proposal team knows
 | `FLASK_DEBUG` | Debug mode | `false` |
 | `MAX_UPLOAD_SIZE_MB` | Max upload size | `50` |
 | `DEFAULT_OUTPUT_FORMAT` | Output format | `docx` |
-# CloserAI
+
