@@ -392,6 +392,104 @@ spot assumptions easily.
 """
 
 
+def draft_scope_of_work(rfp_text: str, vertical: str = "auto",
+                        company_name: str = "",
+                        user_api_key: str = None,
+                        user_model: str = None) -> dict:
+    """Extract a proposed Scope of Work from an RFP/RFQ for human review.
+
+    Returns dict with 'vertical', 'vertical_label', 'summary', and 'items'
+    (list of {'item': str, 'category': str}). The human accepts/removes/adds
+    items before the full proposal is generated.
+    """
+    api_key = user_api_key or ANTHROPIC_API_KEY
+    model = user_model or CLAUDE_MODEL
+
+    if not api_key:
+        raise RuntimeError(
+            "No API key configured. Go to Settings to add your Anthropic API key."
+        )
+
+    if vertical == "auto":
+        from document_parser import detect_vertical
+        vertical = detect_vertical(rfp_text)
+    vertical_label = VERTICALS.get(vertical, {}).get("label", "General")
+
+    company_line = f"You are working on behalf of **{company_name}**.\n" if company_name else ""
+
+    system_prompt = f"""You are a proposal scoping analyst for {vertical_label} projects.
+{company_line}
+Read the customer's RFP/RFQ and extract the complete Scope of Work the responding
+proposal must cover. Each item is a single, concrete, verifiable statement of work
+(deliverable, service, or responsibility) — the checklist a human proposal manager
+will accept or strike before the proposal is drafted.
+
+## Output Format
+Return ONLY a JSON object, no preamble:
+{{
+  "summary": "2-3 sentence plain-English summary of the overall scope",
+  "items": [
+    {{"item": "Provide and install a complete EPMS covering 40 electrical rooms", "category": "installation"}},
+    {{"item": "Perform factory acceptance testing prior to shipment", "category": "commissioning"}}
+  ]
+}}
+
+## Rules
+- category must be one of: engineering, installation, commissioning, documentation, management, general.
+- 5-25 items. Split compound requirements into separate items.
+- Base every item on the RFP text — do NOT invent scope the customer didn't ask for.
+- If the RFP explicitly EXCLUDES something, do not list it as scope.
+- Write items in imperative, contract-ready language.
+"""
+
+    client = _make_client(api_key)
+    response_text = ""
+    with client.messages.stream(
+        model=model,
+        max_tokens=4000,
+        system=system_prompt,
+        messages=[{"role": "user", "content": f"---BEGIN RFP/RFQ---\n{rfp_text[:60000]}\n---END RFP/RFQ---"}],
+    ) as stream:
+        for chunk in stream.text_stream:
+            response_text += chunk
+
+    # Parse the JSON object out of the response
+    summary = ""
+    items: list[dict] = []
+    json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
+    if json_match:
+        try:
+            data = json.loads(json_match.group(0))
+            summary = (data.get("summary") or "").strip()
+            valid_categories = {"engineering", "installation", "commissioning",
+                                "documentation", "management", "general"}
+            for entry in data.get("items", []):
+                if not isinstance(entry, dict):
+                    continue
+                text = (entry.get("item") or "").strip()
+                if not text:
+                    continue
+                category = (entry.get("category") or "general").strip().lower()
+                if category not in valid_categories:
+                    category = "general"
+                items.append({"item": text, "category": category})
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    if not items:
+        raise RuntimeError(
+            "The AI could not extract a scope of work from the uploaded documents. "
+            "Check that the RFP/RFQ text was readable and try again."
+        )
+
+    return {
+        "vertical": vertical,
+        "vertical_label": vertical_label,
+        "summary": summary,
+        "items": items,
+    }
+
+
 def generate_proposal(rfp_text: str, vertical: str = "auto",
                       rate_sheet_data: dict = None,
                       user_templates: dict = None,
@@ -405,7 +503,8 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
                       equipment_data: list = None,
                       travel_data: list = None,
                       past_corrections: list = None,
-                      company_standards: list = None) -> dict:
+                      company_standards: list = None,
+                      approved_scope: list = None) -> dict:
     """Generate a proposal from the given RFP/RFQ text.
 
     Args:
@@ -500,6 +599,19 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
         for qa in answered_questions:
             qa_block += f"\nQ: {qa['question']}\nA: {qa['answer']}\n"
         user_message += qa_block
+
+    # Include the human-approved Scope of Work — this is authoritative
+    if approved_scope:
+        scope_block = (
+            "\n\n---APPROVED SCOPE OF WORK---\n"
+            "The proposal team has already reviewed and approved the following "
+            "Scope of Work. The proposal's Scope of Work section MUST cover exactly "
+            "these items — do not add or remove scope. If the RFP suggests scope "
+            "beyond this list, mention it only as an exclusion or option.\n"
+        )
+        for i, item in enumerate(approved_scope, 1):
+            scope_block += f"{i}. {item}\n"
+        user_message += scope_block
 
     client = _make_client(api_key)
 

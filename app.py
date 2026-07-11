@@ -62,6 +62,7 @@ from models import (
     Notification,
     Project,
     ProjectDocument,
+    ProjectScope,
     Proposal,
     ProposalApproval,
     ProposalComment,
@@ -75,6 +76,7 @@ from models import (
     ReviewCycle,
     RevisionRequest,
     RevisionTemplate,
+    ScopeItem,
     StaffRole,
     TravelExpenseRate,
     User,
@@ -85,6 +87,7 @@ from models import (
 )
 from proposal_agent import (
     analyze_addendum_impact,
+    draft_scope_of_work,
     friendly_api_error,
     generate_proposal,
     parse_customer_email,
@@ -720,14 +723,24 @@ def _project_focus_entry(p, now_naive):
         chip = ("Your move", "chip-gold")
         sub = f"{pending_questions} clarification question(s) awaiting answers"
     elif latest_prop is None:
+        scope = ProjectScope.query.filter_by(project_id=p.id).first()
         if doc_count == 0:
             action_label = "Upload documents"
             chip = ("Needs documents", "chip-neutral")
             sub = "No RFP/RFQ uploaded yet"
+        elif scope is None:
+            action_label = "Draft scope of work"
+            chip = ("Your move", "chip-gold")
+            sub = f"{doc_count} document(s) ready · scope not drafted yet"
+        elif scope.status == "draft":
+            action_label = "Approve scope"
+            action_url = url_for("project_scope", project_id=p.id)
+            chip = ("Your move", "chip-gold")
+            sub = "AI scope drafted · awaiting your approval"
         else:
             action_label = "Generate proposal"
             chip = ("Your move", "chip-gold")
-            sub = f"{doc_count} document(s) ready · awaiting AI draft"
+            sub = "Scope approved · awaiting AI draft"
     else:
         rs = latest_prop.review_status or "draft"
         pending_req = RevisionRequest.query.filter_by(
@@ -1093,6 +1106,16 @@ def dashboard():
 # Proposals list page
 # ---------------------------------------------------------------------------
 
+BOARD_COLUMNS = [
+    ("scoping", "Upload & Scope"),
+    ("drafting", "Drafting"),
+    ("review", "Internal Review"),
+    ("customer", "With Customer"),
+    ("won", "Won"),
+    ("lost", "Lost"),
+    ("storage", "Storage"),
+]
+
 PROPOSAL_FILTERS = [
     ("all", "All", ""),
     ("mine", "My Proposals", ""),
@@ -1156,6 +1179,23 @@ def _build_proposal_rows():
             status_label = p.status.title()
             status_class = f"badge-status-{p.status}"
 
+        # Board column (Kanban view)
+        rs = latest.review_status if latest else None
+        if p.status == "archived":
+            board_col = "storage"
+        elif p.status == "won" or rs in ("won", "customer_approved"):
+            board_col = "won"
+        elif p.status == "lost" or rs in ("lost", "customer_declined"):
+            board_col = "lost"
+        elif rs in ("submitted_to_customer", "customer_feedback"):
+            board_col = "customer"
+        elif rs in ("in_review", "revision_requested", "internally_approved"):
+            board_col = "review"
+        elif rs == "draft":
+            board_col = "drafting"
+        else:
+            board_col = "scoping"
+
         rows.append({
             "project": p,
             "proposal": latest,
@@ -1166,6 +1206,7 @@ def _build_proposal_rows():
             "health_class": health_class,
             "status_label": status_label,
             "status_class": status_class,
+            "board_col": board_col,
         })
     return rows
 
@@ -1250,6 +1291,7 @@ def proposals_list():
         counts=counts,
         active_filter=flt,
         filters=PROPOSAL_FILTERS,
+        board_columns=BOARD_COLUMNS,
         verticals=VERTICALS,
         proposal_users=proposal_users,
         close_category_labels=close_category_labels,
@@ -1954,7 +1996,12 @@ def project_upload(project_id):
         .order_by(Proposal.generated_at.desc())
         .first()
     )
-    phases = compute_phases(project, latest_prop, doc_count=len(documents))
+    scope = ProjectScope.query.filter_by(project_id=project_id).first()
+    scope_included = ScopeItem.query.filter_by(
+        scope_id=scope.id, status="included"
+    ).count() if scope else 0
+    phases = compute_phases(project, latest_prop, doc_count=len(documents),
+                            scope_status=scope.status if scope else None)
     pending_questions = ProposalQuestion.query.filter_by(
         project_id=project_id, status="pending"
     ).count()
@@ -1982,6 +2029,8 @@ def project_upload(project_id):
         open_clarifications=open_clarifications,
         proposal_users=proposal_users,
         lifecycle_labels=LIFECYCLE_LABELS,
+        scope=scope,
+        scope_included=scope_included,
     )
 
 
@@ -2141,6 +2190,18 @@ def project_generate(project_id):
             for s in standards
         ]
 
+    # Human-approved Scope of Work guides the draft when present
+    approved_scope_items = None
+    scope = ProjectScope.query.filter_by(project_id=project_id).first()
+    if scope and scope.status == "approved":
+        included = ScopeItem.query.filter_by(scope_id=scope.id, status="included").order_by(
+            ScopeItem.sort_order, ScopeItem.created_at
+        ).all()
+        if included:
+            approved_scope_items = [i.item_text for i in included]
+            if vertical == "auto" and scope.vertical:
+                vertical = scope.vertical
+
     try:
         result = generate_proposal(
             combined_text,
@@ -2156,6 +2217,7 @@ def project_generate(project_id):
             travel_data=travel_data,
             past_corrections=corrections_data,
             company_standards=company_standards_data,
+            approved_scope=approved_scope_items,
         )
 
         # Check if the agent has questions
@@ -2272,6 +2334,246 @@ def project_generate(project_id):
     except Exception as e:
         flash(f"Proposal generation failed: {friendly_api_error(e)}", "error")
         return redirect(url_for("project_upload", project_id=project_id))
+
+
+# ---------------------------------------------------------------------------
+# Scope of Work (human-approved before generation)
+# ---------------------------------------------------------------------------
+
+def _project_rfp_text(project_id: str) -> str:
+    """Combined text of the project's RFP/supporting documents."""
+    documents = ProjectDocument.query.filter_by(project_id=project_id).all()
+    rfp_docs = [d for d in documents if d.file_type in ("rfp", "supporting")]
+    combined = ""
+    for doc in rfp_docs:
+        try:
+            text = parse_document(doc.file_path)
+            combined += f"\n\n--- Document: {doc.original_filename} ---\n\n{text}"
+        except Exception:
+            continue
+    return combined.strip()
+
+
+@app.route("/projects/<project_id>/scope")
+@login_required
+def project_scope(project_id):
+    """Review the AI-proposed Scope of Work: accept, remove, or add items."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    scope = ProjectScope.query.filter_by(project_id=project_id).first()
+    if not scope:
+        flash("No scope drafted yet. Use 'Draft Scope with AI' on the project page.", "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    items = ScopeItem.query.filter_by(scope_id=scope.id).order_by(
+        ScopeItem.sort_order, ScopeItem.created_at
+    ).all()
+    included_count = sum(1 for i in items if i.status == "included")
+
+    latest_prop = (
+        Proposal.query.filter_by(project_id=project_id)
+        .order_by(Proposal.generated_at.desc())
+        .first()
+    )
+    phases = compute_phases(project, latest_prop, scope_status=scope.status)
+
+    return render_template(
+        "project_scope.html",
+        project=project,
+        scope=scope,
+        items=items,
+        included_count=included_count,
+        phases=phases,
+        latest_prop=latest_prop,
+    )
+
+
+@app.route("/projects/<project_id>/scope/generate", methods=["POST"])
+@login_required
+def generate_scope(project_id):
+    """AI-draft (or re-draft) the Scope of Work from the uploaded documents."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    combined_text = _project_rfp_text(project_id)
+    if not combined_text:
+        flash("Upload an RFP/RFQ document before drafting the scope of work.", "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    vertical = request.form.get("vertical", "auto")
+
+    try:
+        result = draft_scope_of_work(
+            combined_text,
+            vertical=vertical,
+            company_name=current_user.company_name,
+            user_api_key=current_user.api_key_encrypted or None,
+            user_model=current_user.llm_model or None,
+        )
+    except RuntimeError as e:
+        flash(str(e), "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+    except Exception as e:
+        flash(f"Scope drafting failed: {friendly_api_error(e)}", "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    # Replace any existing scope (regeneration starts fresh)
+    existing = ProjectScope.query.filter_by(project_id=project_id).first()
+    if existing:
+        ScopeItem.query.filter_by(scope_id=existing.id).delete()
+        db.session.delete(existing)
+        db.session.flush()
+
+    scope = ProjectScope(
+        project_id=project_id,
+        status="draft",
+        ai_summary=result["summary"],
+        vertical=result["vertical"],
+        vertical_label=result["vertical_label"],
+    )
+    db.session.add(scope)
+    db.session.flush()
+
+    for idx, entry in enumerate(result["items"]):
+        db.session.add(ScopeItem(
+            scope_id=scope.id,
+            project_id=project_id,
+            item_text=entry["item"],
+            category=entry["category"],
+            source="ai",
+            status="included",
+            sort_order=idx,
+        ))
+
+    project.vertical = result["vertical"]
+    project.vertical_label = result["vertical_label"]
+    db.session.commit()
+    _log_activity("scope_generate", f"AI drafted {len(result['items'])} scope item(s)", project_id)
+    flash(f"AI proposed {len(result['items'])} scope item(s). Review and approve below.", "success")
+    return redirect(url_for("project_scope", project_id=project_id))
+
+
+@app.route("/projects/<project_id>/scope/items/<item_id>/toggle", methods=["POST"])
+@login_required
+def toggle_scope_item(project_id, item_id):
+    """Include/remove a single scope item."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    item = db.session.get(ScopeItem, item_id)
+    if not item or item.project_id != project_id:
+        abort(404)
+
+    item.status = "removed" if item.status == "included" else "included"
+
+    # Any change to an approved scope re-opens it for approval
+    scope = db.session.get(ProjectScope, item.scope_id)
+    if scope and scope.status == "approved":
+        scope.status = "draft"
+        flash("Scope modified — re-approve it before generating.", "success")
+    db.session.commit()
+    return redirect(url_for("project_scope", project_id=project_id))
+
+
+@app.route("/projects/<project_id>/scope/add", methods=["POST"])
+@login_required
+def add_scope_item(project_id):
+    """Human adds a scope item the AI missed."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    scope = ProjectScope.query.filter_by(project_id=project_id).first()
+    if not scope:
+        abort(404)
+
+    text = request.form.get("item_text", "").strip()
+    if not text:
+        flash("Scope item text is required.", "error")
+        return redirect(url_for("project_scope", project_id=project_id))
+
+    category = request.form.get("category", "general").strip().lower()
+    if category not in ("engineering", "installation", "commissioning",
+                        "documentation", "management", "general"):
+        category = "general"
+
+    max_order = db.session.query(db.func.max(ScopeItem.sort_order)).filter_by(
+        scope_id=scope.id
+    ).scalar() or 0
+    db.session.add(ScopeItem(
+        scope_id=scope.id,
+        project_id=project_id,
+        item_text=text,
+        category=category,
+        source="human",
+        status="included",
+        sort_order=max_order + 1,
+    ))
+    if scope.status == "approved":
+        scope.status = "draft"
+    db.session.commit()
+    _log_activity("scope_item_add", f"Added scope item: {text[:80]}", project_id)
+    flash("Scope item added.", "success")
+    return redirect(url_for("project_scope", project_id=project_id))
+
+
+@app.route("/projects/<project_id>/scope/items/<item_id>/delete", methods=["POST"])
+@login_required
+def delete_scope_item(project_id, item_id):
+    """Delete a human-added scope item entirely (AI items are toggled instead)."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    item = db.session.get(ScopeItem, item_id)
+    if not item or item.project_id != project_id:
+        abort(404)
+    db.session.delete(item)
+    db.session.commit()
+    flash("Scope item deleted.", "success")
+    return redirect(url_for("project_scope", project_id=project_id))
+
+
+@app.route("/projects/<project_id>/scope/approve", methods=["POST"])
+@login_required
+def approve_scope(project_id):
+    """Human signs off on the scope; generation will honor it."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    scope = ProjectScope.query.filter_by(project_id=project_id).first()
+    if not scope:
+        abort(404)
+
+    included = ScopeItem.query.filter_by(scope_id=scope.id, status="included").count()
+    if included == 0:
+        flash("Approve at least one included scope item.", "error")
+        return redirect(url_for("project_scope", project_id=project_id))
+
+    scope.status = "approved"
+    scope.approved_at = datetime.now(timezone.utc)
+    scope.approved_by = current_user.id
+    db.session.commit()
+    _log_activity("scope_approve", f"Approved scope of work ({included} item(s))", project_id)
+    flash(f"Scope of work approved ({included} item(s)). The AI will draft against it.", "success")
+    return redirect(url_for("project_upload", project_id=project_id))
+
+
+@app.route("/projects/<project_id>/scope/reopen", methods=["POST"])
+@login_required
+def reopen_scope(project_id):
+    """Reopen an approved scope for edits."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    scope = ProjectScope.query.filter_by(project_id=project_id).first()
+    if not scope:
+        abort(404)
+    scope.status = "draft"
+    db.session.commit()
+    flash("Scope reopened for edits.", "success")
+    return redirect(url_for("project_scope", project_id=project_id))
 
 
 @app.route("/projects/<project_id>/questions", methods=["GET", "POST"])
@@ -5458,7 +5760,11 @@ def faq_page():
     faqs = [
         {
             "q": "How do I generate a proposal?",
-            "a": "Create a new project, upload your RFP/RFQ documents, select the industry vertical and cost estimation options, then click 'Generate Proposal'. The AI will analyze your documents and produce a draft proposal in seconds."
+            "a": "Create a new project (or drop an RFP on the dashboard), upload your RFP/RFQ documents, optionally draft and approve a Scope of Work, select the industry vertical and cost estimation options, then click 'Generate Proposal'. The AI will analyze your documents and produce a draft proposal in minutes."
+        },
+        {
+            "q": "What is the Scope of Work step?",
+            "a": "Before generating, you can have the AI read the RFP and propose a Scope of Work checklist. You accept or strike each item (and add your own), then approve. The generated proposal then covers exactly the approved scope — nothing more, nothing less."
         },
         {
             "q": "What file formats can I upload?",
@@ -5470,11 +5776,11 @@ def faq_page():
         },
         {
             "q": "What are Company Standards?",
-            "a": "Company Standards are boilerplate content blocks (mission statement, certifications, safety record, past performance, etc.) that the AI automatically weaves into every proposal. Configure them in Settings > Proposal Setup."
+            "a": "Company Standards are boilerplate content blocks (mission statement, certifications, safety record, past performance, etc.) that the AI automatically weaves into every proposal. Configure them in the Proposal Posture page (sidebar > Library > Proposal Posture)."
         },
         {
             "q": "How does cost estimation work?",
-            "a": "First, configure your staff sell rates, equipment price list, and travel rates in Settings > Proposal Setup. When generating a proposal, check the boxes for which cost estimates you want included. The AI will use your actual rates to build cost tables in the proposal."
+            "a": "First, configure your staff sell rates, equipment price list, and travel rates in the Proposal Posture page. When generating a proposal, check the boxes for which cost estimates you want included. The AI will use your actual rates to build cost tables in the proposal."
         },
         {
             "q": "Can I revert to a previous version of a proposal?",
@@ -5519,13 +5825,13 @@ def chat_help():
         ("generate", "proposal", "create"): "To generate a proposal: Create a new project, upload your RFP/RFQ documents, choose cost estimation options, and click 'Generate Proposal'. The AI will analyze your docs and produce a draft in seconds.",
         ("upload", "file", "document", "format"): "You can upload PDF, Word (.docx), text (.txt), Markdown (.md), and Excel (.xlsx) files. Use the project page to upload RFP documents, and Settings for rate sheets.",
         ("learn", "teach", "finalize", "correction"): "After editing a proposal, click 'Finalize & Teach AI' in the editor. The system captures your editing patterns and uses them to improve future proposals.",
-        ("rate", "pricing", "cost", "staff", "equipment", "travel"): "Configure your rates in Settings > Proposal Setup. Add staff hourly rates, equipment prices, and travel rates. The AI uses these when you check the cost estimation boxes during generation.",
+        ("rate", "pricing", "cost", "staff", "equipment", "travel"): "Configure your rates in the Proposal Posture page. Add staff hourly rates, equipment prices, and travel rates. The AI uses these when you check the cost estimation boxes during generation.",
         ("version", "history", "revert", "restore"): "Open the proposal editor to see Version History in the right sidebar. You can view any version and restore previous ones. Restoring creates a new version so nothing is ever lost.",
         ("redline", "tracked", "changes", "diff"): "Download Redline DOCX from the proposal view page. It shows AI-original vs your edits with red strikethrough (deletions) and blue underline (insertions).",
         ("api", "key", "provider", "model", "llm"): "Go to Settings > Profile & AI to configure your AI provider, model, and API key. Currently supports Anthropic Claude, OpenAI GPT, and Google Gemini.",
         ("vertical", "industry", "template"): "Verticals are industry-specific templates: Data Center, Life Science, Food & Beverage, and General. Choose during proposal generation or let the AI auto-detect from your RFP.",
         ("admin", "user", "manage"): "Admins can view company-wide metrics, manage user permissions, and track activity from the Admin panel in the sidebar.",
-        ("standard", "boilerplate", "mission", "certification"): "Company Standards are reusable content blocks. Go to Settings > Proposal Setup to add mission statements, certifications, past performance, etc. The AI includes these in every proposal.",
+        ("standard", "boilerplate", "mission", "certification"): "Company Standards are reusable content blocks. Go to the Proposal Posture page to add mission statements, certifications, past performance, etc. The AI includes these in every proposal.",
     }
 
     best_match = None

@@ -107,12 +107,47 @@
         </div>
         {% endif %}
 
-        {% block scope_section %}{% endblock %}
+        <!-- Scope of Work -->
+        {% if documents %}
+        <div class="card" id="scope-card">
+            <h2>Scope of Work</h2>
+            {% if not scope %}
+            <p class="card-desc">Let the AI read your RFP/RFQ and propose a Scope of Work checklist. You accept or strike items — and add your own — before the proposal is drafted, so the draft covers exactly what you intend to bid.</p>
+            <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+                <form method="post" action="{{ url_for('generate_scope', project_id=project.id) }}" class="inline-form" id="scope-gen-form">
+                    <input type="hidden" name="vertical" value="auto">
+                    <button type="submit" class="btn btn-primary" id="scope-gen-btn">&#10024; Draft Scope with AI</button>
+                </form>
+                <span class="form-hint">Optional — you can also generate the proposal directly below.</span>
+            </div>
+            <div class="processing-overlay" id="scope-processing" style="display:none;">
+                <div class="spinner"></div>
+                <p class="processing-text">Analyzing documents and drafting the scope&hellip;</p>
+                <p class="processing-subtext">Usually under a minute.</p>
+            </div>
+            {% elif scope.status == 'draft' %}
+            <div class="posture-callout" style="margin-bottom:12px;">
+                <span>&#128269;</span>
+                <div><strong>AI scope drafted — awaiting your review.</strong> {{ scope_included }} item(s) currently included. Accept, strike, or add items, then approve.</div>
+            </div>
+            <a href="{{ url_for('project_scope', project_id=project.id) }}" class="btn btn-primary">Review &amp; Approve Scope &rarr;</a>
+            {% else %}
+            <div class="scope-approved-banner" style="margin-bottom:10px;">
+                <span>&#10003;</span>
+                <span>Scope approved — {{ scope_included }} item(s). The AI draft below will follow it exactly.</span>
+                <a href="{{ url_for('project_scope', project_id=project.id) }}" class="btn btn-small btn-secondary" style="margin-left:auto;">View scope</a>
+            </div>
+            {% endif %}
+        </div>
+        {% endif %}
 
         <!-- Generate Proposal -->
         {% if documents %}
         <div class="card card-highlight">
             <h2>Draft Proposal with AI</h2>
+            {% if scope and scope.status == 'approved' %}
+            <p class="card-desc">Using your approved Scope of Work ({{ scope_included }} item(s)).</p>
+            {% endif %}
             <form method="post" action="{{ url_for('project_generate', project_id=project.id) }}" id="generate-form">
 
                 <div class="form-group">
@@ -358,6 +393,16 @@
         form.addEventListener("submit", function(){
             genBtn.disabled=true;genBtn.textContent="Processing…";
             proc.style.display="flex";
+        });
+    }
+
+    var scopeForm = document.getElementById("scope-gen-form");
+    var scopeProc = document.getElementById("scope-processing");
+    var scopeBtn = document.getElementById("scope-gen-btn");
+    if(scopeForm && scopeProc){
+        scopeForm.addEventListener("submit", function(){
+            scopeBtn.disabled=true;scopeBtn.textContent="Drafting scope…";
+            scopeProc.style.display="flex";
         });
     }
 })();

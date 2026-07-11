@@ -1,0 +1,159 @@
+{% extends "base.html" %}
+
+{% block title %}Scope of Work &mdash; {{ project.name }} &mdash; {{ app_name }}{% endblock %}
+
+{% block breadcrumb %}
+<a href="{{ url_for('dashboard') }}">Workspace</a>
+<span class="crumb-sep">&rsaquo;</span>
+<a href="{{ url_for('proposals_list') }}">Proposals</a>
+<span class="crumb-sep">&rsaquo;</span>
+<a href="{{ url_for('project_upload', project_id=project.id) }}">{{ project.name | truncate(28) }}</a>
+<span class="crumb-sep">&rsaquo;</span>
+<span class="crumb-current">Scope of Work</span>
+{% endblock %}
+
+{% block content %}
+<section class="page-header" style="padding-bottom: 12px;">
+    <div class="page-header-row">
+        <div>
+            <h1>Scope of Work</h1>
+            <p class="page-subtitle">
+                {{ project.name }} &middot; {{ scope.vertical_label }}
+                &middot; AI drafted {{ scope.generated_at.strftime('%b %d, %Y %H:%M') }}
+            </p>
+        </div>
+        <div class="header-actions">
+            <form method="post" action="{{ url_for('generate_scope', project_id=project.id) }}" class="inline-form"
+                  onsubmit="return confirm('Re-draft the scope with AI? Your current items (including edits) will be replaced.');">
+                <input type="hidden" name="vertical" value="auto">
+                <button type="submit" class="btn btn-secondary">&#10227; Re-draft with AI</button>
+            </form>
+            <a href="{{ url_for('project_upload', project_id=project.id) }}" class="btn btn-secondary">Back to Project</a>
+        </div>
+    </div>
+</section>
+
+{% include "_stepper.html" %}
+
+{% if scope.status == 'approved' %}
+<div class="scope-approved-banner">
+    <span>&#10003;</span>
+    <span>Scope approved{% if scope.approved_at %} on {{ scope.approved_at.strftime('%b %d, %Y %H:%M') }}{% endif %}
+        — the AI will draft the proposal against exactly these {{ included_count }} item(s).</span>
+    <form method="post" action="{{ url_for('reopen_scope', project_id=project.id) }}" class="inline-form" style="margin-left:auto;">
+        <button type="submit" class="btn btn-small btn-secondary">Reopen for edits</button>
+    </form>
+</div>
+{% else %}
+<div class="posture-callout">
+    <span>&#128269;</span>
+    <div>
+        <strong>Review the AI's proposed scope.</strong> Uncheck anything that should NOT be in the proposal,
+        add anything the AI missed, then approve. The proposal draft will cover exactly the checked items.
+    </div>
+</div>
+{% endif %}
+
+{% if scope.ai_summary %}
+<div class="card">
+    <h2>AI Summary</h2>
+    <p style="font-size: 14px; color: var(--ink-700); line-height: 1.7;">{{ scope.ai_summary }}</p>
+</div>
+{% endif %}
+
+<div class="workspace-grid">
+    <div class="workspace-main">
+        <div class="card">
+            <h2>Proposed Scope Items <span class="pill">{{ included_count }} of {{ items | length }} included</span></h2>
+            <ul class="scope-list" style="margin-top: 12px;">
+                {% for item in items %}
+                <li class="scope-item{% if item.status == 'removed' %} scope-removed{% endif %}{% if item.source == 'human' %} scope-added{% endif %}">
+                    <form method="post" action="{{ url_for('toggle_scope_item', project_id=project.id, item_id=item.id) }}" class="scope-item-toggle">
+                        <input type="checkbox" {{ 'checked' if item.status == 'included' }}
+                               onchange="this.form.submit()"
+                               title="{{ 'Remove from scope' if item.status == 'included' else 'Include in scope' }}">
+                    </form>
+                    <div class="scope-item-main">
+                        <div class="scope-item-text">{{ item.item_text }}</div>
+                        <div class="scope-item-meta">
+                            <span class="badge badge-vertical">{{ item.category | title }}</span>
+                            {% if item.source == 'human' %}
+                            <span class="chip chip-sea">Added by team</span>
+                            {% else %}
+                            <span class="chip chip-neutral">AI proposed</span>
+                            {% endif %}
+                            {% if item.status == 'removed' %}
+                            <span class="chip chip-red">Removed from scope</span>
+                            {% endif %}
+                        </div>
+                    </div>
+                    {% if item.source == 'human' %}
+                    <form method="post" action="{{ url_for('delete_scope_item', project_id=project.id, item_id=item.id) }}" class="inline-form" onsubmit="return confirm('Delete this scope item?');">
+                        <button type="submit" class="btn btn-small btn-danger">Delete</button>
+                    </form>
+                    {% endif %}
+                </li>
+                {% endfor %}
+            </ul>
+        </div>
+
+        <div class="card">
+            <h2>Add a Scope Item</h2>
+            <p class="card-desc">Something the AI missed? Add it — it will be marked as team-added.</p>
+            <form method="post" action="{{ url_for('add_scope_item', project_id=project.id) }}">
+                <div class="form-group">
+                    <label>Scope item *</label>
+                    <textarea name="item_text" rows="2" required placeholder="e.g., Provide as-built drawings within 30 days of substantial completion"></textarea>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Category</label>
+                        <select name="category">
+                            <option value="engineering">Engineering</option>
+                            <option value="installation">Installation</option>
+                            <option value="commissioning">Commissioning</option>
+                            <option value="documentation">Documentation</option>
+                            <option value="management">Management</option>
+                            <option value="general" selected>General</option>
+                        </select>
+                    </div>
+                </div>
+                <button type="submit" class="btn btn-secondary">Add Item</button>
+            </form>
+        </div>
+    </div>
+
+    <aside class="rail">
+        <div class="rail-card">
+            <h3>{{ 'Scope Approved' if scope.status == 'approved' else 'Approve This Scope' }}</h3>
+            <p style="font-size: 13px; color: var(--ink-500); margin-bottom: 12px;">
+                {% if scope.status == 'approved' %}
+                Next: generate the proposal from the project page. The draft will follow this scope exactly.
+                {% else %}
+                <strong>{{ included_count }}</strong> item(s) will define the proposal's Scope of Work.
+                Removed items stay visible here for the record.
+                {% endif %}
+            </p>
+            <div class="rail-actions">
+                {% if scope.status != 'approved' %}
+                <form method="post" action="{{ url_for('approve_scope', project_id=project.id) }}" class="inline-form">
+                    <button type="submit" class="btn btn-primary">&#10003; Approve Scope ({{ included_count }})</button>
+                </form>
+                {% else %}
+                <a href="{{ url_for('project_upload', project_id=project.id) }}" class="btn btn-primary">Continue to Generate &rarr;</a>
+                {% endif %}
+            </div>
+        </div>
+
+        <div class="rail-card">
+            <h3>How This Works</h3>
+            <ul class="timeline">
+                <li><span class="tl-title">1. AI proposes scope</span><div class="tl-meta">Extracted from your RFP/RFQ documents</div></li>
+                <li><span class="tl-title">2. You accept or strike items</span><div class="tl-meta">Uncheck to remove; add what's missing</div></li>
+                <li><span class="tl-title">3. Approve</span><div class="tl-meta">Locks the scope for this draft</div></li>
+                <li><span class="tl-title">4. Generate</span><div class="tl-meta">The proposal covers exactly the approved items</div></li>
+            </ul>
+        </div>
+    </aside>
+</div>
+{% endblock %}

@@ -148,6 +148,43 @@ class Proposal(db.Model):
     review_deadline = db.Column(db.DateTime, nullable=True)
 
 
+class ProjectScope(db.Model):
+    """AI-drafted Scope of Work for a project, reviewed and approved by a human
+    before proposal generation. One scope per project (regenerating replaces it)."""
+    __tablename__ = "project_scopes"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    project_id = db.Column(db.String(32), db.ForeignKey("projects.id"), unique=True, nullable=False)
+    status = db.Column(db.String(20), default="draft")  # draft, approved
+    ai_summary = db.Column(db.Text, default="")
+    vertical = db.Column(db.String(50), default="general")
+    vertical_label = db.Column(db.String(100), default="General")
+    generated_at = db.Column(db.DateTime, default=_utcnow)
+    approved_at = db.Column(db.DateTime, nullable=True)
+    approved_by = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+
+    project = db.relationship("Project", backref=db.backref("scope", uselist=False))
+    approver = db.relationship("User")
+
+
+class ScopeItem(db.Model):
+    """A single line item in the Scope of Work. AI-proposed items can be
+    included or removed by the human reviewer; humans can add their own."""
+    __tablename__ = "scope_items"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    scope_id = db.Column(db.String(32), db.ForeignKey("project_scopes.id"), nullable=False)
+    project_id = db.Column(db.String(32), db.ForeignKey("projects.id"), nullable=False)
+    item_text = db.Column(db.Text, nullable=False)
+    category = db.Column(db.String(50), default="general")  # engineering, installation, commissioning, documentation, management, general
+    source = db.Column(db.String(10), default="ai")  # ai, human
+    status = db.Column(db.String(20), default="included")  # included, removed
+    sort_order = db.Column(db.Integer, default=0)
+    created_at = db.Column(db.DateTime, default=_utcnow)
+
+    scope = db.relationship("ProjectScope", backref=db.backref("items", lazy="dynamic", cascade="all, delete-orphan"))
+
+
 class ProposalQuestion(db.Model):
     """Questions the AI asks the user during proposal generation."""
     __tablename__ = "proposal_questions"

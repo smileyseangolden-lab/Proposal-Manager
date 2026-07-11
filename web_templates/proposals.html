@@ -42,6 +42,12 @@
     {% endfor %}
 </div>
 
+<!-- View toggle -->
+<div class="view-toggle">
+    <a href="{{ url_for('proposals_list', filter=active_filter, q=q, status=f_status, vertical=f_vertical, sort=sort, dir=direction, view='table') }}" class="{{ 'active' if view != 'board' }}">&#8862; Table</a>
+    <a href="{{ url_for('proposals_list', filter=active_filter, q=q, status=f_status, vertical=f_vertical, sort=sort, dir=direction, view='board') }}" class="{{ 'active' if view == 'board' }}">&#9638; Board</a>
+</div>
+
 <!-- Filter bar -->
 <div class="filter-card">
     <form method="get" action="{{ url_for('proposals_list') }}" class="filter-row">
@@ -67,6 +73,40 @@
     </form>
 </div>
 
+{% if view == 'board' %}
+{% if rows %}
+<div class="board">
+    {% for col_key, col_label in board_columns %}
+    {% set col_rows = rows | selectattr('board_col', 'equalto', col_key) | list %}
+    <div class="board-col">
+        <div class="board-col-head">
+            <span>{{ col_label }}</span>
+            <span class="board-col-count">{{ col_rows | length }}</span>
+        </div>
+        {% for r in col_rows %}
+        {% set p = r.project %}
+        <a class="board-card" href="{% if r.proposal %}{{ url_for('view_proposal', proposal_id=r.proposal.id) }}{% else %}{{ url_for('project_upload', project_id=p.id) }}{% endif %}">
+            <div class="board-card-title">{{ p.name }}</div>
+            <div class="board-card-meta">
+                {% if p.client_name %}<span>{{ p.client_name }}</span>{% endif %}
+                {% if p.dollar_amount %}<span>${{ "{:,.0f}".format(p.dollar_amount) }}</span>{% endif %}
+            </div>
+            <div class="board-card-meta">
+                <span class="badge {{ r.status_class }}">{{ r.status_label }}</span>
+                {% if r.overdue %}<span class="chip chip-red">Overdue</span>{% endif %}
+                {% if r.health is not none %}<span class="health-dot {{ r.health_class }}">{{ r.health }}%</span>{% endif %}
+            </div>
+        </a>
+        {% endfor %}
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">
+    <p>No proposals match this view. <a href="{{ url_for('new_project') }}">Start a new proposal</a> or <a href="{{ url_for('proposals_list', view='board') }}">clear filters</a>.</p>
+</div>
+{% endif %}
+{% else %}
 {% if rows %}
 <table class="proposals-table">
     <thead>
@@ -155,6 +195,7 @@
 <div class="empty-state">
     <p>No proposals match this view. <a href="{{ url_for('new_project') }}">Start a new proposal</a> or <a href="{{ url_for('proposals_list') }}">clear filters</a>.</p>
 </div>
+{% endif %}
 {% endif %}
 
 <!-- Close Details Modal -->
