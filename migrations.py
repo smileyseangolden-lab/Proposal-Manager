@@ -72,6 +72,8 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # Hardening: cross-worker login throttling
     ("users", "failed_login_count", "INTEGER DEFAULT 0"),
     ("users", "lockout_until", "TIMESTAMP"),
+    # Platform-admin dashboard
+    ("users", "platform_owner", "BOOLEAN DEFAULT FALSE"),
 ]
 
 # Indexes on hot filter / foreign-key columns. CREATE INDEX IF NOT EXISTS is

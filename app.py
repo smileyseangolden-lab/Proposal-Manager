@@ -393,6 +393,11 @@ with app.app_context():
     except Exception:
         app.logger.warning("Startup job reap failed", exc_info=True)
 
+# Platform-Admin owner dashboard (cross-tenant, owner-gated) — a separate area
+# from the tenant app, mounted at /platform-admin.
+from platform_admin import bp as platform_admin_bp
+app.register_blueprint(platform_admin_bp)
+
 
 # ---------------------------------------------------------------------------
 # Helpers

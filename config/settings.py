@@ -80,6 +80,14 @@ SELF_HOSTED = os.getenv("SELF_HOSTED", "false").lower() == "true"
 # could spoof X-Forwarded-For).
 TRUST_PROXY_HOPS = int(os.getenv("TRUST_PROXY_HOPS", "0"))
 
+# Platform-owner allowlist for the cross-tenant /platform-admin dashboard.
+# Comma-separated emails. This is the bootstrap path (no owner exists in the DB
+# at first deploy) and a break-glass backstop; the User.platform_owner column is
+# the durable grant. Either one grants access.
+PLATFORM_OWNER_EMAILS = {
+    e.strip().lower() for e in os.getenv("PLATFORM_OWNER_EMAILS", "").split(",") if e.strip()
+}
+
 # Secrets known to be insecure defaults — refused in production.
 INSECURE_SECRETS = {
     "",

@@ -1,0 +1,70 @@
+{% extends "platform/base.html" %}
+{% block body %}
+<h1 class="page">Overview</h1>
+<p class="page-sub">Cross-tenant snapshot of the entire platform.</p>
+
+<div class="grid kpis">
+  <div class="card kpi">
+    <div class="label">Organizations 🏢</div>
+    <div class="num c-blue">{{ stats.organizations }}</div>
+    <div class="foot">tenant workspaces</div>
+  </div>
+  <div class="card kpi">
+    <div class="label">Total Users 👥</div>
+    <div class="num c-purple">{{ stats.users }}</div>
+    <div class="foot">across all orgs</div>
+  </div>
+  <div class="card kpi">
+    <div class="label">Proposals 📄</div>
+    <div class="num c-green">{{ stats.proposals }}</div>
+    <div class="foot">{{ stats.projects }} projects</div>
+  </div>
+  <div class="card kpi">
+    <div class="label">AI Reviews ⚡</div>
+    <div class="num c-pink">{{ stats.ai_reviews }}</div>
+    <div class="foot">completed generations</div>
+  </div>
+  <div class="card kpi">
+    <div class="label">Paid Subscribers 💳</div>
+    <div class="num c-amber">{{ stats.paid_subscribers }}</div>
+    <div class="foot">active paid plans</div>
+  </div>
+</div>
+
+<div class="grid two-col" style="margin-top:15px">
+  <div class="card">
+    <div class="label" style="color:var(--ink-2);font-weight:600">Monthly Recurring Revenue</div>
+    <div class="num c-amber" style="font-size:2.6rem;font-weight:800">${{ '{:,.0f}'.format(mrr) }}</div>
+    <div class="foot">ARR: ${{ '{:,.0f}'.format(arr) }}</div>
+  </div>
+  <div class="card">
+    <div class="label" style="color:var(--ink-2);font-weight:600;margin-bottom:12px">Plan Distribution</div>
+    {% for key, plan in plans.items() %}
+    {% set n = dist.get(key, 0) %}
+    {% set total = (dist.values()|sum) or 1 %}
+    <div style="display:flex;align-items:center;gap:10px;margin:9px 0">
+      <span class="pill {{ key }}" style="min-width:74px;text-align:center">{{ plan.name }}</span>
+      <div class="bar" style="flex:1"><span style="width:{{ (n/total*100)|round(0,'floor') }}%"></span></div>
+      <span class="muted" style="min-width:24px;text-align:right;font-variant-numeric:tabular-nums">{{ n }}</span>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+
+<div class="section-title">LLM Usage (last 30 days)</div>
+<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(170px,1fr))">
+  <div class="card kpi"><div class="label">LLM Requests</div><div class="num c-cyan">{{ '{:,}'.format(llm_requests) }}</div></div>
+  <div class="card kpi"><div class="label">Tokens</div><div class="num c-cyan">{{ '{:,}'.format(llm_tokens) }}</div></div>
+  <div class="card kpi"><div class="label">Est. LLM Cost</div><div class="num c-amber">${{ '{:,.2f}'.format(llm_cost) }}</div></div>
+</div>
+
+<div class="section-title">Operational</div>
+<div class="grid ops">
+  <div class="card"><div class="num c-blue">{{ ops.envelopes }}</div><div class="label">Shares</div></div>
+  <div class="card"><div class="num c-green">{{ ops.signed }}</div><div class="label">Accepted</div></div>
+  <div class="card"><div class="num c-amber">{{ ops.pending_sig }}</div><div class="label">Pending</div></div>
+  <div class="card"><div class="num c-purple">{{ ops.clauses }}</div><div class="label">Std. Clauses</div></div>
+  <div class="card"><div class="num c-cyan">{{ ops.templates }}</div><div class="label">Templates</div></div>
+  <div class="card"><div class="num c-pink">{{ ops.obligations }}</div><div class="label">Clarifications</div></div>
+</div>
+{% endblock %}

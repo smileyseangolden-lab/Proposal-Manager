@@ -1,0 +1,43 @@
+{% extends "platform/base.html" %}
+{% block body %}
+<h1 class="page">AI Costs</h1>
+<p class="page-sub">LLM token usage and estimated spend across all tenants (last 30 days).</p>
+
+{% if not has_data %}
+<div class="card empty">
+  No LLM usage recorded in the last 30 days yet.<br>
+  <span class="muted">Usage is metered automatically on each generation and appears here.</span>
+</div>
+{% else %}
+<div class="grid kpis">
+  <div class="card kpi"><div class="label">Requests</div><div class="num c-cyan">{{ '{:,}'.format(requests) }}</div></div>
+  <div class="card kpi"><div class="label">Input Tokens</div><div class="num c-blue">{{ '{:,}'.format(input_tokens) }}</div></div>
+  <div class="card kpi"><div class="label">Output Tokens</div><div class="num c-purple">{{ '{:,}'.format(output_tokens) }}</div></div>
+  <div class="card kpi"><div class="label">Est. Cost</div><div class="num c-amber">${{ '{:,.2f}'.format(cost) }}</div></div>
+</div>
+
+<div class="section-title">By model</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Est. Cost</th></tr></thead>
+    <tbody>
+      {% for m in by_model %}
+      <tr><td class="muted" style="font-family:var(--mono);font-size:.82rem">{{ m.model }}</td><td class="num">{{ m.count }}</td><td class="num">${{ '{:,.2f}'.format(m.cost) }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="section-title">Top orgs by spend</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Organization</th><th class="num">Tokens</th><th class="num">Est. Cost</th></tr></thead>
+    <tbody>
+      {% for o in by_org %}
+      <tr><td>{{ o.name }}</td><td class="num">{{ '{:,}'.format(o.tokens) }}</td><td class="num">${{ '{:,.2f}'.format(o.cost) }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}

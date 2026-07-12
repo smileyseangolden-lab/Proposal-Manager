@@ -1,0 +1,35 @@
+{% extends "platform/base.html" %}
+{% block body %}
+<h1 class="page">Revenue</h1>
+<p class="page-sub">Computed from the plan catalog for orgs in good standing. Stripe is the source-of-truth upgrade path.</p>
+
+<div class="grid two-col">
+  <div class="card">
+    <div class="label" style="color:var(--ink-2);font-weight:600">Monthly Recurring Revenue</div>
+    <div class="num c-amber" style="font-size:2.8rem">${{ '{:,.0f}'.format(mrr) }}</div>
+  </div>
+  <div class="card">
+    <div class="label" style="color:var(--ink-2);font-weight:600">Annual Run Rate</div>
+    <div class="num c-green" style="font-size:2.8rem">${{ '{:,.0f}'.format(arr) }}</div>
+  </div>
+</div>
+
+<div class="section-title">By plan</div>
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr><th>Plan</th><th class="num">Price / mo</th><th class="num">Subscribers</th><th class="num">MRR</th></tr>
+    </thead>
+    <tbody>
+      {% for b in breakdown %}
+      <tr>
+        <td><span class="pill {{ b.key }}">{{ b.name }}</span></td>
+        <td class="num">${{ b.price }}</td>
+        <td class="num">{{ b.count }}</td>
+        <td class="num">${{ '{:,.0f}'.format(b.mrr) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

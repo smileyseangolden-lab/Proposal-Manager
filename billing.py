@@ -192,6 +192,31 @@ def tokens_this_month(org_id) -> int:
     return int(total or 0)
 
 
+def platform_mrr() -> float:
+    """Monthly recurring revenue across all tenants, computed from the plan
+    catalog: sum of monthly_price over orgs on a paid plan in good standing.
+    (Stripe is the source-of-truth upgrade path; this is the pragmatic v1.)"""
+    from models import Organization
+    total = 0.0
+    orgs = Organization.query.filter(
+        Organization.plan.isnot(None), Organization.plan != "free"
+    ).all()
+    for org in orgs:
+        if (org.billing_status or "") in _DELINQUENT_STATUSES:
+            continue
+        total += PLANS.get(org.plan, PLANS["free"]).get("monthly_price", 0)
+    return round(total, 2)
+
+
+def plan_distribution() -> dict:
+    """Count of orgs per plan key, e.g. {'free': 3, 'pro': 1}."""
+    from sqlalchemy import func
+
+    from models import Organization, db
+    rows = db.session.query(Organization.plan, func.count()).group_by(Organization.plan).all()
+    return {(p or "free"): n for p, n in rows}
+
+
 def check_ai_budget(org_id) -> tuple[bool, str]:
     """Return (allowed, message). Enforces the monthly AI token budget so a
     single org can't run up unbounded pay-per-use LLM cost."""

@@ -116,6 +116,10 @@ class User(UserMixin, db.Model):
     email_verified = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=_utcnow)
 
+    # Platform ownership — the SaaS operator, NOT a tenant admin. Grants access
+    # to the cross-tenant /platform-admin dashboard. Default False for everyone.
+    platform_owner = db.Column(db.Boolean, default=False, nullable=False)
+
     # Login throttling — cross-worker, per-account (complements the in-process
     # per-IP limiter, which doesn't survive multiple gunicorn workers).
     failed_login_count = db.Column(db.Integer, default=0)
