@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>{% block title %}{{ app_name }}{% endblock %}</title>
     <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='img/pm-logo-mark.svg') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
@@ -77,6 +78,10 @@
                 <span class="sidebar-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>
                 <span>People &amp; Roles</span>
             </a>
+            <a href="{{ url_for('billing_page') }}" class="sidebar-link sidebar-admin{% if request.endpoint == 'billing_page' %} active{% endif %}">
+                <span class="sidebar-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="4" width="22" height="16" rx="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg></span>
+                <span>Billing &amp; Plans</span>
+            </a>
             {% endif %}
         </nav>
         <div class="sidebar-footer">
@@ -134,6 +139,15 @@
             </div>
         </header>
         <main class="main-content">
+            {% if current_user.is_authenticated and not current_user.email_verified %}
+            <div class="flash flash-info verify-banner">
+                Please verify your email address ({{ current_user.email }}).
+                <form method="post" action="{{ url_for('resend_verification') }}" class="inline-form" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="link-button">Resend verification email</button>
+                </form>
+            </div>
+            {% endif %}
             {% with messages = get_flashed_messages(with_categories=true) %}
             {% if messages %}
             <div class="flash-messages">
@@ -187,6 +201,30 @@
     {% block scripts %}{% endblock %}
     {% if current_user.is_authenticated %}
     <script>
+    (function(){
+        // CSRF: inject token into every same-origin POST form and fetch call
+        var csrfToken = (document.querySelector('meta[name="csrf-token"]') || {}).content || "";
+        function ensureFormToken(form){
+            if (!form || (form.method || "").toLowerCase() !== "post") return;
+            if (form.querySelector('input[name="csrf_token"]')) return;
+            var input = document.createElement("input");
+            input.type = "hidden"; input.name = "csrf_token"; input.value = csrfToken;
+            form.appendChild(input);
+        }
+        document.querySelectorAll("form").forEach(ensureFormToken);
+        document.addEventListener("submit", function(e){ ensureFormToken(e.target); }, true);
+        // Patch fetch to attach the CSRF header for same-origin mutating requests
+        var _fetch = window.fetch;
+        window.fetch = function(input, init){
+            init = init || {};
+            var method = (init.method || (typeof input === "object" && input.method) || "GET").toUpperCase();
+            if (["POST","PUT","PATCH","DELETE"].indexOf(method) !== -1){
+                init.headers = new Headers(init.headers || {});
+                if (!init.headers.has("X-CSRFToken")) init.headers.set("X-CSRFToken", csrfToken);
+            }
+            return _fetch(input, init);
+        };
+    })();
     (function(){
         // Sidebar toggle
         var toggle = document.getElementById("sidebar-toggle");

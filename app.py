@@ -12,9 +12,12 @@ Full-featured intranet application with:
 """
 
 import difflib
+import hmac
 import json
 import os
 import re
+import secrets
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +31,7 @@ from flask import (
     render_template,
     request,
     send_file,
+    session,
     url_for,
 )
 from flask_login import (
@@ -46,20 +50,29 @@ from config.settings import (
     APP_FOOTER,
     APP_NAME,
     APP_SHORT_NAME,
+    DATABASE_URL,
     FLASK_SECRET_KEY,
     GENERATED_DIR,
     MAX_UPLOAD_SIZE_MB,
     UPLOADS_DIR,
     VERTICALS,
 )
+import billing
+import crypto_util
+import jobs
+import storage
 from document_parser import parse_document
 from models import (
     ActivityLog,
+    BackgroundJob,
     ClarificationItem,
     CompanyStandard,
     DocumentTag,
     EquipmentItem,
+    EstimateLineItem,
     Notification,
+    Organization,
+    OrgInvitation,
     Project,
     ProjectDocument,
     ProjectScope,
@@ -67,9 +80,11 @@ from models import (
     ProposalApproval,
     ProposalComment,
     ProposalCorrection,
+    ProposalEstimate,
     ProposalQuestion,
     ProposalReviewer,
     ProposalRevisionBatch,
+    ProposalShare,
     ProposalStatusHistory,
     ProposalVersion,
     ReviewComment,
@@ -77,17 +92,22 @@ from models import (
     RevisionRequest,
     RevisionTemplate,
     ScopeItem,
+    ShareView,
     StaffRole,
     TravelExpenseRate,
     User,
     UserRateSheet,
+    UserToken,
     UserVerticalTemplate,
     VerticalClarificationTemplate,
     db,
 )
 from proposal_agent import (
     analyze_addendum_impact,
+    draft_estimate,
     draft_scope_of_work,
+    extract_rates_from_sheet,
+    extract_standards,
     friendly_api_error,
     generate_proposal,
     parse_customer_email,
@@ -97,6 +117,7 @@ from proposal_agent import (
 )
 from proposal_export import (
     markdown_to_docx,
+    markdown_to_pdf,
     markdown_to_redline_docx,
     markdown_to_rfi_docx,
 )
@@ -119,8 +140,17 @@ from rate_sheet_parser import parse_rate_sheet
 app = Flask(__name__, template_folder="web_templates", static_folder="static")
 app.secret_key = FLASK_SECRET_KEY
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_SIZE_MB * 1024 * 1024
-app.config["SQLALCHEMY_DATABASE_URI"] = f"sqlite:///{Path(__file__).resolve().parent / 'data' / 'proposal_manager.db'}"
+app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+if DATABASE_URL.startswith("postgresql"):
+    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"pool_pre_ping": True, "pool_recycle": 280}
+
+# Secure session cookies. SESSION_COOKIE_SECURE defaults on unless explicitly
+# disabled (set to false for plain-HTTP intranet deployments).
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", "true").lower() == "true"
+app.config["PERMANENT_SESSION_LIFETIME"] = 60 * 60 * 24 * 14  # 14 days
 
 # Ensure data directory exists
 (Path(__file__).resolve().parent / "data").mkdir(exist_ok=True)
@@ -156,118 +186,82 @@ def load_user(user_id):
     return db.session.get(User, user_id)
 
 
+# ---------------------------------------------------------------------------
+# CSRF protection (session double-submit token)
+# ---------------------------------------------------------------------------
+
+# Endpoints exempt from CSRF: external webhooks (signed separately) and any
+# read-only JSON polled by same-origin fetch (which sends the header anyway).
+_CSRF_EXEMPT_ENDPOINTS = {"billing_webhook"}
+
+
+def _csrf_token() -> str:
+    token = session.get("_csrf_token")
+    if not token:
+        token = secrets.token_hex(32)
+        session["_csrf_token"] = token
+    return token
+
+
+@app.context_processor
+def inject_csrf():
+    return dict(csrf_token=_csrf_token)
+
+
+@app.before_request
+def _csrf_protect():
+    if app.testing:
+        return
+    if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return
+    if request.endpoint in _CSRF_EXEMPT_ENDPOINTS:
+        return
+    sent = request.form.get("csrf_token") or request.headers.get("X-CSRFToken", "")
+    expected = session.get("_csrf_token", "")
+    if not expected or not hmac.compare_digest(str(sent), str(expected)):
+        abort(400, description="Invalid or missing CSRF token. Please reload and try again.")
+
+
+# ---------------------------------------------------------------------------
+# Login rate limiting (in-process sliding window per IP+username)
+# ---------------------------------------------------------------------------
+
+_LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+_LOGIN_MAX_ATTEMPTS = 8
+_LOGIN_WINDOW_SECONDS = 300
+
+
+def _login_rate_limited(key: str) -> bool:
+    now = time.time()
+    attempts = [t for t in _LOGIN_ATTEMPTS.get(key, []) if now - t < _LOGIN_WINDOW_SECONDS]
+    _LOGIN_ATTEMPTS[key] = attempts
+    return len(attempts) >= _LOGIN_MAX_ATTEMPTS
+
+
+def _record_login_attempt(key: str):
+    _LOGIN_ATTEMPTS.setdefault(key, []).append(time.time())
+
+
 with app.app_context():
     # Cross-worker schema bootstrap lock. Under gunicorn, every worker imports
-    # this module and runs db.create_all() + migrations. Without a lock, two
-    # workers race to CREATE TABLE for a brand-new table and the loser crashes
-    # with "table already exists". A simple file lock (fcntl.flock) serializes
-    # the bootstrap so only one worker at a time touches the schema.
+    # this module and runs migrations. A file lock serializes the bootstrap so
+    # only one worker per host touches the schema at a time; ensure_schema()
+    # itself also tolerates already-exists races (relevant for Postgres where
+    # workers may run on different hosts).
     import fcntl as _fcntl
+    from migrations import ensure_schema
     _data_dir = Path(__file__).resolve().parent / "data"
     _data_dir.mkdir(exist_ok=True)
     _lock_path = _data_dir / ".schema.lock"
     with open(_lock_path, "w") as _lock_fh:
         _fcntl.flock(_lock_fh, _fcntl.LOCK_EX)
         try:
-            # Tolerate the race even if the lock somehow fails: if another
-            # worker already created a table between our check and create,
-            # swallow the "already exists" error. All other DDL errors
-            # still propagate.
-            try:
-                db.create_all()
-            except Exception as _e:
-                if "already exists" not in str(_e):
-                    raise
-
-            # Migrate existing project_documents table to add new columns if missing
-            import sqlite3 as _sqlite3
-            _db_path = str(_data_dir / "proposal_manager.db")
-            _conn = _sqlite3.connect(_db_path)
-            _cur = _conn.cursor()
-            _cur.execute("PRAGMA table_info(project_documents)")
-            _existing_cols = {row[1] for row in _cur.fetchall()}
-            _migrations = [
-                ("is_reference", "ALTER TABLE project_documents ADD COLUMN is_reference BOOLEAN DEFAULT 0"),
-                ("notes", 'ALTER TABLE project_documents ADD COLUMN notes TEXT DEFAULT ""'),
-                ("version_group", 'ALTER TABLE project_documents ADD COLUMN version_group VARCHAR(32) DEFAULT ""'),
-                ("version_label", 'ALTER TABLE project_documents ADD COLUMN version_label VARCHAR(100) DEFAULT ""'),
-            ]
-            for col, sql in _migrations:
-                if col not in _existing_cols:
-                    _cur.execute(sql)
-            _conn.commit()
-
-            # Migrate projects table to add assigned_to column if missing
-            _cur.execute("PRAGMA table_info(projects)")
-            _proj_cols = {row[1] for row in _cur.fetchall()}
-            if "assigned_to" not in _proj_cols:
-                _cur.execute('ALTER TABLE projects ADD COLUMN assigned_to VARCHAR(32) DEFAULT NULL')
-                _conn.commit()
-
-            # Part 2 migrations: deadlines and win/loss analysis columns
-            _cur.execute("PRAGMA table_info(projects)")
-            _proj_cols = {row[1] for row in _cur.fetchall()}
-            _project_migrations = [
-                ("due_date", "ALTER TABLE projects ADD COLUMN due_date DATETIME DEFAULT NULL"),
-                ("close_reason", 'ALTER TABLE projects ADD COLUMN close_reason TEXT DEFAULT ""'),
-                ("close_category", 'ALTER TABLE projects ADD COLUMN close_category VARCHAR(50) DEFAULT ""'),
-                ("competitor_name", 'ALTER TABLE projects ADD COLUMN competitor_name VARCHAR(300) DEFAULT ""'),
-                ("closed_at", "ALTER TABLE projects ADD COLUMN closed_at DATETIME DEFAULT NULL"),
-            ]
-            for col, sql in _project_migrations:
-                if col not in _proj_cols:
-                    _cur.execute(sql)
-            _conn.commit()
-
-            # Migrate users table to add role column if missing
-            _cur.execute("PRAGMA table_info(users)")
-            _user_cols = {row[1] for row in _cur.fetchall()}
-            if "role" not in _user_cols:
-                _cur.execute('ALTER TABLE users ADD COLUMN role VARCHAR(20) DEFAULT "proposal"')
-                # Backfill: set existing admins to admin role
-                _cur.execute('UPDATE users SET role = "admin" WHERE is_admin = 1')
-                _conn.commit()
-
-            # Migrate users table to add company logo columns if missing
-            _user_logo_migrations = [
-                ("company_logo_path", 'ALTER TABLE users ADD COLUMN company_logo_path VARCHAR(1000) DEFAULT ""'),
-                ("company_logo_original_name", 'ALTER TABLE users ADD COLUMN company_logo_original_name VARCHAR(500) DEFAULT ""'),
-                ("company_logo_use_in_proposals", "ALTER TABLE users ADD COLUMN company_logo_use_in_proposals BOOLEAN DEFAULT 1"),
-                ("company_logo_placement", 'ALTER TABLE users ADD COLUMN company_logo_placement VARCHAR(20) DEFAULT "top_left"'),
-                ("company_logo_show_on_cover", "ALTER TABLE users ADD COLUMN company_logo_show_on_cover BOOLEAN DEFAULT 1"),
-            ]
-            for _col, _sql in _user_logo_migrations:
-                if _col not in _user_cols:
-                    _cur.execute(_sql)
-            _conn.commit()
-
-            # Migrate proposals table for Part 3 review lifecycle
-            _cur.execute("PRAGMA table_info(proposals)")
-            _prop_cols = {row[1] for row in _cur.fetchall()}
-            if "review_status" not in _prop_cols:
-                _cur.execute('ALTER TABLE proposals ADD COLUMN review_status VARCHAR(40) DEFAULT "draft"')
-                _conn.commit()
-            if "review_deadline" not in _prop_cols:
-                _cur.execute('ALTER TABLE proposals ADD COLUMN review_deadline DATETIME DEFAULT NULL')
-                _conn.commit()
-
-            # Migrate projects table to add clarification_sub_status if missing
-            _cur.execute("PRAGMA table_info(projects)")
-            _proj_cols2 = {row[1] for row in _cur.fetchall()}
-            if "clarification_sub_status" not in _proj_cols2:
-                _cur.execute('ALTER TABLE projects ADD COLUMN clarification_sub_status VARCHAR(30) DEFAULT "none"')
-                _conn.commit()
-
-            # Migrate proposal_questions table to add resolution_path if missing
-            _cur.execute("PRAGMA table_info(proposal_questions)")
-            _pq_cols = {row[1] for row in _cur.fetchall()}
-            if "resolution_path" not in _pq_cols:
-                _cur.execute('ALTER TABLE proposal_questions ADD COLUMN resolution_path VARCHAR(20) DEFAULT "internal"')
-                _conn.commit()
-
-            _conn.close()
+            ensure_schema()
         finally:
             _fcntl.flock(_lock_fh, _fcntl.LOCK_UN)
+
+# Background job runner (AI generation/revision run out-of-request)
+jobs.init_app(app)
 
 
 # ---------------------------------------------------------------------------
@@ -280,8 +274,13 @@ def _allowed_file(filename: str, extensions: set = None) -> bool:
 
 
 def _log_activity(action: str, detail: str = "", project_id: str = None):
+    _log_activity_for(current_user, action, detail, project_id)
+
+
+def _log_activity_for(user, action: str, detail: str = "", project_id: str = None):
+    """Request-context-free variant used by background jobs."""
     log = ActivityLog(
-        user_id=current_user.id,
+        user_id=user.id,
         action=action,
         detail=detail,
         project_id=project_id,
@@ -298,13 +297,95 @@ def _notify(user_id: str, category: str, title: str, message: str = "", link: st
 
 
 def _notify_role(role: str, category: str, title: str, message: str = "", link: str = "", exclude_user_id: str = None):
-    """Send a notification to all users with a given role."""
-    users = User.query.filter_by(role=role).all()
+    """Send a notification to all users with a given role in the current org."""
+    _notify_role_org(current_user.org_id, role, category, title, message, link, exclude_user_id)
+
+
+def _notify_role_org(org_id, role, category, title, message="", link="", exclude_user_id=None):
+    """Request-context-free variant used by background jobs."""
+    users = User.query.filter_by(role=role, org_id=org_id).all()
     for u in users:
         if exclude_user_id and u.id == exclude_user_id:
             continue
         db.session.add(Notification(user_id=u.id, category=category, title=title, message=message, link=link))
     db.session.commit()
+
+
+def _notify_via_integrations(org_id, text, event="", payload=None):
+    """Fan a message out to an org's configured Slack / outbound webhook."""
+    if not org_id:
+        return
+    org = db.session.get(Organization, org_id)
+    if not org:
+        return
+    import integrations
+    if org.slack_webhook_url:
+        integrations.notify_slack(org.slack_webhook_url, text)
+    if org.outbound_webhook_url and event:
+        integrations.notify_webhook(org.outbound_webhook_url, event, payload or {})
+
+
+# ---------------------------------------------------------------------------
+# Organization (tenant) helpers
+# ---------------------------------------------------------------------------
+
+def _org_id():
+    """The current user's organization id."""
+    return current_user.org_id
+
+
+def _org_users_query():
+    """All members of the current user's organization."""
+    return User.query.filter_by(org_id=current_user.org_id)
+
+
+def _org_proposal_users():
+    """Org members who can be assigned proposals (proposal + admin roles)."""
+    return (
+        _org_users_query()
+        .filter(User.role.in_(["proposal", "admin"]))
+        .order_by(User.display_name)
+        .all()
+    )
+
+
+def _same_org(user_or_org_id) -> bool:
+    org_id = getattr(user_or_org_id, "org_id", user_or_org_id)
+    return bool(org_id) and org_id == current_user.org_id
+
+
+# ---------------------------------------------------------------------------
+# API key encryption (Phase 2) — thin wrappers over crypto_util
+# ---------------------------------------------------------------------------
+
+def encrypt_api_key(plaintext: str) -> str:
+    import crypto_util
+    return crypto_util.encrypt(plaintext)
+
+
+def decrypt_api_key(stored: str) -> str:
+    import crypto_util
+    return crypto_util.decrypt(stored)
+
+
+# ---------------------------------------------------------------------------
+# Billing gates (Phase 5) — thin wrappers so routes stay readable
+# ---------------------------------------------------------------------------
+
+def billing_check_generation(org_id):
+    return billing.check_generation(org_id)
+
+
+def billing_record_generation(org_id):
+    return billing.record_generation(org_id)
+
+
+def billing_check_seat(org_id, pending_invites=0):
+    return billing.can_add_seat(org_id, pending_invites)
+
+
+def billing_check_project(org_id):
+    return billing.can_add_project(org_id)
 
 
 @app.context_processor
@@ -344,7 +425,7 @@ def _setup_progress(user) -> dict:
             "desc": "The AI follows your structure when drafting.",
             "endpoint": "posture",
             "anchor": "#templates",
-            "done": UserVerticalTemplate.query.filter_by(user_id=user.id).count() > 0,
+            "done": UserVerticalTemplate.query.filter_by(org_id=user.org_id).count() > 0,
         },
         {
             "key": "standards",
@@ -352,7 +433,7 @@ def _setup_progress(user) -> dict:
             "desc": "Mission, certifications, T&Cs auto-injected into proposals.",
             "endpoint": "posture",
             "anchor": "#standards",
-            "done": CompanyStandard.query.filter_by(user_id=user.id).count() > 0,
+            "done": CompanyStandard.query.filter_by(org_id=user.org_id).count() > 0,
         },
         {
             "key": "staff",
@@ -360,8 +441,8 @@ def _setup_progress(user) -> dict:
             "desc": "Hourly sell rates for labor cost estimates.",
             "endpoint": "posture",
             "anchor": "#staff-rates",
-            "done": StaffRole.query.filter_by(user_id=user.id).count() > 0
-                    or UserRateSheet.query.filter_by(user_id=user.id).count() > 0,
+            "done": StaffRole.query.filter_by(org_id=user.org_id).count() > 0
+                    or UserRateSheet.query.filter_by(org_id=user.org_id).count() > 0,
         },
         {
             "key": "equipment",
@@ -369,7 +450,7 @@ def _setup_progress(user) -> dict:
             "desc": "Price list used for Bill of Materials estimates.",
             "endpoint": "posture",
             "anchor": "#equipment",
-            "done": EquipmentItem.query.filter_by(user_id=user.id).count() > 0,
+            "done": EquipmentItem.query.filter_by(org_id=user.org_id).count() > 0,
         },
         {
             "key": "travel",
@@ -377,7 +458,7 @@ def _setup_progress(user) -> dict:
             "desc": "Per diem, mileage, airfare used in travel estimates.",
             "endpoint": "posture",
             "anchor": "#travel",
-            "done": TravelExpenseRate.query.filter_by(user_id=user.id).count() > 0,
+            "done": TravelExpenseRate.query.filter_by(org_id=user.org_id).count() > 0,
         },
         {
             "key": "project",
@@ -425,14 +506,21 @@ def inject_nav_context():
 
 
 def _can_access_project(project) -> bool:
-    """Check if current user can access a project (owner, assigned, or admin)."""
+    """Check if current user can access a project (owner, assignee, or an
+    admin of the *same organization*)."""
     if not project:
         return False
-    return (
-        project.user_id == current_user.id
-        or project.assigned_to == current_user.id
-        or current_user.is_admin
-    )
+    if project.user_id == current_user.id or project.assigned_to == current_user.id:
+        return True
+    return current_user.is_admin and _same_org(project.org_id or _owner_org_id(project))
+
+
+def _owner_org_id(project) -> str:
+    """Org id for a project, falling back to its owner's org for legacy rows."""
+    if project.org_id:
+        return project.org_id
+    owner = db.session.get(User, project.user_id)
+    return owner.org_id if owner else None
 
 
 def _save_upload(file, subdir: str = "") -> tuple[str, str, int]:
@@ -444,7 +532,15 @@ def _save_upload(file, subdir: str = "") -> tuple[str, str, int]:
     dest = dest_dir / unique
     file.save(str(dest))
     size = dest.stat().st_size
+    storage.sync_up(dest)
     return safe, str(dest), size
+
+
+def _send_stored_file(path, **kwargs):
+    """send_file wrapper that fetches the file from object storage first if the
+    local copy is missing (ephemeral disk / multi-instance safety)."""
+    storage.ensure_local(path)
+    return send_file(str(path), **kwargs)
 
 
 def _logo_docx_kwargs(user, company_name_override: str = "") -> dict:
@@ -514,16 +610,46 @@ def _process_and_save_logo(file, user_id: str) -> tuple[str, str, int]:
 # Auth routes
 # ---------------------------------------------------------------------------
 
+def _valid_invitation(token: str) -> OrgInvitation | None:
+    if not token:
+        return None
+    inv = OrgInvitation.query.filter_by(token=token).first()
+    if not inv or inv.accepted_at or inv.revoked_at:
+        return None
+    if inv.expires_at:
+        expires = inv.expires_at.replace(tzinfo=None) if inv.expires_at.tzinfo else inv.expires_at
+        if expires < datetime.utcnow():
+            return None
+    return inv
+
+
+@app.route("/invite/<token>")
+def accept_invite(token):
+    """Landing page for an org invitation — signup form scoped to the org."""
+    inv = _valid_invitation(token)
+    if not inv:
+        flash("This invitation link is invalid, expired, or already used.", "error")
+        return redirect(url_for("signup"))
+    org = db.session.get(Organization, inv.org_id)
+    return render_template("signup.html", invitation=inv, invite_org=org)
+
+
 @app.route("/signup", methods=["GET", "POST"])
 def signup():
     if request.method == "GET":
-        return render_template("signup.html")
+        return render_template("signup.html", invitation=None, invite_org=None)
 
     username = request.form.get("username", "").strip()
     email = request.form.get("email", "").strip()
     password = request.form.get("password", "")
     display_name = request.form.get("display_name", "").strip()
     company_name = request.form.get("company_name", "").strip()
+    invite_token = request.form.get("invite_token", "").strip()
+
+    invitation = _valid_invitation(invite_token) if invite_token else None
+    if invite_token and not invitation:
+        flash("This invitation link is invalid, expired, or already used.", "error")
+        return redirect(url_for("signup"))
 
     if not username or not email or not password:
         flash("All fields are required.", "error")
@@ -545,16 +671,49 @@ def signup():
     )
     user.set_password(password)
 
-    # First user becomes admin
-    if User.query.count() == 0:
+    if invitation:
+        # Join the inviting organization with the invited role
+        org = db.session.get(Organization, invitation.org_id)
+        user.org_id = org.id
+        user.company_name = org.name
+        user.role = invitation.role if invitation.role in ("admin", "sales", "proposal") else "proposal"
+        user.is_admin = user.role == "admin"
+        invitation.accepted_at = datetime.now(timezone.utc)
+        db.session.add(user)
+        db.session.flush()
+        invitation.accepted_user_id = user.id
+    else:
+        # Fresh signup creates a new workspace; the creator is its admin
+        from datetime import timedelta
+        org = Organization(
+            name=company_name or f"{display_name or username}'s Workspace",
+            plan="free",
+            trial_ends_at=datetime.utcnow() + timedelta(days=14),
+        )
+        db.session.add(org)
+        db.session.flush()
+        user.org_id = org.id
         user.is_admin = True
         user.role = "admin"
+        db.session.add(user)
 
-    db.session.add(user)
     db.session.commit()
     login_user(user)
     _log_activity("signup", f"User {username} created account")
-    flash("Account created successfully.", "success")
+
+    # Kick off email verification (best-effort; never blocks signup)
+    if invitation:
+        # Invited users arrived via a link sent to their address — trust it
+        user.email_verified = True
+        db.session.commit()
+    else:
+        try:
+            _send_verification_email(user)
+        except Exception:
+            pass
+
+    flash("Account created successfully." if not invitation
+          else f"Welcome to {org.name}!", "success")
     return redirect(url_for("dashboard"))
 
 
@@ -567,15 +726,141 @@ def login():
 
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "")
+
+    rl_key = f"{request.remote_addr}:{username.lower()}"
+    if _login_rate_limited(rl_key):
+        flash("Too many login attempts. Please wait a few minutes and try again.", "error")
+        return redirect(url_for("login"))
+
     user = User.query.filter_by(username=username).first()
 
     if not user or not user.check_password(password):
+        _record_login_attempt(rl_key)
         flash("Invalid username or password.", "error")
         return redirect(url_for("login"))
 
+    _LOGIN_ATTEMPTS.pop(rl_key, None)
     login_user(user)
     _log_activity("login")
     return redirect(url_for("dashboard"))
+
+
+# ---------------------------------------------------------------------------
+# Email verification & password reset
+# ---------------------------------------------------------------------------
+
+def _issue_token(user, purpose: str, hours: int = 24) -> UserToken:
+    from datetime import timedelta
+    tok = UserToken(
+        user_id=user.id,
+        purpose=purpose,
+        expires_at=datetime.utcnow() + timedelta(hours=hours),
+    )
+    db.session.add(tok)
+    db.session.commit()
+    return tok
+
+
+def _consume_token(token_str: str, purpose: str):
+    tok = UserToken.query.filter_by(token=token_str, purpose=purpose).first()
+    if not tok or tok.used_at:
+        return None
+    if tok.expires_at:
+        exp = tok.expires_at.replace(tzinfo=None) if tok.expires_at.tzinfo else tok.expires_at
+        if exp < datetime.utcnow():
+            return None
+    return tok
+
+
+def _send_verification_email(user):
+    tok = _issue_token(user, "verify", hours=72)
+    link = url_for("verify_email", token=tok.token, _external=True)
+    import mailer
+    sent = mailer.send_email(
+        to=user.email,
+        subject=f"Verify your email for {APP_NAME}",
+        body=(f"Welcome to {APP_NAME}!\n\nPlease verify your email address:\n{link}\n\n"
+              f"This link expires in 72 hours."),
+    )
+    return link, sent
+
+
+@app.route("/verify-email/<token>")
+def verify_email(token):
+    tok = _consume_token(token, "verify")
+    if not tok:
+        flash("This verification link is invalid or has expired.", "error")
+        return redirect(url_for("login"))
+    user = db.session.get(User, tok.user_id)
+    user.email_verified = True
+    tok.used_at = datetime.now(timezone.utc)
+    db.session.commit()
+    flash("Email verified. Thanks!", "success")
+    return redirect(url_for("dashboard") if current_user.is_authenticated else url_for("login"))
+
+
+@app.route("/resend-verification", methods=["POST"])
+@login_required
+def resend_verification():
+    if current_user.email_verified:
+        flash("Your email is already verified.", "success")
+        return redirect(request.referrer or url_for("dashboard"))
+    link, sent = _send_verification_email(current_user)
+    if sent:
+        flash("Verification email sent.", "success")
+    else:
+        flash(f"Verify your email here: {link}", "success")
+    return redirect(request.referrer or url_for("dashboard"))
+
+
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    if request.method == "GET":
+        return render_template("forgot_password.html")
+    email = request.form.get("email", "").strip().lower()
+    # Always show the same message to avoid leaking which emails exist
+    generic = "If an account exists for that email, a reset link has been sent."
+    user = User.query.filter(User.email.ilike(email)).first() if email else None
+    if user:
+        tok = _issue_token(user, "reset", hours=2)
+        link = url_for("reset_password", token=tok.token, _external=True)
+        import mailer
+        sent = mailer.send_email(
+            to=user.email,
+            subject=f"Reset your {APP_NAME} password",
+            body=(f"A password reset was requested for your account.\n\n"
+                  f"Reset your password:\n{link}\n\nThis link expires in 2 hours. "
+                  f"If you didn't request this, you can ignore this email."),
+        )
+        if not sent:
+            # Dev fallback: surface the link so the flow is testable without SMTP
+            flash(f"Password reset link: {link}", "success")
+    flash(generic, "success")
+    return redirect(url_for("login"))
+
+
+@app.route("/reset-password/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    tok = _consume_token(token, "reset")
+    if not tok:
+        flash("This password reset link is invalid or has expired.", "error")
+        return redirect(url_for("forgot_password"))
+    if request.method == "GET":
+        return render_template("reset_password.html", token=token)
+    password = request.form.get("password", "")
+    confirm = request.form.get("confirm_password", "")
+    if len(password) < 8:
+        flash("Password must be at least 8 characters.", "error")
+        return redirect(url_for("reset_password", token=token))
+    if password != confirm:
+        flash("Passwords do not match.", "error")
+        return redirect(url_for("reset_password", token=token))
+    user = db.session.get(User, tok.user_id)
+    user.set_password(password)
+    tok.used_at = datetime.now(timezone.utc)
+    db.session.commit()
+    flash("Password updated. You can now sign in.", "success")
+    return redirect(url_for("login"))
 
 
 @app.route("/logout")
@@ -829,7 +1114,12 @@ def quick_start():
     stem = Path(valid[0].filename).stem.replace("_", " ").replace("-", " ").strip()
     project_name = (stem[:280] or "New Proposal") + " Proposal"
 
-    project = Project(user_id=current_user.id, name=project_name)
+    ok, msg = billing_check_project(current_user.org_id)
+    if not ok:
+        flash(msg, "error")
+        return redirect(url_for("billing_page"))
+
+    project = Project(user_id=current_user.id, org_id=current_user.org_id, name=project_name)
     db.session.add(project)
     db.session.flush()
 
@@ -937,7 +1227,7 @@ def dashboard():
     ).order_by(Notification.created_at.desc()).limit(10).all()
 
     # Proposal users list (for sales assignment dropdown)
-    proposal_users = User.query.filter(User.role.in_(["proposal", "admin"])).order_by(User.display_name).all()
+    proposal_users = _org_proposal_users()
 
     # Upcoming deadlines (next 7 days) and overdue — from active projects only
     from datetime import timedelta
@@ -1133,7 +1423,9 @@ PROPOSAL_FILTERS = [
 def _build_proposal_rows():
     """Load all accessible projects enriched with their latest proposal state."""
     if current_user.is_admin:
-        projects = Project.query.order_by(Project.updated_at.desc()).all()
+        projects = Project.query.filter_by(org_id=current_user.org_id).order_by(
+            Project.updated_at.desc()
+        ).all()
     else:
         projects = Project.query.filter(_my_projects_filter()).order_by(
             Project.updated_at.desc()
@@ -1277,7 +1569,7 @@ def proposals_list():
     counts = {key: len(_filter_proposal_rows(all_rows, key)) for key, _, _ in PROPOSAL_FILTERS}
     rows = _apply_row_query_filters(_filter_proposal_rows(all_rows, flt))
 
-    proposal_users = User.query.filter(User.role.in_(["proposal", "admin"])).order_by(User.display_name).all()
+    proposal_users = _org_proposal_users()
 
     close_category_labels = {
         "price": "Price", "scope": "Scope", "schedule": "Schedule / Timing",
@@ -1351,13 +1643,13 @@ def proposals_export_csv():
 @app.route("/posture")
 @login_required
 def posture():
-    rate_sheets = UserRateSheet.query.filter_by(user_id=current_user.id).order_by(UserRateSheet.uploaded_at.desc()).all()
-    user_templates = UserVerticalTemplate.query.filter_by(user_id=current_user.id, is_company_default=False).order_by(UserVerticalTemplate.uploaded_at.desc()).all()
-    staff_roles = StaffRole.query.filter_by(user_id=current_user.id).order_by(StaffRole.category, StaffRole.role_name).all()
-    equipment_items = EquipmentItem.query.filter_by(user_id=current_user.id).order_by(EquipmentItem.category, EquipmentItem.item_name).all()
-    travel_rates = TravelExpenseRate.query.filter_by(user_id=current_user.id).order_by(TravelExpenseRate.expense_type).all()
-    company_standards = CompanyStandard.query.filter_by(user_id=current_user.id).order_by(CompanyStandard.category, CompanyStandard.title).all()
-    revision_templates = RevisionTemplate.query.filter_by(user_id=current_user.id).order_by(
+    rate_sheets = UserRateSheet.query.filter_by(org_id=current_user.org_id).order_by(UserRateSheet.uploaded_at.desc()).all()
+    user_templates = UserVerticalTemplate.query.filter_by(org_id=current_user.org_id, is_company_default=False).order_by(UserVerticalTemplate.uploaded_at.desc()).all()
+    staff_roles = StaffRole.query.filter_by(org_id=current_user.org_id).order_by(StaffRole.category, StaffRole.role_name).all()
+    equipment_items = EquipmentItem.query.filter_by(org_id=current_user.org_id).order_by(EquipmentItem.category, EquipmentItem.item_name).all()
+    travel_rates = TravelExpenseRate.query.filter_by(org_id=current_user.org_id).order_by(TravelExpenseRate.expense_type).all()
+    company_standards = CompanyStandard.query.filter_by(org_id=current_user.org_id).order_by(CompanyStandard.category, CompanyStandard.title).all()
+    revision_templates = RevisionTemplate.query.filter_by(org_id=current_user.org_id).order_by(
         RevisionTemplate.category, RevisionTemplate.name
     ).all()
 
@@ -1419,7 +1711,7 @@ def settings():
 
         api_key = request.form.get("api_key", "").strip()
         if api_key:
-            current_user.api_key_encrypted = api_key  # In production, encrypt this
+            current_user.api_key_encrypted = encrypt_api_key(api_key)
 
         # Company logo preferences (checkboxes come through only when checked)
         current_user.company_logo_use_in_proposals = bool(request.form.get("company_logo_use_in_proposals"))
@@ -1436,19 +1728,19 @@ def settings():
         return redirect(url_for("settings"))
 
     # Rate sheets
-    rate_sheets = UserRateSheet.query.filter_by(user_id=current_user.id).order_by(UserRateSheet.uploaded_at.desc()).all()
+    rate_sheets = UserRateSheet.query.filter_by(org_id=current_user.org_id).order_by(UserRateSheet.uploaded_at.desc()).all()
     # User vertical templates
-    user_templates = UserVerticalTemplate.query.filter_by(user_id=current_user.id, is_company_default=False).order_by(UserVerticalTemplate.uploaded_at.desc()).all()
+    user_templates = UserVerticalTemplate.query.filter_by(org_id=current_user.org_id, is_company_default=False).order_by(UserVerticalTemplate.uploaded_at.desc()).all()
     # Staff roles
-    staff_roles = StaffRole.query.filter_by(user_id=current_user.id).order_by(StaffRole.category, StaffRole.role_name).all()
+    staff_roles = StaffRole.query.filter_by(org_id=current_user.org_id).order_by(StaffRole.category, StaffRole.role_name).all()
     # Equipment items
-    equipment_items = EquipmentItem.query.filter_by(user_id=current_user.id).order_by(EquipmentItem.category, EquipmentItem.item_name).all()
+    equipment_items = EquipmentItem.query.filter_by(org_id=current_user.org_id).order_by(EquipmentItem.category, EquipmentItem.item_name).all()
     # Travel expense rates
-    travel_rates = TravelExpenseRate.query.filter_by(user_id=current_user.id).order_by(TravelExpenseRate.expense_type).all()
+    travel_rates = TravelExpenseRate.query.filter_by(org_id=current_user.org_id).order_by(TravelExpenseRate.expense_type).all()
     # Company standards
-    company_standards = CompanyStandard.query.filter_by(user_id=current_user.id).order_by(CompanyStandard.category, CompanyStandard.title).all()
+    company_standards = CompanyStandard.query.filter_by(org_id=current_user.org_id).order_by(CompanyStandard.category, CompanyStandard.title).all()
     # Revision request templates (Part 3)
-    revision_templates = RevisionTemplate.query.filter_by(user_id=current_user.id).order_by(
+    revision_templates = RevisionTemplate.query.filter_by(org_id=current_user.org_id).order_by(
         RevisionTemplate.category, RevisionTemplate.name
     ).all()
 
@@ -1481,6 +1773,7 @@ def upload_rate_sheet():
 
     sheet = UserRateSheet(
         user_id=current_user.id,
+        org_id=current_user.org_id,
         name=request.form.get("sheet_name", safe),
         sheet_type=sheet_type,
         file_path=path,
@@ -1491,6 +1784,192 @@ def upload_rate_sheet():
     _log_activity("rate_sheet_upload", f"Uploaded {sheet_type}: {safe}")
     flash("Rate sheet uploaded.", "success")
     return redirect(url_for("posture") + "#staff-rates")
+
+
+# ---------------------------------------------------------------------------
+# Ingestion review flows (Phase 4): parse → AI-extract → review → import
+# ---------------------------------------------------------------------------
+
+_INGEST_TARGETS = {
+    "labor_rates": {"label": "Staff Rates", "anchor": "#staff-rates",
+                    "cols": [("role_name", "Role"), ("category", "Category"),
+                             ("hourly_rate", "Hourly Rate"), ("overtime_rate", "OT Rate")]},
+    "product_pricing": {"label": "Equipment / Products", "anchor": "#equipment",
+                        "cols": [("item_name", "Item"), ("category", "Category"),
+                                 ("part_number", "Part #"), ("manufacturer", "Manufacturer"),
+                                 ("unit_cost", "Unit Cost"), ("unit", "Unit")]},
+    "travel": {"label": "Travel Rates", "anchor": "#travel",
+               "cols": [("expense_type", "Expense"), ("rate", "Rate"),
+                        ("unit", "Unit"), ("description", "Description")]},
+}
+
+
+@app.route("/posture/ingest-rates", methods=["POST"])
+@login_required
+def ingest_rates():
+    """Parse an uploaded rate sheet and AI-map it into structured rows for review."""
+    file = request.files.get("ingest_file")
+    target = request.form.get("target_type", "labor_rates")
+    if target not in _INGEST_TARGETS:
+        target = "labor_rates"
+    if not file or not file.filename:
+        flash("Please choose a file to import.", "error")
+        return redirect(url_for("posture"))
+
+    safe, path, size = _save_upload(file, f"ingest/{current_user.org_id}")
+    try:
+        if path.lower().endswith((".xlsx", ".xls")):
+            parsed = parse_rate_sheet(path)
+            raw_text = parsed.get("raw_text", "")
+        elif path.lower().endswith(".csv"):
+            raw_text = Path(path).read_text(encoding="utf-8", errors="replace")
+        else:
+            raw_text = parse_document(path)
+    except Exception as e:
+        flash(f"Could not read the file: {e}", "error")
+        return redirect(url_for("posture") + _INGEST_TARGETS[target]["anchor"])
+
+    try:
+        rows = extract_rates_from_sheet(
+            raw_text, target,
+            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
+            user_model=current_user.llm_model or None,
+        )
+    except RuntimeError as e:
+        flash(str(e), "error")
+        return redirect(url_for("posture") + _INGEST_TARGETS[target]["anchor"])
+    except Exception as e:
+        flash(f"Extraction failed: {friendly_api_error(e)}", "error")
+        return redirect(url_for("posture") + _INGEST_TARGETS[target]["anchor"])
+
+    if not rows:
+        flash("The AI couldn't find any rows to import. You can still add rates manually.", "error")
+        return redirect(url_for("posture") + _INGEST_TARGETS[target]["anchor"])
+
+    return render_template(
+        "ingest_review.html",
+        mode="rates", target=target, meta=_INGEST_TARGETS[target],
+        rows=rows, source_name=safe,
+    )
+
+
+@app.route("/posture/ingest-rates/confirm", methods=["POST"])
+@login_required
+def ingest_rates_confirm():
+    target = request.form.get("target_type", "labor_rates")
+    if target not in _INGEST_TARGETS:
+        abort(400)
+    count = 0
+    n = len(request.form.getlist("include"))
+    includes = set(request.form.getlist("include"))
+
+    def _num(name, i):
+        vals = request.form.getlist(name)
+        try:
+            return float((vals[i] if i < len(vals) else "0").replace(",", "").replace("$", "") or 0)
+        except ValueError:
+            return 0.0
+
+    def _str(name, i):
+        vals = request.form.getlist(name)
+        return (vals[i] if i < len(vals) else "").strip()
+
+    total_rows = len(request.form.getlist("row_marker"))
+    for i in range(total_rows):
+        if str(i) not in includes:
+            continue
+        if target == "labor_rates":
+            name = _str("role_name", i)
+            if not name:
+                continue
+            db.session.add(StaffRole(
+                user_id=current_user.id, org_id=current_user.org_id,
+                role_name=name, category=_str("category", i),
+                hourly_rate=_num("hourly_rate", i), overtime_rate=_num("overtime_rate", i),
+            ))
+        elif target == "product_pricing":
+            name = _str("item_name", i)
+            if not name:
+                continue
+            db.session.add(EquipmentItem(
+                user_id=current_user.id, org_id=current_user.org_id,
+                item_name=name, category=_str("category", i),
+                part_number=_str("part_number", i), manufacturer=_str("manufacturer", i),
+                unit_cost=_num("unit_cost", i), unit=_str("unit", i) or "each",
+            ))
+        elif target == "travel":
+            name = _str("expense_type", i)
+            if not name:
+                continue
+            db.session.add(TravelExpenseRate(
+                user_id=current_user.id, org_id=current_user.org_id,
+                expense_type=name, rate=_num("rate", i),
+                unit=_str("unit", i) or "per day", description=_str("description", i),
+            ))
+        count += 1
+    db.session.commit()
+    _log_activity("rates_ingest", f"Imported {count} {target} row(s)")
+    flash(f"Imported {count} row(s) into your posture.", "success")
+    return redirect(url_for("posture") + _INGEST_TARGETS[target]["anchor"])
+
+
+@app.route("/posture/ingest-standards", methods=["POST"])
+@login_required
+def ingest_standards():
+    """Parse a document and propose reusable company standard blocks for review."""
+    file = request.files.get("standards_file")
+    if not file or not file.filename:
+        flash("Please choose a document to import.", "error")
+        return redirect(url_for("posture") + "#standards")
+    safe, path, size = _save_upload(file, f"ingest/{current_user.org_id}")
+    try:
+        text = parse_document(path)
+    except Exception as e:
+        flash(f"Could not read the document: {e}", "error")
+        return redirect(url_for("posture") + "#standards")
+    try:
+        blocks = extract_standards(
+            text,
+            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
+            user_model=current_user.llm_model or None,
+        )
+    except RuntimeError as e:
+        flash(str(e), "error")
+        return redirect(url_for("posture") + "#standards")
+    except Exception as e:
+        flash(f"Extraction failed: {friendly_api_error(e)}", "error")
+        return redirect(url_for("posture") + "#standards")
+    if not blocks:
+        flash("The AI couldn't extract standards from that document.", "error")
+        return redirect(url_for("posture") + "#standards")
+    return render_template("ingest_review.html", mode="standards", blocks=blocks, source_name=safe)
+
+
+@app.route("/posture/ingest-standards/confirm", methods=["POST"])
+@login_required
+def ingest_standards_confirm():
+    includes = set(request.form.getlist("include"))
+    categories = request.form.getlist("category")
+    titles = request.form.getlist("title")
+    contents = request.form.getlist("content")
+    count = 0
+    for i in range(len(titles)):
+        if str(i) not in includes:
+            continue
+        title = (titles[i] or "").strip()
+        content = (contents[i] or "").strip()
+        if not title or not content:
+            continue
+        db.session.add(CompanyStandard(
+            user_id=current_user.id, org_id=current_user.org_id,
+            category=(categories[i] if i < len(categories) else "general").strip() or "general",
+            title=title[:300], content=content,
+        ))
+        count += 1
+    db.session.commit()
+    _log_activity("standards_ingest", f"Imported {count} standard(s)")
+    flash(f"Imported {count} company standard(s).", "success")
+    return redirect(url_for("posture") + "#standards")
 
 
 @app.route("/settings/upload-template", methods=["POST"])
@@ -1508,6 +1987,7 @@ def upload_user_template():
 
     tmpl = UserVerticalTemplate(
         user_id=current_user.id,
+        org_id=current_user.org_id,
         vertical=vertical,
         template_type=template_type,
         name=request.form.get("template_name", safe),
@@ -1526,7 +2006,7 @@ def upload_user_template():
 @login_required
 def delete_rate_sheet(sheet_id):
     sheet = db.session.get(UserRateSheet, sheet_id)
-    if not sheet or sheet.user_id != current_user.id:
+    if not sheet or sheet.org_id != current_user.org_id:
         abort(404)
     db.session.delete(sheet)
     db.session.commit()
@@ -1538,7 +2018,7 @@ def delete_rate_sheet(sheet_id):
 @login_required
 def delete_user_template(template_id):
     tmpl = db.session.get(UserVerticalTemplate, template_id)
-    if not tmpl or tmpl.user_id != current_user.id:
+    if not tmpl or tmpl.org_id != current_user.org_id:
         abort(404)
     db.session.delete(tmpl)
     db.session.commit()
@@ -1638,6 +2118,7 @@ def add_staff_role():
         safe, path, size = _save_upload(uploaded_file, "rate_sheets")
         sheet = UserRateSheet(
             user_id=current_user.id,
+        org_id=current_user.org_id,
             name=f"Staff Rates - {safe}",
             sheet_type="labor_rates",
             file_path=path,
@@ -1672,6 +2153,7 @@ def add_staff_role():
 
     role = StaffRole(
         user_id=current_user.id,
+        org_id=current_user.org_id,
         role_name=role_name,
         category=category,
         hourly_rate=hourly_rate,
@@ -1689,7 +2171,7 @@ def add_staff_role():
 @login_required
 def edit_staff_role(role_id):
     role = db.session.get(StaffRole, role_id)
-    if not role or role.user_id != current_user.id:
+    if not role or role.org_id != current_user.org_id:
         abort(404)
 
     role.role_name = request.form.get("role_name", role.role_name).strip()
@@ -1714,7 +2196,7 @@ def edit_staff_role(role_id):
 @login_required
 def delete_staff_role(role_id):
     role = db.session.get(StaffRole, role_id)
-    if not role or role.user_id != current_user.id:
+    if not role or role.org_id != current_user.org_id:
         abort(404)
     name = role.role_name
     db.session.delete(role)
@@ -1737,6 +2219,7 @@ def add_equipment_item():
         safe, path, size = _save_upload(uploaded_file, "rate_sheets")
         sheet = UserRateSheet(
             user_id=current_user.id,
+        org_id=current_user.org_id,
             name=f"Equipment Price List - {safe}",
             sheet_type="product_pricing",
             file_path=path,
@@ -1772,6 +2255,7 @@ def add_equipment_item():
 
     item = EquipmentItem(
         user_id=current_user.id,
+        org_id=current_user.org_id,
         item_name=item_name,
         category=category,
         part_number=part_number,
@@ -1791,7 +2275,7 @@ def add_equipment_item():
 @login_required
 def delete_equipment_item(item_id):
     item = db.session.get(EquipmentItem, item_id)
-    if not item or item.user_id != current_user.id:
+    if not item or item.org_id != current_user.org_id:
         abort(404)
     name = item.item_name
     db.session.delete(item)
@@ -1814,6 +2298,7 @@ def add_travel_rate():
         safe, path, size = _save_upload(uploaded_file, "rate_sheets")
         sheet = UserRateSheet(
             user_id=current_user.id,
+        org_id=current_user.org_id,
             name=f"Travel Rates - {safe}",
             sheet_type="labor_rates",
             file_path=path,
@@ -1846,6 +2331,7 @@ def add_travel_rate():
 
     tr = TravelExpenseRate(
         user_id=current_user.id,
+        org_id=current_user.org_id,
         expense_type=expense_type,
         description=description,
         rate=rate,
@@ -1862,7 +2348,7 @@ def add_travel_rate():
 @login_required
 def delete_travel_rate(rate_id):
     tr = db.session.get(TravelExpenseRate, rate_id)
-    if not tr or tr.user_id != current_user.id:
+    if not tr or tr.org_id != current_user.org_id:
         abort(404)
     name = tr.expense_type
     db.session.delete(tr)
@@ -1884,15 +2370,27 @@ def new_project():
 
     name = request.form.get("project_name", "").strip()
     client = request.form.get("client_name", "").strip()
+    client_email = request.form.get("client_email", "").strip()
+    request_type = request.form.get("request_type", "").strip().lower()
+    if request_type not in ("rfp", "rfq", "rom", ""):
+        request_type = ""
     due_date_raw = request.form.get("due_date", "").strip()
     if not name:
         flash("Project name is required.", "error")
         return redirect(url_for("new_project"))
 
+    ok, msg = billing_check_project(current_user.org_id)
+    if not ok:
+        flash(msg, "error")
+        return redirect(url_for("billing_page"))
+
     project = Project(
         user_id=current_user.id,
+        org_id=current_user.org_id,
         name=name,
         client_name=client,
+        client_email=client_email,
+        request_type=request_type,
     )
 
     # Optional due date (YYYY-MM-DD or YYYY-MM-DDTHH:MM)
@@ -1909,6 +2407,25 @@ def new_project():
     db.session.commit()
     _log_activity("project_create", f"Created project: {name}", project.id)
     return redirect(url_for("project_upload", project_id=project.id))
+
+
+@app.route("/projects/<project_id>/convert-to-full", methods=["POST"])
+@login_required
+def convert_rom_to_full(project_id):
+    """Promote a ROM project to a full RFP/RFQ so a firm proposal can be drafted."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    if (project.request_type or "").lower() != "rom":
+        flash("This project is not a ROM.", "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+    project.request_type = request.form.get("new_type", "rfp").strip().lower()
+    if project.request_type not in ("rfp", "rfq"):
+        project.request_type = "rfp"
+    db.session.commit()
+    _log_activity("rom_convert", f"Converted ROM to {project.request_type.upper()}", project_id)
+    flash(f"Converted to a full {project.request_type.upper()}. Regenerate to produce a firm proposal.", "success")
+    return redirect(url_for("project_upload", project_id=project_id))
 
 
 @app.route("/projects/<project_id>/set-due-date", methods=["POST"])
@@ -1979,16 +2496,16 @@ def project_upload(project_id):
     documents = ProjectDocument.query.filter_by(project_id=project_id).order_by(ProjectDocument.uploaded_at.desc()).all()
 
     # Counts for cost estimation checkboxes
-    staff_role_count = StaffRole.query.filter_by(user_id=current_user.id, is_active=True).count()
-    equipment_count = EquipmentItem.query.filter_by(user_id=current_user.id, is_active=True).count()
-    travel_rate_count = TravelExpenseRate.query.filter_by(user_id=current_user.id, is_active=True).count()
+    staff_role_count = StaffRole.query.filter_by(org_id=current_user.org_id, is_active=True).count()
+    equipment_count = EquipmentItem.query.filter_by(org_id=current_user.org_id, is_active=True).count()
+    travel_rate_count = TravelExpenseRate.query.filter_by(org_id=current_user.org_id, is_active=True).count()
 
     # Template availability for indicator
     has_user_template = UserVerticalTemplate.query.filter_by(
-        user_id=current_user.id, is_company_default=False
+        org_id=current_user.org_id, is_company_default=False
     ).first() is not None
     has_company_template = UserVerticalTemplate.query.filter_by(
-        is_company_default=True
+        is_company_default=True, org_id=current_user.org_id
     ).first() is not None
 
     latest_prop = (
@@ -2008,7 +2525,7 @@ def project_upload(project_id):
     open_clarifications = ClarificationItem.query.filter_by(project_id=project_id).filter(
         ClarificationItem.status.in_(["open", "draft", "sent", "response_received"])
     ).count()
-    proposal_users = User.query.filter(User.role.in_(["proposal", "admin"])).order_by(User.display_name).all()
+    proposal_users = _org_proposal_users()
 
     return render_template(
         "project_upload.html",
@@ -2041,48 +2558,78 @@ def project_generate(project_id):
     if not _can_access_project(project):
         abort(404)
 
+    # Plan gate (Phase 5): enforce monthly generation limits
+    allowed, limit_msg = billing_check_generation(current_user.org_id)
+    if not allowed:
+        flash(limit_msg, "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
     vertical = request.form.get("vertical", "auto")
     output_format = request.form.get("output_format", "docx")
-
     project.output_format = output_format
     db.session.commit()
 
-    # Collect all document text
+    # Validate documents exist before spending a worker
     documents = ProjectDocument.query.filter_by(project_id=project_id).all()
     rfp_docs = [d for d in documents if d.file_type in ("rfp", "supporting")]
     if not rfp_docs:
         flash("No RFP/RFQ documents uploaded yet.", "error")
         return redirect(url_for("project_upload", project_id=project_id))
 
+    cost_options = {
+        "include_staff_types": request.form.get("include_staff_types") == "1",
+        "include_staff_hours": request.form.get("include_staff_hours") == "1",
+        "include_equipment_bom": request.form.get("include_equipment_bom") == "1",
+        "include_travel_expenses": request.form.get("include_travel_expenses") == "1",
+    }
+
+    # Run the (slow) AI generation as a background job so the request returns
+    # immediately and gunicorn workers / load balancers don't time out.
+    job = jobs.enqueue(
+        "generate_proposal",
+        {
+            "project_id": project_id,
+            "vertical": vertical,
+            "output_format": output_format,
+            "cost_options": cost_options,
+        },
+        user_id=current_user.id,
+        org_id=current_user.org_id,
+    )
+    return redirect(url_for("job_status_page", job_id=job.id))
+
+
+def _perform_generation(project_id, user, vertical, output_format, cost_options, set_progress):
+    """Gather posture context and run proposal generation. Returns a dict with
+    a 'redirect' key. Runs inside a background job (no request context)."""
+    project = db.session.get(Project, project_id)
+    if not project:
+        raise RuntimeError("Project no longer exists.")
+
+    set_progress("reading", "Reading uploaded documents…")
+    documents = ProjectDocument.query.filter_by(project_id=project_id).all()
+    rfp_docs = [d for d in documents if d.file_type in ("rfp", "supporting")]
     combined_text = ""
     for doc in rfp_docs:
         try:
+            storage.ensure_local(doc.file_path)
             text = parse_document(doc.file_path)
             combined_text += f"\n\n--- Document: {doc.original_filename} ---\n\n{text}"
         except Exception:
             continue
-
     if not combined_text.strip():
-        flash("Could not extract text from the uploaded documents.", "error")
-        return redirect(url_for("project_upload", project_id=project_id))
+        raise RuntimeError("Could not extract text from the uploaded documents.")
 
-    # Read cost estimation checkbox options
-    include_staff_types = request.form.get("include_staff_types") == "1"
-    include_staff_hours = request.form.get("include_staff_hours") == "1"
-    include_equipment_bom = request.form.get("include_equipment_bom") == "1"
-    include_travel_expenses = request.form.get("include_travel_expenses") == "1"
-
-    cost_options = {
-        "include_staff_types": include_staff_types,
-        "include_staff_hours": include_staff_hours,
-        "include_equipment_bom": include_equipment_bom,
-        "include_travel_expenses": include_travel_expenses,
-    }
+    org_id = user.org_id
+    include_staff_types = cost_options.get("include_staff_types")
+    include_staff_hours = cost_options.get("include_staff_hours")
+    include_equipment_bom = cost_options.get("include_equipment_bom")
+    include_travel_expenses = cost_options.get("include_travel_expenses")
 
     # Build structured rate data from DB entries
     staff_roles_data = None
     if include_staff_types or include_staff_hours:
-        roles = StaffRole.query.filter_by(user_id=current_user.id, is_active=True).all()
+        roles = StaffRole.query.filter_by(org_id=org_id, is_active=True).all()
         if roles:
             staff_roles_data = [
                 {
@@ -2097,7 +2644,7 @@ def project_generate(project_id):
 
     equipment_data = None
     if include_equipment_bom:
-        items = EquipmentItem.query.filter_by(user_id=current_user.id, is_active=True).all()
+        items = EquipmentItem.query.filter_by(org_id=org_id, is_active=True).all()
         if items:
             equipment_data = [
                 {
@@ -2114,7 +2661,7 @@ def project_generate(project_id):
 
     travel_data = None
     if include_travel_expenses:
-        rates = TravelExpenseRate.query.filter_by(user_id=current_user.id, is_active=True).all()
+        rates = TravelExpenseRate.query.filter_by(org_id=org_id, is_active=True).all()
         if rates:
             travel_data = [
                 {
@@ -2128,7 +2675,7 @@ def project_generate(project_id):
 
     # Load user rate sheets (Excel uploads)
     rate_sheet_data = None
-    active_sheets = UserRateSheet.query.filter_by(user_id=current_user.id, is_active=True).all()
+    active_sheets = UserRateSheet.query.filter_by(org_id=org_id, is_active=True).all()
     if active_sheets:
         rate_sheet_data = {}
         for sheet in active_sheets:
@@ -2140,7 +2687,7 @@ def project_generate(project_id):
     # Auto-select templates: user custom first, then company defaults as fallback
     user_templates = None
     user_tmpls = UserVerticalTemplate.query.filter_by(
-        user_id=current_user.id, vertical=vertical, is_company_default=False
+        org_id=org_id, vertical=vertical, is_company_default=False
     ).all()
     if user_tmpls:
         user_templates = {}
@@ -2152,7 +2699,7 @@ def project_generate(project_id):
 
     # Fall back to company defaults for any missing template types
     co_tmpls = UserVerticalTemplate.query.filter_by(
-        vertical=vertical, is_company_default=True
+        vertical=vertical, is_company_default=True, org_id=org_id
     ).all()
     if co_tmpls:
         user_templates = user_templates or {}
@@ -2165,7 +2712,7 @@ def project_generate(project_id):
 
     # Load past corrections for AI learning
     past_corrections = ProposalCorrection.query.filter_by(
-        user_id=current_user.id
+        org_id=org_id
     ).order_by(ProposalCorrection.created_at.desc()).limit(10).all()
 
     corrections_data = None
@@ -2182,7 +2729,7 @@ def project_generate(project_id):
         ]
 
     # Load company standards for auto-injection
-    standards = CompanyStandard.query.filter_by(user_id=current_user.id, is_active=True).all()
+    standards = CompanyStandard.query.filter_by(org_id=org_id, is_active=True).all()
     company_standards_data = None
     if standards:
         company_standards_data = [
@@ -2202,138 +2749,176 @@ def project_generate(project_id):
             if vertical == "auto" and scope.vertical:
                 vertical = scope.vertical
 
-    try:
-        result = generate_proposal(
-            combined_text,
-            vertical=vertical,
-            rate_sheet_data=rate_sheet_data,
-            user_templates=user_templates,
-            company_name=current_user.company_name,
-            user_api_key=current_user.api_key_encrypted or None,
-            user_model=current_user.llm_model or None,
-            cost_options=cost_options,
-            staff_roles_data=staff_roles_data,
-            equipment_data=equipment_data,
-            travel_data=travel_data,
-            past_corrections=corrections_data,
-            company_standards=company_standards_data,
-            approved_scope=approved_scope_items,
-        )
+    set_progress("drafting", "Claude is drafting your proposal…")
+    result = generate_proposal(
+        combined_text,
+        vertical=vertical,
+        rate_sheet_data=rate_sheet_data,
+        user_templates=user_templates,
+        company_name=user.company_name,
+        user_api_key=decrypt_api_key(user.api_key_encrypted) or None,
+        user_model=user.llm_model or None,
+        cost_options=cost_options,
+        staff_roles_data=staff_roles_data,
+        equipment_data=equipment_data,
+        travel_data=travel_data,
+        past_corrections=corrections_data,
+        company_standards=company_standards_data,
+        approved_scope=approved_scope_items,
+        request_type=project.request_type or "",
+    )
 
-        # Check if the agent has questions
-        if result.get("questions"):
-            for q in result["questions"]:
-                pq = ProposalQuestion(
-                    project_id=project_id,
-                    question=q["question"],
-                    context=q.get("context", ""),
-                    status="pending",
-                    resolution_path=q.get("resolution_path", "internal"),
-                )
-                db.session.add(pq)
+    billing_record_generation(org_id)
 
-                # Also create ClarificationItem entries for tracking
-                ci = ClarificationItem(
-                    project_id=project_id,
-                    source="ai_detected",
-                    resolution_path=q.get("resolution_path", "internal"),
-                    category=q.get("category", "general"),
-                    question=q["question"],
-                    context=q.get("context", ""),
-                    ai_suggestion=q.get("ai_suggestion", ""),
-                    status="open",
-                    created_by=current_user.id,
-                )
-                db.session.add(ci)
-
-            # Update project sub-status
-            project.clarification_sub_status = "clarification_pending"
-            db.session.commit()
-            _log_activity("proposal_questions", f"{len(result['questions'])} clarification question(s)", project_id)
-            return redirect(url_for("project_questions", project_id=project_id))
-
-        # Save outputs
-        job_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
-        md_filename = f"proposal_{job_id}.md"
-        md_path = GENERATED_DIR / md_filename
-        md_path.write_text(result["proposal_markdown"], encoding="utf-8")
-
-        docx_filename = f"proposal_{job_id}.docx"
-        docx_path = GENERATED_DIR / docx_filename
-        _brand_user = project.owner or current_user
-        markdown_to_docx(
-            result["proposal_markdown"],
-            str(docx_path),
-            **_logo_docx_kwargs(_brand_user),
-        )
-
-        pdf_filename = ""
-        # PDF generation could be added here if needed
-
-        project.vertical = result["vertical"]
-        project.vertical_label = result["vertical_label"]
-
-        proposal = Proposal(
-            project_id=project_id,
-            job_id=job_id,
-            document_type=result["document_type"],
-            vertical=result["vertical"],
-            vertical_label=result["vertical_label"],
-            confidence_score=result["confidence_score"],
-            action_items_count=len(result["action_items"]),
-            md_file=md_filename,
-            docx_file=docx_filename,
-            pdf_file=pdf_filename,
-            review_status="draft",
-        )
-        db.session.add(proposal)
-        db.session.flush()  # Get proposal.id before commit
-
-        # Record the initial "draft" state in status history
-        db.session.add(ProposalStatusHistory(
-            proposal_id=proposal.id,
-            from_status="",
-            to_status="draft",
-            actor_id=current_user.id,
-            note="AI-generated v1.",
-        ))
-
-        # Save version 1 (AI-generated original)
-        v1 = ProposalVersion(
-            proposal_id=proposal.id,
-            version_number=1,
-            markdown_content=result["proposal_markdown"],
-            edit_source="ai",
-            change_summary="AI-generated original",
-        )
-        db.session.add(v1)
+    # If the agent needs clarification, record questions and stop here
+    if result.get("questions"):
+        set_progress("questions", "Clarification questions detected…")
+        for q in result["questions"]:
+            db.session.add(ProposalQuestion(
+                project_id=project_id,
+                question=q["question"],
+                context=q.get("context", ""),
+                status="pending",
+                resolution_path=q.get("resolution_path", "internal"),
+            ))
+            db.session.add(ClarificationItem(
+                project_id=project_id,
+                source="ai_detected",
+                resolution_path=q.get("resolution_path", "internal"),
+                category=q.get("category", "general"),
+                question=q["question"],
+                context=q.get("context", ""),
+                ai_suggestion=q.get("ai_suggestion", ""),
+                status="open",
+                created_by=user.id,
+            ))
+        project.clarification_sub_status = "clarification_pending"
         db.session.commit()
-        _log_activity("proposal_generate", f"Generated {result['vertical_label']} proposal", project_id)
-        # Notify sales users when proposals are generated
-        _notify_role(
-            "sales", "proposal_generated",
-            f"Proposal generated: {project.name}",
-            f"{current_user.display_name or current_user.username} generated a {result['vertical_label']} proposal for '{project.name}'.",
+        _log_activity_for(user, "proposal_questions",
+                          f"{len(result['questions'])} clarification question(s)", project_id)
+        return {"redirect": url_for("project_questions", project_id=project_id)}
+
+    set_progress("saving", "Formatting and saving your proposal…")
+    job_slug = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
+    md_filename = f"proposal_{job_slug}.md"
+    md_path = GENERATED_DIR / md_filename
+    md_path.write_text(result["proposal_markdown"], encoding="utf-8")
+    storage.sync_up(md_path)
+
+    docx_filename = f"proposal_{job_slug}.docx"
+    docx_path = GENERATED_DIR / docx_filename
+    _brand_user = project.owner or user
+    markdown_to_docx(
+        result["proposal_markdown"],
+        str(docx_path),
+        **_logo_docx_kwargs(_brand_user),
+    )
+    storage.sync_up(docx_path)
+
+    project.vertical = result["vertical"]
+    project.vertical_label = result["vertical_label"]
+
+    doc_type = "ROM" if (project.request_type or "").lower() == "rom" else result["document_type"]
+    proposal = Proposal(
+        project_id=project_id,
+        job_id=job_slug,
+        document_type=doc_type,
+        vertical=result["vertical"],
+        vertical_label=result["vertical_label"],
+        confidence_score=result["confidence_score"],
+        action_items_count=len(result["action_items"]),
+        md_file=md_filename,
+        docx_file=docx_filename,
+        pdf_file="",
+        review_status="draft",
+    )
+    db.session.add(proposal)
+    db.session.flush()
+
+    db.session.add(ProposalStatusHistory(
+        proposal_id=proposal.id,
+        from_status="",
+        to_status="draft",
+        actor_id=user.id,
+        note="AI-generated v1.",
+    ))
+    db.session.add(ProposalVersion(
+        proposal_id=proposal.id,
+        version_number=1,
+        markdown_content=result["proposal_markdown"],
+        edit_source="ai",
+        change_summary="AI-generated original",
+    ))
+    db.session.commit()
+    _log_activity_for(user, "proposal_generate",
+                      f"Generated {result['vertical_label']} proposal", project_id)
+    _notify_role_org(
+        org_id, "sales", "proposal_generated",
+        f"Proposal generated: {project.name}",
+        f"{user.display_name or user.username} generated a {result['vertical_label']} proposal for '{project.name}'.",
+        link=f"/proposal/{proposal.id}",
+        exclude_user_id=user.id,
+    )
+    if project.user_id != user.id:
+        _notify(
+            project.user_id, "proposal_generated",
+            f"Proposal generated for your project: {project.name}",
+            f"{user.display_name or user.username} generated a proposal for '{project.name}'.",
             link=f"/proposal/{proposal.id}",
-            exclude_user_id=current_user.id,
         )
-        # Also notify the project owner if different from generator
-        if project.user_id != current_user.id:
-            _notify(
-                project.user_id, "proposal_generated",
-                f"Proposal generated for your project: {project.name}",
-                f"{current_user.display_name or current_user.username} generated a proposal for '{project.name}'.",
-                link=f"/proposal/{proposal.id}",
-            )
+    _notify_via_integrations(
+        org_id,
+        f"\U0001F4C4 Proposal generated for *{project.name}* ({result['vertical_label']}).",
+        event="proposal_generated",
+        payload={"project": project.name, "proposal_id": proposal.id},
+    )
+    return {"redirect": url_for("view_proposal", proposal_id=proposal.id)}
 
-        return redirect(url_for("view_proposal", proposal_id=proposal.id))
 
-    except RuntimeError as e:
-        flash(str(e), "error")
-        return redirect(url_for("project_upload", project_id=project_id))
-    except Exception as e:
-        flash(f"Proposal generation failed: {friendly_api_error(e)}", "error")
-        return redirect(url_for("project_upload", project_id=project_id))
+# ---------------------------------------------------------------------------
+# Background job handlers + progress page
+# ---------------------------------------------------------------------------
+
+@jobs.register("generate_proposal")
+def _job_generate_proposal(payload, job):
+    user = db.session.get(User, job.user_id)
+    def _sp(phase, message=""):
+        jobs.set_progress(job, phase, message)
+    return _perform_generation(
+        payload["project_id"], user, payload["vertical"],
+        payload["output_format"], payload["cost_options"], _sp,
+    )
+
+
+@app.route("/jobs/<job_id>")
+@login_required
+def job_status_page(job_id):
+    job = db.session.get(BackgroundJob, job_id)
+    if not job or job.user_id != current_user.id:
+        abort(404)
+    return render_template("job_status.html", job=job)
+
+
+@app.route("/jobs/<job_id>/status.json")
+@login_required
+def job_status_json(job_id):
+    job = db.session.get(BackgroundJob, job_id)
+    if not job or job.user_id != current_user.id:
+        abort(404)
+    data = {
+        "id": job.id,
+        "status": job.status,
+        "phase": job.phase,
+        "message": job.message,
+        "error": job.error,
+    }
+    if job.status == "done":
+        try:
+            result = json.loads(job.result or "{}")
+        except ValueError:
+            result = {}
+        data["redirect"] = result.get("redirect", url_for("dashboard"))
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -2410,7 +2995,7 @@ def generate_scope(project_id):
             combined_text,
             vertical=vertical,
             company_name=current_user.company_name,
-            user_api_key=current_user.api_key_encrypted or None,
+            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
             user_model=current_user.llm_model or None,
         )
     except RuntimeError as e:
@@ -2679,6 +3264,14 @@ def update_project_status(project_id):
     dollar_amount = request.form.get("dollar_amount")
 
     prev_status = project.status
+
+    # Require a win/loss reason category when closing a deal (retrospective quality)
+    if new_status in ("won", "lost") and prev_status not in ("won", "lost"):
+        close_category = request.form.get("close_category", "").strip()
+        if not close_category:
+            flash("Please select a win/loss reason category before closing this deal.", "error")
+            return redirect(request.referrer or url_for("dashboard"))
+
     project.status = new_status
     if dollar_amount:
         try:
@@ -2705,6 +3298,16 @@ def update_project_status(project_id):
 
     db.session.commit()
     _log_activity("project_status_update", f"Status → {new_status}", project_id)
+    if new_status in ("won", "lost") and prev_status not in ("won", "lost"):
+        emoji = "\U0001F3C6" if new_status == "won" else "\U0001F4C9"
+        _notify_via_integrations(
+            project.org_id,
+            f"{emoji} *{project.name}* marked **{new_status.upper()}**"
+            + (f" (${project.dollar_amount:,.0f})" if project.dollar_amount else ""),
+            event=f"project_{new_status}",
+            payload={"project": project.name, "value": project.dollar_amount,
+                     "category": project.close_category},
+        )
     flash(f"Project status updated to {new_status}.", "success")
     return redirect(request.referrer or url_for("dashboard"))
 
@@ -2816,6 +3419,10 @@ def view_proposal(proposal_id):
 
     phases = compute_phases(project, proposal)
 
+    # Customer share (Phase 3)
+    share = _active_share(proposal_id)
+    share_url = url_for("customer_portal", token=share.token, _external=True) if share else ""
+
     return render_template(
         "proposal.html",
         meta=meta,
@@ -2836,6 +3443,8 @@ def view_proposal(proposal_id):
         versions=versions,
         view_mode=view_mode,
         redline_available=redline_available,
+        share=share,
+        share_url=share_url,
     )
 
 
@@ -2848,7 +3457,7 @@ def download(proposal_id, fmt):
         return redirect(url_for("dashboard"))
 
     project = db.session.get(Project, proposal.project_id)
-    if not project or (project.user_id != current_user.id and not current_user.is_admin):
+    if not _can_access_project(project):
         abort(404)
 
     if fmt == "docx":
@@ -2857,11 +3466,315 @@ def download(proposal_id, fmt):
     elif fmt == "md":
         file_path = GENERATED_DIR / proposal.md_file
         mimetype = "text/markdown"
+    elif fmt == "pdf":
+        try:
+            file_path = _ensure_proposal_pdf(proposal, project)
+        except Exception as e:
+            flash(f"Could not generate PDF: {e}", "error")
+            return redirect(url_for("view_proposal", proposal_id=proposal_id))
+        mimetype = "application/pdf"
     else:
         flash("Invalid format.", "error")
         return redirect(url_for("view_proposal", proposal_id=proposal_id))
 
-    return send_file(str(file_path), mimetype=mimetype, as_attachment=True, download_name=file_path.name)
+    return _send_stored_file(file_path, mimetype=mimetype, as_attachment=True, download_name=file_path.name)
+
+
+def _ensure_proposal_pdf(proposal, project):
+    """Generate (or regenerate) the proposal PDF from its latest markdown and
+    return the local path. Branding uses the project owner's logo/company."""
+    latest = latest_version(proposal.id)
+    md_text = latest.markdown_content if latest else ""
+    if not md_text:
+        storage.ensure_local(GENERATED_DIR / proposal.md_file)
+        md_path = GENERATED_DIR / proposal.md_file
+        md_text = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+
+    owner = project.owner or db.session.get(User, project.user_id)
+    pdf_filename = proposal.pdf_file or f"proposal_{proposal.job_id}.pdf"
+    pdf_path = GENERATED_DIR / pdf_filename
+
+    logo_path = None
+    company_name = ""
+    if owner:
+        company_name = owner.company_name or ""
+        if (owner.company_logo_path and getattr(owner, "company_logo_use_in_proposals", False)
+                and Path(owner.company_logo_path).exists()):
+            logo_path = owner.company_logo_path
+
+    markdown_to_pdf(md_text, str(pdf_path), logo_path=logo_path, company_name=company_name)
+    storage.sync_up(pdf_path)
+    if proposal.pdf_file != pdf_filename:
+        proposal.pdf_file = pdf_filename
+        db.session.commit()
+    return pdf_path
+
+
+# ---------------------------------------------------------------------------
+# Structured pricing estimate (Phase 4)
+# ---------------------------------------------------------------------------
+
+def _estimate_totals(estimate):
+    """Compute subtotal by kind, markup, and grand total for an estimate."""
+    items = estimate.items.order_by(EstimateLineItem.kind, EstimateLineItem.sort_order).all()
+    by_kind = {}
+    subtotal = 0.0
+    for it in items:
+        t = it.total
+        by_kind[it.kind] = by_kind.get(it.kind, 0.0) + t
+        subtotal += t
+    markup = subtotal * (estimate.markup_pct or 0) / 100.0
+    return {
+        "items": items,
+        "by_kind": by_kind,
+        "subtotal": subtotal,
+        "markup": markup,
+        "grand_total": subtotal + markup,
+    }
+
+
+@app.route("/proposal/<proposal_id>/estimate", methods=["GET"])
+@login_required
+def proposal_estimate(proposal_id):
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    estimate = ProposalEstimate.query.filter_by(proposal_id=proposal_id).first()
+    totals = _estimate_totals(estimate) if estimate else None
+    return render_template(
+        "proposal_estimate.html",
+        proposal=proposal, project=project,
+        estimate=estimate, totals=totals,
+    )
+
+
+@app.route("/proposal/<proposal_id>/estimate/draft", methods=["POST"])
+@login_required
+def draft_proposal_estimate(proposal_id):
+    """AI-draft a structured estimate from the RFP + the org's rates."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    org_id = current_user.org_id
+    staff = [{"role_name": r.role_name, "category": r.category, "hourly_rate": r.hourly_rate,
+              "overtime_rate": r.overtime_rate}
+             for r in StaffRole.query.filter_by(org_id=org_id, is_active=True).all()]
+    equip = [{"item_name": e.item_name, "category": e.category, "unit_cost": e.unit_cost, "unit": e.unit}
+             for e in EquipmentItem.query.filter_by(org_id=org_id, is_active=True).all()]
+    travel = [{"expense_type": t.expense_type, "rate": t.rate, "unit": t.unit}
+              for t in TravelExpenseRate.query.filter_by(org_id=org_id, is_active=True).all()]
+
+    scope_items = None
+    scope = ProjectScope.query.filter_by(project_id=project.id).first()
+    if scope:
+        scope_items = [i.item_text for i in ScopeItem.query.filter_by(
+            scope_id=scope.id, status="included").all()]
+
+    rfp_text = _project_rfp_text(project.id)
+    try:
+        result = draft_estimate(
+            rfp_text, staff_roles=staff, equipment=equip, travel=travel,
+            approved_scope=scope_items,
+            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
+            user_model=current_user.llm_model or None,
+        )
+    except RuntimeError as e:
+        flash(str(e), "error")
+        return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
+    except Exception as e:
+        flash(f"Estimate drafting failed: {friendly_api_error(e)}", "error")
+        return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
+
+    existing = ProposalEstimate.query.filter_by(proposal_id=proposal_id).first()
+    if existing:
+        db.session.delete(existing)
+        db.session.flush()
+    estimate = ProposalEstimate(
+        proposal_id=proposal_id, project_id=project.id, org_id=org_id,
+        currency=result.get("currency", "USD"),
+    )
+    db.session.add(estimate)
+    db.session.flush()
+    for idx, it in enumerate(result["items"]):
+        db.session.add(EstimateLineItem(
+            estimate_id=estimate.id, kind=it["kind"], description=it["description"],
+            quantity=it["quantity"], unit=it["unit"], unit_cost=it["unit_cost"], sort_order=idx,
+        ))
+    db.session.commit()
+    _log_activity("estimate_draft", f"AI drafted {len(result['items'])} estimate line(s)", project.id)
+    flash(f"AI drafted {len(result['items'])} line item(s). Review and adjust below.", "success")
+    return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
+
+
+@app.route("/proposal/<proposal_id>/estimate/save", methods=["POST"])
+@login_required
+def save_proposal_estimate(proposal_id):
+    """Persist grid edits: line items (add/edit/delete) + markup."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    estimate = ProposalEstimate.query.filter_by(proposal_id=proposal_id).first()
+    if not estimate:
+        estimate = ProposalEstimate(proposal_id=proposal_id, project_id=project.id, org_id=current_user.org_id)
+        db.session.add(estimate)
+        db.session.flush()
+
+    try:
+        estimate.markup_pct = float(request.form.get("markup_pct", estimate.markup_pct) or 0)
+    except ValueError:
+        pass
+    estimate.currency = (request.form.get("currency", estimate.currency) or "USD")[:10]
+
+    EstimateLineItem.query.filter_by(estimate_id=estimate.id).delete()
+    kinds = request.form.getlist("kind")
+    descs = request.form.getlist("description")
+    qtys = request.form.getlist("quantity")
+    units = request.form.getlist("unit")
+    costs = request.form.getlist("unit_cost")
+    for idx in range(len(descs)):
+        desc = (descs[idx] or "").strip()
+        if not desc:
+            continue
+        kind = (kinds[idx] if idx < len(kinds) else "other").lower()
+        if kind not in ("labor", "equipment", "travel", "other"):
+            kind = "other"
+        def _num(lst, i):
+            try:
+                return float((lst[i] if i < len(lst) else "0").replace(",", "").replace("$", "") or 0)
+            except ValueError:
+                return 0.0
+        db.session.add(EstimateLineItem(
+            estimate_id=estimate.id, kind=kind, description=desc[:400],
+            quantity=_num(qtys, idx), unit=(units[idx] if idx < len(units) else "")[:40],
+            unit_cost=_num(costs, idx), sort_order=idx,
+        ))
+    db.session.commit()
+    _log_activity("estimate_save", "Saved structured estimate", project.id)
+    flash("Estimate saved.", "success")
+    return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
+
+
+def _estimate_markdown(estimate) -> str:
+    """Render an estimate as a Markdown Pricing section."""
+    totals = _estimate_totals(estimate)
+    cur = estimate.currency or "USD"
+    sym = "$" if cur == "USD" else ""
+    lines = ["## Pricing", ""]
+    kind_labels = {"labor": "Labor", "equipment": "Equipment & Materials",
+                   "travel": "Travel & Expenses", "other": "Other"}
+    for kind in ("labor", "equipment", "travel", "other"):
+        rows = [it for it in totals["items"] if it.kind == kind]
+        if not rows:
+            continue
+        lines.append(f"### {kind_labels[kind]}")
+        lines.append("")
+        lines.append("| Item | Qty | Unit | Unit Cost | Total |")
+        lines.append("|------|-----|------|-----------|-------|")
+        for it in rows:
+            lines.append(f"| {it.description} | {it.quantity:g} | {it.unit} | "
+                         f"{sym}{it.unit_cost:,.2f} | {sym}{it.total:,.2f} |")
+        lines.append(f"| **{kind_labels[kind]} subtotal** | | | | **{sym}{totals['by_kind'][kind]:,.2f}** |")
+        lines.append("")
+    lines.append("### Total")
+    lines.append("")
+    lines.append("| | Amount |")
+    lines.append("|--|--------|")
+    lines.append(f"| Subtotal | {sym}{totals['subtotal']:,.2f} |")
+    if estimate.markup_pct:
+        lines.append(f"| Markup ({estimate.markup_pct:g}%) | {sym}{totals['markup']:,.2f} |")
+    lines.append(f"| **Total Estimated Cost** | **{sym}{totals['grand_total']:,.2f}** |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+@app.route("/proposal/<proposal_id>/estimate/export.csv")
+@login_required
+def export_estimate_csv(proposal_id):
+    import csv
+    import io
+    from flask import Response
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+    estimate = ProposalEstimate.query.filter_by(proposal_id=proposal_id).first()
+    if not estimate:
+        flash("No estimate to export.", "error")
+        return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
+    totals = _estimate_totals(estimate)
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["Kind", "Description", "Quantity", "Unit", "Unit Cost", "Total"])
+    for it in totals["items"]:
+        w.writerow([it.kind, it.description, it.quantity, it.unit, f"{it.unit_cost:.2f}", f"{it.total:.2f}"])
+    w.writerow([])
+    w.writerow(["", "", "", "", "Subtotal", f"{totals['subtotal']:.2f}"])
+    w.writerow(["", "", "", "", f"Markup {estimate.markup_pct:g}%", f"{totals['markup']:.2f}"])
+    w.writerow(["", "", "", "", "Grand Total", f"{totals['grand_total']:.2f}"])
+    out.seek(0)
+    return Response(out.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename=estimate_{proposal.job_id}.csv"})
+
+
+@app.route("/proposal/<proposal_id>/estimate/insert", methods=["POST"])
+@login_required
+def insert_estimate_into_proposal(proposal_id):
+    """Insert/replace the proposal's Pricing section from the structured estimate,
+    saving a new version."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+    estimate = ProposalEstimate.query.filter_by(proposal_id=proposal_id).first()
+    if not estimate or not estimate.items.count():
+        flash("Add estimate line items first.", "error")
+        return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
+
+    version = latest_version(proposal_id)
+    current_md = version.markdown_content if version else ""
+    pricing_md = _estimate_markdown(estimate)
+
+    if re.search(r"^##\s+Pricing\s*$", current_md, re.MULTILINE):
+        updated_md = re.sub(r"##\s+Pricing.*?(?=\n##\s|\Z)", pricing_md + "\n", current_md,
+                            count=1, flags=re.DOTALL)
+    else:
+        updated_md = current_md.rstrip() + "\n\n" + pricing_md
+
+    next_version = (version.version_number + 1) if version else 1
+    db.session.add(ProposalVersion(
+        proposal_id=proposal_id, version_number=next_version, markdown_content=updated_md,
+        edit_source="human_web", editor_id=current_user.id,
+        change_summary="Inserted structured pricing estimate",
+    ))
+    md_path = GENERATED_DIR / proposal.md_file
+    md_path.write_text(updated_md, encoding="utf-8")
+    storage.sync_up(md_path)
+    if proposal.docx_file:
+        docx_path = GENERATED_DIR / proposal.docx_file
+        _brand_user = project.owner or current_user
+        markdown_to_docx(updated_md, str(docx_path), **_logo_docx_kwargs(_brand_user))
+        storage.sync_up(docx_path)
+    project.dollar_amount = _estimate_totals(estimate)["grand_total"]
+    db.session.commit()
+    _log_activity("estimate_insert", f"Inserted pricing into proposal v{next_version}", project.id)
+    flash(f"Pricing inserted as v{next_version}.", "success")
+    return redirect(url_for("view_proposal", proposal_id=proposal_id))
 
 
 # ---------------------------------------------------------------------------
@@ -2875,7 +3788,7 @@ def edit_proposal(proposal_id):
     if not proposal:
         abort(404)
     project = db.session.get(Project, proposal.project_id)
-    if not project or (project.user_id != current_user.id and not current_user.is_admin):
+    if not _can_access_project(project):
         abort(404)
 
     if request.method == "POST":
@@ -2944,6 +3857,69 @@ def edit_proposal(proposal_id):
     )
 
 
+@app.route("/proposal/<proposal_id>/preview", methods=["POST"])
+@login_required
+def preview_markdown(proposal_id):
+    """Render posted markdown to HTML for the live editor preview pane."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+    data = request.get_json(silent=True) or {}
+    content = data.get("markdown", "")
+    html = md.markdown(content, extensions=["tables", "fenced_code"])
+    return {"html": html}
+
+
+@app.route("/proposal/<proposal_id>/ai-assist", methods=["POST"])
+@login_required
+def ai_assist(proposal_id):
+    """Rewrite a selected passage with a quick instruction (tighten, formalize,
+    expand). Returns {"result": text}. Used inline from the editor."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text", "") or "").strip()
+    action = (data.get("action", "") or "").strip().lower()
+    if not text:
+        return {"error": "Select some text first."}, 400
+
+    instructions = {
+        "tighten": "Rewrite this passage to be more concise and punchy without losing meaning.",
+        "formal": "Rewrite this passage in a more formal, professional business tone.",
+        "expand": "Expand this passage with more specific, persuasive detail. Do not invent facts, pricing, names, or certifications — use [ACTION REQUIRED: ...] for anything unknown.",
+        "grammar": "Fix grammar, spelling, and punctuation in this passage. Keep the meaning and tone.",
+    }
+    instr = instructions.get(action, instructions["tighten"])
+
+    api_key = decrypt_api_key(current_user.api_key_encrypted) or None
+    from config.settings import ANTHROPIC_API_KEY as _GK
+    key = api_key or _GK
+    if not key:
+        return {"error": "No API key configured. Add one in Settings."}, 400
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=key, timeout=45, max_retries=1)
+        resp = client.messages.create(
+            model=current_user.llm_model or "claude-opus-4-6",
+            max_tokens=1500,
+            system=("You are a proposal editor. Return ONLY the rewritten passage in "
+                    "Markdown — no preamble, no explanation, no code fences."),
+            messages=[{"role": "user", "content": f"{instr}\n\n---PASSAGE---\n{text[:6000]}"}],
+        )
+        out = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+        return {"result": out or text}
+    except Exception as e:
+        return {"error": friendly_api_error(e)}, 500
+
+
 @app.route("/proposal/<proposal_id>/version/<version_id>")
 @login_required
 def view_version(proposal_id, version_id):
@@ -2951,7 +3927,7 @@ def view_version(proposal_id, version_id):
     if not proposal:
         abort(404)
     project = db.session.get(Project, proposal.project_id)
-    if not project or (project.user_id != current_user.id and not current_user.is_admin):
+    if not _can_access_project(project):
         abort(404)
 
     version = db.session.get(ProposalVersion, version_id)
@@ -2976,7 +3952,7 @@ def restore_version(proposal_id, version_id):
     if not proposal:
         abort(404)
     project = db.session.get(Project, proposal.project_id)
-    if not project or (project.user_id != current_user.id and not current_user.is_admin):
+    if not _can_access_project(project):
         abort(404)
 
     version = db.session.get(ProposalVersion, version_id)
@@ -3027,7 +4003,7 @@ def download_redline(proposal_id):
     if not proposal:
         abort(404)
     project = db.session.get(Project, proposal.project_id)
-    if not project or (project.user_id != current_user.id and not current_user.is_admin):
+    if not _can_access_project(project):
         abort(404)
 
     # Get the AI original (v1) and latest version
@@ -3072,7 +4048,7 @@ def finalize_proposal(proposal_id):
     if not proposal:
         abort(404)
     project = db.session.get(Project, proposal.project_id)
-    if not project or (project.user_id != current_user.id and not current_user.is_admin):
+    if not _can_access_project(project):
         abort(404)
 
     # Get AI original (v1) and latest human version
@@ -3102,6 +4078,7 @@ def finalize_proposal(proposal_id):
 
                 correction = ProposalCorrection(
                     user_id=current_user.id,
+                    org_id=current_user.org_id,
                     proposal_id=proposal_id,
                     vertical=proposal.vertical,
                     correction_summary="; ".join(summary_parts),
@@ -3218,7 +4195,7 @@ def send_for_review(proposal_id):
     project = db.session.get(Project, proposal.project_id)
 
     if request.method == "GET":
-        all_users = User.query.order_by(User.display_name).all()
+        all_users = _org_users_query().order_by(User.display_name).all()
         existing_reviewers = ProposalReviewer.query.filter_by(proposal_id=proposal_id).all()
         return render_template(
             "proposal_send_review.html",
@@ -3343,7 +4320,7 @@ def proposal_review_page(proposal_id):
     ).order_by(RevisionRequest.created_at.desc()).all()
 
     # Templates I can apply
-    templates = RevisionTemplate.query.filter_by(user_id=current_user.id).order_by(
+    templates = RevisionTemplate.query.filter_by(org_id=current_user.org_id).order_by(
         RevisionTemplate.category, RevisionTemplate.name
     ).all()
 
@@ -3606,13 +4583,13 @@ def apply_feedback(proposal_id):
     # Load supporting context
     owner = _proposal_owner(proposal)
     owner_id = owner.id if owner else current_user.id
-    standards = CompanyStandard.query.filter_by(user_id=owner_id, is_active=True).all()
+    standards = CompanyStandard.query.filter_by(org_id=_owner_org_id(project), is_active=True).all()
     standards_data = [
         {"category": s.category, "title": s.title, "content": s.content}
         for s in standards
     ] if standards else None
 
-    corrections = ProposalCorrection.query.filter_by(user_id=owner_id).order_by(
+    corrections = ProposalCorrection.query.filter_by(org_id=_owner_org_id(project)).order_by(
         ProposalCorrection.created_at.desc()
     ).limit(10).all()
     corrections_data = [
@@ -3632,7 +4609,7 @@ def apply_feedback(proposal_id):
             revision_requests=ai_payload,
             vertical=proposal.vertical,
             company_name=current_user.company_name,
-            user_api_key=current_user.api_key_encrypted or None,
+            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
             user_model=current_user.llm_model or None,
             company_standards=standards_data,
             past_corrections=corrections_data,
@@ -3751,6 +4728,275 @@ def submit_to_customer(proposal_id):
     return redirect(url_for("view_proposal", proposal_id=proposal_id))
 
 
+# ---------------------------------------------------------------------------
+# Customer share portal (Phase 3)
+# ---------------------------------------------------------------------------
+
+def _active_share(proposal_id):
+    return (
+        ProposalShare.query.filter_by(proposal_id=proposal_id)
+        .filter(ProposalShare.revoked_at.is_(None))
+        .order_by(ProposalShare.created_at.desc())
+        .first()
+    )
+
+
+@app.route("/proposal/<proposal_id>/share", methods=["POST"])
+@login_required
+def create_share(proposal_id):
+    """Create (or refresh) a customer share link, optionally emailing it with
+    the PDF attached. Also advances the lifecycle to submitted_to_customer."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal or not _is_proposal_owner(proposal):
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+
+    customer_email = request.form.get("customer_email", "").strip()
+    allow_comments = request.form.get("allow_comments", "1") == "1"
+    allow_decision = request.form.get("allow_decision", "1") == "1"
+    send_email_flag = request.form.get("send_email") == "1"
+
+    if customer_email:
+        project.client_email = customer_email
+
+    version = latest_version(proposal_id)
+
+    # Reuse an existing active share or create a new one
+    share = _active_share(proposal_id)
+    if not share:
+        share = ProposalShare(
+            proposal_id=proposal_id,
+            project_id=project.id,
+            created_by=current_user.id,
+        )
+        db.session.add(share)
+    share.customer_email = customer_email or share.customer_email
+    share.allow_comments = allow_comments
+    share.allow_decision = allow_decision
+    share.version_number = version.version_number if version else 0
+    db.session.flush()
+
+    # Advance lifecycle if we're at the internally-approved gate
+    if proposal.review_status == "internally_approved":
+        try:
+            lifecycle_transition(proposal, "submitted_to_customer", current_user.id,
+                                 note="Shared with customer via portal link.")
+        except LifecycleError:
+            pass
+
+    share_url = url_for("customer_portal", token=share.token, _external=True)
+
+    emailed = False
+    if send_email_flag and customer_email:
+        try:
+            pdf_path = _ensure_proposal_pdf(proposal, project)
+        except Exception:
+            pdf_path = None
+        import mailer
+        body = (
+            f"Hello,\n\n{current_user.company_name or 'We'} have prepared a proposal for "
+            f"{project.name}. You can review it online here:\n\n{share_url}\n\n"
+        )
+        if share.allow_decision:
+            body += "You can accept, decline, or leave comments directly on that page.\n\n"
+        body += f"Thank you,\n{current_user.display_name or current_user.username}"
+        attachments = [str(pdf_path)] if pdf_path else None
+        emailed = mailer.send_email(
+            to=customer_email,
+            subject=f"Proposal for {project.name}",
+            body=body,
+            attachments=attachments,
+        )
+
+    db.session.commit()
+    _log_activity("proposal_share", f"Created customer share for '{project.name}'", project.id)
+    if emailed:
+        flash(f"Proposal emailed to {customer_email}. Share link is also on this page.", "success")
+    else:
+        flash(f"Share link ready: {share_url}", "success")
+    return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
+
+@app.route("/proposal/<proposal_id>/share/revoke", methods=["POST"])
+@login_required
+def revoke_share(proposal_id):
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal or not _is_proposal_owner(proposal):
+        abort(404)
+    share = _active_share(proposal_id)
+    if share:
+        share.revoked_at = datetime.now(timezone.utc)
+        db.session.commit()
+        flash("Customer share link revoked.", "success")
+    return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
+
+def _valid_share(token):
+    share = ProposalShare.query.filter_by(token=token).first()
+    if not share or share.revoked_at:
+        return None
+    if share.expires_at:
+        exp = share.expires_at.replace(tzinfo=None) if share.expires_at.tzinfo else share.expires_at
+        if exp < datetime.utcnow():
+            return None
+    return share
+
+
+@app.route("/p/<token>")
+def customer_portal(token):
+    """Public, read-only branded proposal view for a customer. No login."""
+    share = _valid_share(token)
+    if not share:
+        return render_template("portal_invalid.html"), 404
+
+    proposal = db.session.get(Proposal, share.proposal_id)
+    project = db.session.get(Project, share.project_id)
+    owner = db.session.get(User, project.user_id) if project else None
+
+    # Record the view (dedupe rapid reloads within 60s from same IP)
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()
+    recent = (
+        ShareView.query.filter_by(share_id=share.id, ip=ip)
+        .order_by(ShareView.viewed_at.desc())
+        .first()
+    )
+    now = datetime.now(timezone.utc)
+    is_new_view = True
+    if recent and recent.viewed_at:
+        last = recent.viewed_at.replace(tzinfo=timezone.utc) if recent.viewed_at.tzinfo is None else recent.viewed_at
+        if (now - last).total_seconds() < 60:
+            is_new_view = False
+    if is_new_view:
+        db.session.add(ShareView(
+            share_id=share.id, ip=ip,
+            user_agent=(request.headers.get("User-Agent", "") or "")[:400],
+        ))
+        share.view_count = (share.view_count or 0) + 1
+        share.last_viewed_at = now
+        db.session.commit()
+
+    version = latest_version(proposal.id)
+    md_text = version.markdown_content if version else ""
+    # Strip internal-only markers from the customer-facing view
+    md_text = re.sub(r"\[ACTION REQUIRED:.*?\]", "", md_text)
+    md_text = re.sub(r"\[ASSUMED:.*?\]", "", md_text)
+    proposal_html = md.markdown(md_text, extensions=["tables", "fenced_code"])
+
+    company_name = (owner.company_name if owner else "") or ""
+    logo_url = url_for("portal_logo", token=token) if (
+        owner and owner.company_logo_path and getattr(owner, "company_logo_use_in_proposals", False)
+        and Path(owner.company_logo_path).exists()
+    ) else ""
+
+    return render_template(
+        "portal.html",
+        share=share,
+        proposal=proposal,
+        project=project,
+        proposal_html=proposal_html,
+        company_name=company_name,
+        logo_url=logo_url,
+    )
+
+
+@app.route("/p/<token>/logo")
+def portal_logo(token):
+    share = _valid_share(token)
+    if not share:
+        abort(404)
+    project = db.session.get(Project, share.project_id)
+    owner = db.session.get(User, project.user_id) if project else None
+    if not owner or not owner.company_logo_path or not Path(owner.company_logo_path).exists():
+        abort(404)
+    return send_file(owner.company_logo_path, mimetype="image/png")
+
+
+@app.route("/p/<token>/comment", methods=["POST"])
+def portal_comment(token):
+    """Customer leaves a comment → becomes a pending customer revision request."""
+    share = _valid_share(token)
+    if not share or not share.allow_comments:
+        abort(404)
+    proposal = db.session.get(Proposal, share.proposal_id)
+    project = db.session.get(Project, share.project_id)
+
+    body = request.form.get("comment", "").strip()
+    section = request.form.get("section", "").strip()[:200]
+    if not body:
+        flash("Please enter a comment.", "error")
+        return redirect(url_for("customer_portal", token=token))
+
+    db.session.add(RevisionRequest(
+        proposal_id=proposal.id,
+        author_id=None,
+        source="customer",
+        category="other",
+        directive=body,
+        target_section=section,
+        status="pending",
+    ))
+    # Move the proposal into customer_feedback so the owner sees it
+    if proposal.review_status == "submitted_to_customer":
+        try:
+            lifecycle_transition(proposal, "customer_feedback", None,
+                                 note="Customer left a comment via the portal.")
+        except LifecycleError:
+            pass
+    db.session.commit()
+
+    if project:
+        _notify(project.user_id, "customer_feedback",
+                f"Customer comment on {project.name}",
+                body[:160], link=f"/proposal/{proposal.id}")
+        _notify_via_integrations(project.org_id,
+                                 f"💬 Customer comment on *{project.name}*: {body[:200]}")
+    flash("Thanks — your comment has been sent to the team.", "success")
+    return redirect(url_for("customer_portal", token=token))
+
+
+@app.route("/p/<token>/decision", methods=["POST"])
+def portal_decision(token):
+    """Customer accepts or declines through the portal."""
+    share = _valid_share(token)
+    if not share or not share.allow_decision:
+        abort(404)
+    proposal = db.session.get(Proposal, share.proposal_id)
+    project = db.session.get(Project, share.project_id)
+
+    decision = request.form.get("decision", "").strip()
+    note = request.form.get("note", "").strip()
+    if decision not in ("accepted", "declined"):
+        flash("Invalid decision.", "error")
+        return redirect(url_for("customer_portal", token=token))
+
+    share.decision = decision
+    share.decision_note = note
+    share.decided_at = datetime.now(timezone.utc)
+
+    try:
+        if decision == "accepted":
+            if proposal.review_status in ("submitted_to_customer", "customer_feedback"):
+                lifecycle_transition(proposal, "customer_approved", None, note="Accepted by customer via portal.")
+                lifecycle_transition(proposal, "won", None, note="Customer accepted.")
+        else:
+            if proposal.review_status in ("submitted_to_customer", "customer_feedback"):
+                lifecycle_transition(proposal, "customer_declined", None, note=note or "Declined by customer via portal.")
+                lifecycle_transition(proposal, "lost", None, note="Customer declined.")
+    except LifecycleError:
+        pass
+    db.session.commit()
+
+    if project:
+        verb = "accepted" if decision == "accepted" else "declined"
+        _notify(project.user_id, "customer_decision",
+                f"Customer {verb}: {project.name}", note[:160],
+                link=f"/proposal/{proposal.id}")
+        _notify_via_integrations(project.org_id,
+                                 f"{'✅' if decision=='accepted' else '❌'} Customer *{verb}* the proposal for *{project.name}*.")
+    flash("Thank you — your response has been recorded.", "success")
+    return redirect(url_for("customer_portal", token=token))
+
+
 @app.route("/proposal/<proposal_id>/customer-feedback", methods=["GET", "POST"])
 @login_required
 def customer_feedback(proposal_id):
@@ -3780,7 +5026,7 @@ def customer_feedback(proposal_id):
         try:
             drafts = parse_customer_email(
                 email_text,
-                user_api_key=current_user.api_key_encrypted or None,
+                user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
                 user_model=current_user.llm_model or None,
             )
         except RuntimeError as e:
@@ -3907,7 +5153,7 @@ def proposal_preflight(proposal_id):
     try:
         result = preflight_check_proposal(
             version.markdown_content,
-            user_api_key=current_user.api_key_encrypted or None,
+            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
             user_model=current_user.llm_model or None,
         )
     except Exception as e:
@@ -3942,6 +5188,7 @@ def add_revision_template():
 
     tmpl = RevisionTemplate(
         user_id=current_user.id,
+        org_id=current_user.org_id,
         name=name[:200],
         category=category,
         directive_template=directive,
@@ -3958,7 +5205,7 @@ def add_revision_template():
 @login_required
 def delete_revision_template(template_id):
     tmpl = db.session.get(RevisionTemplate, template_id)
-    if not tmpl or tmpl.user_id != current_user.id:
+    if not tmpl or tmpl.org_id != current_user.org_id:
         abort(404)
     name = tmpl.name
     db.session.delete(tmpl)
@@ -3995,6 +5242,7 @@ def add_company_standard():
 
     standard = CompanyStandard(
         user_id=current_user.id,
+        org_id=current_user.org_id,
         category=category,
         title=title,
         content=content,
@@ -4010,7 +5258,7 @@ def add_company_standard():
 @login_required
 def edit_company_standard(standard_id):
     std = db.session.get(CompanyStandard, standard_id)
-    if not std or std.user_id != current_user.id:
+    if not std or std.org_id != current_user.org_id:
         abort(404)
 
     std.category = request.form.get("standard_category", std.category).strip()
@@ -4027,7 +5275,7 @@ def edit_company_standard(standard_id):
 @login_required
 def delete_company_standard(standard_id):
     std = db.session.get(CompanyStandard, standard_id)
-    if not std or std.user_id != current_user.id:
+    if not std or std.org_id != current_user.org_id:
         abort(404)
     title = std.title
     db.session.delete(std)
@@ -4048,7 +5296,14 @@ def admin_panel():
         flash("Access denied.", "error")
         return redirect(url_for("dashboard"))
 
-    users = User.query.order_by(User.created_at.desc()).all()
+    users = _org_users_query().order_by(User.created_at.desc()).all()
+    org = db.session.get(Organization, current_user.org_id) if current_user.org_id else None
+    pending_invitations = OrgInvitation.query.filter_by(
+        org_id=current_user.org_id
+    ).filter(
+        OrgInvitation.accepted_at.is_(None),
+        OrgInvitation.revoked_at.is_(None),
+    ).order_by(OrgInvitation.created_at.desc()).all() if current_user.org_id else []
 
     from sqlalchemy import func
 
@@ -4079,15 +5334,16 @@ def admin_panel():
             "last_active": last_active,
         })
 
-    # Company-wide totals
-    total_projects = Project.query.count()
-    total_proposals = Proposal.query.count()
-    total_won = Project.query.filter_by(status="won").count()
-    total_lost = Project.query.filter_by(status="lost").count()
+    # Organization-wide totals
+    org_project_filter = Project.org_id == current_user.org_id
+    total_projects = Project.query.filter(org_project_filter).count()
+    total_proposals = Proposal.query.join(Project).filter(org_project_filter).count()
+    total_won = Project.query.filter(org_project_filter, Project.status == "won").count()
+    total_lost = Project.query.filter(org_project_filter, Project.status == "lost").count()
     total_decided = total_won + total_lost
     total_users = len(users)
     company_total_dollar = db.session.query(func.sum(Project.dollar_amount)).filter(
-        Project.dollar_amount > 0
+        org_project_filter, Project.dollar_amount > 0
     ).scalar() or 0
 
     company_stats = {
@@ -4127,7 +5383,8 @@ def admin_panel():
             "pipeline": r_dollar,
         }
 
-    # Activity filter
+    # Activity filter (org-scoped: only members of this org)
+    org_user_ids = [u.id for u in users]
     activity_filter = request.args.get("activity_role", "")
     if activity_filter and activity_filter in ("admin", "sales", "proposal"):
         role_user_ids = [u.id for u in users if (getattr(u, "role", None) or ("admin" if u.is_admin else "proposal")) == activity_filter]
@@ -4135,11 +5392,15 @@ def admin_panel():
             ActivityLog.user_id.in_(role_user_ids)
         ).order_by(ActivityLog.created_at.desc()).limit(50).all()
     else:
-        recent_activity = ActivityLog.query.order_by(ActivityLog.created_at.desc()).limit(50).all()
+        recent_activity = ActivityLog.query.filter(
+            ActivityLog.user_id.in_(org_user_ids)
+        ).order_by(ActivityLog.created_at.desc()).limit(50).all()
 
     return render_template(
         "admin.html",
         users=users,
+        org=org,
+        pending_invitations=pending_invitations,
         user_stats=user_stats,
         company_stats=company_stats,
         role_counts=role_counts,
@@ -4147,6 +5408,355 @@ def admin_panel():
         recent_activity=recent_activity,
         activity_filter=activity_filter,
     )
+
+
+@app.route("/admin/org-name", methods=["POST"])
+@login_required
+def update_org_name():
+    """Rename the organization (workspace)."""
+    if not current_user.is_admin or not current_user.org_id:
+        abort(403)
+    org = db.session.get(Organization, current_user.org_id)
+    name = request.form.get("org_name", "").strip()
+    if not name:
+        flash("Workspace name cannot be empty.", "error")
+        return redirect(url_for("admin_panel"))
+    org.name = name[:300]
+    db.session.commit()
+    _log_activity("org_rename", f"Renamed workspace to {org.name}")
+    flash("Workspace name updated.", "success")
+    return redirect(url_for("admin_panel"))
+
+
+@app.route("/admin/invite", methods=["POST"])
+@login_required
+def create_invitation():
+    """Invite a teammate to the organization by email."""
+    if not current_user.is_admin or not current_user.org_id:
+        abort(403)
+
+    email = request.form.get("invite_email", "").strip().lower()
+    role = request.form.get("invite_role", "proposal").strip().lower()
+    if role not in ("admin", "sales", "proposal"):
+        role = "proposal"
+    if not email or "@" not in email:
+        flash("A valid email address is required.", "error")
+        return redirect(url_for("admin_panel"))
+
+    # Don't invite existing members
+    existing = _org_users_query().filter(User.email.ilike(email)).first()
+    if existing:
+        flash(f"{email} is already a member of this workspace.", "error")
+        return redirect(url_for("admin_panel"))
+
+    # Seat-limit gate (counts members + outstanding invites)
+    pending = OrgInvitation.query.filter_by(org_id=current_user.org_id).filter(
+        OrgInvitation.accepted_at.is_(None), OrgInvitation.revoked_at.is_(None)
+    ).count()
+    ok, msg = billing_check_seat(current_user.org_id, pending_invites=pending)
+    if not ok:
+        flash(msg, "error")
+        return redirect(url_for("billing_page"))
+
+    from datetime import timedelta
+    inv = OrgInvitation(
+        org_id=current_user.org_id,
+        email=email,
+        role=role,
+        invited_by=current_user.id,
+        expires_at=datetime.utcnow() + timedelta(days=14),
+    )
+    db.session.add(inv)
+    db.session.commit()
+
+    invite_url = url_for("accept_invite", token=inv.token, _external=True)
+
+    # Email the invite when a mailer is configured; always surface the link
+    try:
+        import mailer
+        org = db.session.get(Organization, current_user.org_id)
+        sent = mailer.send_email(
+            to=email,
+            subject=f"You're invited to join {org.name} on {APP_NAME}",
+            body=(
+                f"{current_user.display_name or current_user.username} invited you to join "
+                f"{org.name} on {APP_NAME} as a {role.title()} user.\n\n"
+                f"Accept the invitation:\n{invite_url}\n\n"
+                f"This link expires in 14 days."
+            ),
+        )
+    except Exception:
+        sent = False
+
+    _log_activity("org_invite", f"Invited {email} as {role}")
+    if sent:
+        flash(f"Invitation emailed to {email}.", "success")
+    else:
+        flash(f"Invitation created. Share this link with {email}: {invite_url}", "success")
+    return redirect(url_for("admin_panel"))
+
+
+@app.route("/admin/invitations/<invite_id>/revoke", methods=["POST"])
+@login_required
+def revoke_invitation(invite_id):
+    if not current_user.is_admin:
+        abort(403)
+    inv = db.session.get(OrgInvitation, invite_id)
+    if not inv or inv.org_id != current_user.org_id:
+        abort(404)
+    inv.revoked_at = datetime.now(timezone.utc)
+    db.session.commit()
+    flash(f"Invitation for {inv.email} revoked.", "success")
+    return redirect(url_for("admin_panel"))
+
+
+@app.route("/admin/integrations", methods=["POST"])
+@login_required
+def update_integrations():
+    """Save the org's Slack incoming webhook and generic outbound webhook URLs."""
+    if not current_user.is_admin or not current_user.org_id:
+        abort(403)
+    org = db.session.get(Organization, current_user.org_id)
+    slack = request.form.get("slack_webhook_url", "").strip()
+    webhook = request.form.get("outbound_webhook_url", "").strip()
+    # Basic sanity: only accept https URLs (or empty to clear)
+    org.slack_webhook_url = slack if (slack.startswith("https://") or not slack) else org.slack_webhook_url
+    org.outbound_webhook_url = webhook if (webhook.startswith("https://") or not webhook) else org.outbound_webhook_url
+    db.session.commit()
+    _log_activity("integrations_update", "Updated integrations")
+    flash("Integrations saved.", "success")
+    return redirect(url_for("admin_panel") + "#integrations")
+
+
+@app.route("/admin/export-data")
+@login_required
+def export_org_data():
+    """Export all of the org's projects + proposals as a JSON file."""
+    if not current_user.is_admin:
+        abort(403)
+    from flask import Response
+    org = db.session.get(Organization, current_user.org_id)
+    projects = Project.query.filter_by(org_id=current_user.org_id).all()
+    data = {
+        "organization": {"id": org.id, "name": org.name, "plan": org.plan} if org else {},
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "projects": [],
+    }
+    for p in projects:
+        proposals = []
+        for prop in Proposal.query.filter_by(project_id=p.id).all():
+            latest = latest_version(prop.id)
+            proposals.append({
+                "id": prop.id,
+                "document_type": prop.document_type,
+                "review_status": prop.review_status,
+                "confidence_score": prop.confidence_score,
+                "generated_at": prop.generated_at.isoformat() if prop.generated_at else None,
+                "markdown": latest.markdown_content if latest else "",
+            })
+        data["projects"].append({
+            "id": p.id,
+            "name": p.name,
+            "client_name": p.client_name,
+            "request_type": p.request_type,
+            "status": p.status,
+            "vertical": p.vertical_label,
+            "dollar_amount": p.dollar_amount,
+            "close_reason": p.close_reason,
+            "close_category": p.close_category,
+            "competitor_name": p.competitor_name,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+            "proposals": proposals,
+        })
+    _log_activity("data_export", f"Exported {len(projects)} project(s)")
+    return Response(
+        json.dumps(data, indent=2),
+        mimetype="application/json",
+        headers={"Content-Disposition": "attachment; filename=proposal_manager_export.json"},
+    )
+
+
+@app.route("/load-sample-data", methods=["POST"])
+@login_required
+def load_sample_data():
+    """Seed the workspace with a sample project + posture so a new trial can see
+    the product working immediately. Admin-only; refuses if data already exists."""
+    if not current_user.is_admin:
+        abort(403)
+    org_id = current_user.org_id
+    if Project.query.filter_by(org_id=org_id).count() > 0:
+        flash("Sample data is only available for an empty workspace.", "error")
+        return redirect(url_for("dashboard"))
+
+    # Sample posture
+    if StaffRole.query.filter_by(org_id=org_id).count() == 0:
+        for rn, cat, hr in [("Senior Engineer", "Engineering", 165),
+                            ("Project Manager", "Management", 185),
+                            ("Field Technician", "Technician", 95)]:
+            db.session.add(StaffRole(user_id=current_user.id, org_id=org_id,
+                                     role_name=rn, category=cat, hourly_rate=hr))
+    if CompanyStandard.query.filter_by(org_id=org_id).count() == 0:
+        db.session.add(CompanyStandard(
+            user_id=current_user.id, org_id=org_id, category="certifications",
+            title="Certifications & Safety",
+            content="ISO 9001:2015 certified. EMR of 0.72. OSHA 30 trained field staff."))
+
+    # Sample project + RFP document
+    project = Project(user_id=current_user.id, org_id=org_id,
+                      name="Sample — Data Center EPMS", client_name="Acme Colo",
+                      request_type="rfp", vertical="data_center",
+                      vertical_label="Data Center / Mission Critical")
+    db.session.add(project)
+    db.session.flush()
+    sample_rfp = (
+        "REQUEST FOR PROPOSAL — Electrical Power Monitoring System (EPMS)\n\n"
+        "Acme Colo seeks a complete EPMS for a new 5MW data hall: metering at all "
+        "switchgear, PDUs, and RPPs; integration to the existing BMS; factory and "
+        "site acceptance testing; and O&M documentation. Redundant (N+1) monitoring "
+        "required. Provide a fixed-price proposal with schedule and staffing plan."
+    )
+    dpath = UPLOADS_DIR / f"projects/{project.id}"
+    dpath.mkdir(parents=True, exist_ok=True)
+    fpath = dpath / "sample_rfp.txt"
+    fpath.write_text(sample_rfp, encoding="utf-8")
+    storage.sync_up(fpath)
+    db.session.add(ProjectDocument(
+        project_id=project.id, filename="sample_rfp.txt", original_filename="sample_rfp.txt",
+        file_type="rfp", file_path=str(fpath), file_size=fpath.stat().st_size))
+    db.session.commit()
+    _log_activity("sample_data", "Loaded sample data", project.id)
+    flash("Sample project and posture loaded. Open it and try generating a proposal!", "success")
+    return redirect(url_for("project_upload", project_id=project.id))
+
+
+# ---------------------------------------------------------------------------
+# Billing & Plans (Phase 5)
+# ---------------------------------------------------------------------------
+
+@app.route("/billing")
+@login_required
+def billing_page():
+    org = db.session.get(Organization, current_user.org_id) if current_user.org_id else None
+    current_plan = billing.plan_for(org)
+    usage = {
+        "generations": billing.generations_this_month(current_user.org_id),
+        "seats": billing.seats_used(current_user.org_id),
+        "limits": billing.limits_for(org),
+    }
+    return render_template(
+        "billing.html",
+        org=org,
+        plans=billing.PLANS,
+        current_plan_key=(org.plan if org else "free") or "free",
+        current_plan=current_plan,
+        usage=usage,
+        stripe_enabled=billing.stripe_enabled(),
+        is_admin=current_user.is_admin,
+    )
+
+
+@app.route("/billing/checkout/<plan_key>", methods=["POST"])
+@login_required
+def billing_checkout(plan_key):
+    if not current_user.is_admin:
+        flash("Only workspace admins can change the plan.", "error")
+        return redirect(url_for("billing_page"))
+    if plan_key not in billing.PLANS:
+        abort(404)
+    org = db.session.get(Organization, current_user.org_id)
+
+    if not billing.stripe_enabled():
+        # No Stripe configured — switch plan directly (self-hosted / trial mode)
+        org.plan = plan_key
+        org.billing_status = "active"
+        db.session.commit()
+        _log_activity("plan_change", f"Switched to {plan_key} plan (no Stripe)")
+        flash(f"Plan changed to {billing.PLANS[plan_key]['name']}.", "success")
+        return redirect(url_for("billing_page"))
+
+    try:
+        import stripe
+        stripe.api_key = billing.STRIPE_SECRET_KEY
+        price_id = billing.PLANS[plan_key]["price_id"]
+        if not price_id:
+            flash("This plan is not configured for checkout.", "error")
+            return redirect(url_for("billing_page"))
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=url_for("billing_page", _external=True) + "?success=1",
+            cancel_url=url_for("billing_page", _external=True) + "?canceled=1",
+            customer=org.stripe_customer_id or None,
+            client_reference_id=org.id,
+            metadata={"org_id": org.id, "plan": plan_key},
+        )
+        return redirect(session.url, code=303)
+    except Exception as e:
+        flash(f"Could not start checkout: {e}", "error")
+        return redirect(url_for("billing_page"))
+
+
+@app.route("/billing/portal", methods=["POST"])
+@login_required
+def billing_portal():
+    if not current_user.is_admin:
+        abort(403)
+    org = db.session.get(Organization, current_user.org_id)
+    if not billing.stripe_enabled() or not org.stripe_customer_id:
+        flash("No active Stripe subscription to manage.", "error")
+        return redirect(url_for("billing_page"))
+    try:
+        import stripe
+        stripe.api_key = billing.STRIPE_SECRET_KEY
+        session = stripe.billing_portal.Session.create(
+            customer=org.stripe_customer_id,
+            return_url=url_for("billing_page", _external=True),
+        )
+        return redirect(session.url, code=303)
+    except Exception as e:
+        flash(f"Could not open billing portal: {e}", "error")
+        return redirect(url_for("billing_page"))
+
+
+@app.route("/billing/webhook", methods=["POST"])
+def billing_webhook():
+    """Stripe webhook: keep org plan/subscription state in sync."""
+    if not billing.stripe_enabled():
+        return {"ok": False}, 400
+    import stripe
+    payload = request.get_data()
+    sig = request.headers.get("Stripe-Signature", "")
+    try:
+        if billing.STRIPE_WEBHOOK_SECRET:
+            event = stripe.Webhook.construct_event(payload, sig, billing.STRIPE_WEBHOOK_SECRET)
+        else:
+            event = json.loads(payload)
+    except Exception:
+        return {"ok": False}, 400
+
+    etype = event.get("type", "")
+    obj = event.get("data", {}).get("object", {})
+
+    if etype == "checkout.session.completed":
+        org_id = (obj.get("metadata") or {}).get("org_id") or obj.get("client_reference_id")
+        org = db.session.get(Organization, org_id) if org_id else None
+        if org:
+            org.stripe_customer_id = obj.get("customer", org.stripe_customer_id)
+            org.stripe_subscription_id = obj.get("subscription", "")
+            org.plan = (obj.get("metadata") or {}).get("plan", org.plan)
+            org.billing_status = "active"
+            db.session.commit()
+    elif etype in ("customer.subscription.updated", "customer.subscription.deleted"):
+        sub_id = obj.get("id")
+        org = Organization.query.filter_by(stripe_subscription_id=sub_id).first()
+        if org:
+            status = obj.get("status", "")
+            org.billing_status = status
+            if etype == "customer.subscription.deleted" or status in ("canceled", "unpaid"):
+                org.plan = "free"
+            db.session.commit()
+
+    return {"ok": True}
 
 
 @app.route("/admin/upload-company-template", methods=["POST"])
@@ -4167,6 +5777,7 @@ def upload_company_template():
 
     tmpl = UserVerticalTemplate(
         user_id=current_user.id,
+        org_id=current_user.org_id,
         vertical=vertical,
         template_type=template_type,
         name=request.form.get("template_name", safe),
@@ -4263,7 +5874,10 @@ def document_library():
     show_reference = request.args.get("reference", "")
 
     # All user projects for filter dropdown
-    all_projects = Project.query.filter_by(user_id=current_user.id).order_by(Project.name).all()
+    if current_user.is_admin:
+        all_projects = Project.query.filter_by(org_id=current_user.org_id).order_by(Project.name).all()
+    else:
+        all_projects = Project.query.filter(_my_projects_filter()).order_by(Project.name).all()
     project_ids = [p.id for p in all_projects]
 
     # Base document query
@@ -4334,8 +5948,8 @@ def document_library():
             project_stats.append({"project": p, "doc_count": p_docs, "total_size": p_size})
 
     # Generated proposals
-    proposals = Proposal.query.join(Project).filter(
-        Project.user_id == current_user.id
+    proposals = Proposal.query.filter(
+        Proposal.project_id.in_(project_ids)
     ).order_by(Proposal.generated_at.desc()).all()
 
     # Reference documents count
@@ -4373,7 +5987,7 @@ def download_document(doc_id):
     if not doc:
         abort(404)
     project = db.session.get(Project, doc.project_id)
-    if not project or project.user_id != current_user.id:
+    if not _can_access_project(project):
         abort(404)
     return send_file(doc.file_path, as_attachment=True, download_name=doc.original_filename)
 
@@ -4386,7 +6000,7 @@ def preview_document(doc_id):
     if not doc:
         abort(404)
     project = db.session.get(Project, doc.project_id)
-    if not project or project.user_id != current_user.id:
+    if not _can_access_project(project):
         abort(404)
     return send_file(doc.file_path, as_attachment=False)
 
@@ -4399,7 +6013,7 @@ def update_document_tags(doc_id):
     if not doc:
         abort(404)
     project = db.session.get(Project, doc.project_id)
-    if not project or project.user_id != current_user.id:
+    if not _can_access_project(project):
         abort(404)
 
     tags_str = request.form.get("tags", "").strip()
@@ -4422,7 +6036,7 @@ def update_document_notes(doc_id):
     if not doc:
         abort(404)
     project = db.session.get(Project, doc.project_id)
-    if not project or project.user_id != current_user.id:
+    if not _can_access_project(project):
         abort(404)
 
     doc.notes = request.form.get("notes", "").strip()
@@ -4439,7 +6053,7 @@ def toggle_document_reference(doc_id):
     if not doc:
         abort(404)
     project = db.session.get(Project, doc.project_id)
-    if not project or project.user_id != current_user.id:
+    if not _can_access_project(project):
         abort(404)
 
     doc.is_reference = not doc.is_reference
@@ -4459,12 +6073,12 @@ def copy_document_to_project(doc_id):
     if not doc:
         abort(404)
     src_project = db.session.get(Project, doc.project_id)
-    if not src_project or src_project.user_id != current_user.id:
+    if not _can_access_project(src_project):
         abort(404)
 
     target_project_id = request.form.get("target_project_id", "").strip()
     target_project = db.session.get(Project, target_project_id)
-    if not target_project or target_project.user_id != current_user.id:
+    if not _can_access_project(target_project):
         flash("Invalid target project.", "error")
         return redirect(url_for("document_library"))
 
@@ -4510,7 +6124,7 @@ def update_document_version(doc_id):
     if not doc:
         abort(404)
     project = db.session.get(Project, doc.project_id)
-    if not project or project.user_id != current_user.id:
+    if not _can_access_project(project):
         abort(404)
 
     doc.version_label = request.form.get("version_label", "").strip()
@@ -4530,7 +6144,7 @@ def bulk_download_documents():
 
     project_id = request.form.get("project_id", "").strip()
     project = db.session.get(Project, project_id)
-    if not project or project.user_id != current_user.id:
+    if not _can_access_project(project):
         abort(404)
 
     docs = ProjectDocument.query.filter_by(project_id=project_id).all()
@@ -4593,7 +6207,7 @@ def mark_all_notifications_read():
 def assign_project(project_id):
     """Assign a project to a proposal user."""
     project = db.session.get(Project, project_id)
-    if not project or (project.user_id != current_user.id and not current_user.is_admin):
+    if not _can_access_project(project):
         abort(404)
 
     assignee_id = request.form.get("assigned_to", "").strip()
@@ -4652,7 +6266,8 @@ def calendar_view():
 
     # Load projects with a due date (owned or assigned)
     if current_user.is_admin:
-        all_with_due = Project.query.filter(Project.due_date.isnot(None)).all()
+        all_with_due = Project.query.filter_by(org_id=current_user.org_id).filter(
+            Project.due_date.isnot(None)).all()
     else:
         all_with_due = Project.query.filter(
             _my_projects_filter(), Project.due_date.isnot(None)
@@ -4710,7 +6325,7 @@ def reports():
 
     # Admins see company-wide; other users see own + assigned
     if current_user.is_admin:
-        base_query = Project.query
+        base_query = Project.query.filter_by(org_id=current_user.org_id)
     else:
         base_query = Project.query.filter(_my_projects_filter())
 
@@ -4870,13 +6485,17 @@ def search():
             Project.competitor_name.ilike(like),
         )
     )
-    if not current_user.is_admin:
+    if current_user.is_admin:
+        proj_query = proj_query.filter(Project.org_id == current_user.org_id)
+    else:
         proj_query = proj_query.filter(_my_projects_filter())
     results["projects"] = proj_query.order_by(Project.updated_at.desc()).limit(25).all()
 
     # Documents (under user's projects, or admin sees all)
     if current_user.is_admin:
-        accessible_project_ids = [p.id for p in Project.query.all()]
+        accessible_project_ids = [
+            p.id for p in Project.query.filter_by(org_id=current_user.org_id).all()
+        ]
     else:
         accessible_project_ids = [
             p.id for p in Project.query.filter(_my_projects_filter()).all()
@@ -4913,10 +6532,8 @@ def search():
             proposal_matches.append({"proposal": prop, "snippet": snippet})
     results["proposals"] = proposal_matches[:25]
 
-    # Comments
-    if current_user.is_admin:
-        comment_query = ProposalComment.query.filter(ProposalComment.body.ilike(like))
-    else:
+    # Comments — always scoped to accessible (org) proposals
+    if True:
         accessible_proposal_ids = [
             p.id for p in Proposal.query.filter(Proposal.project_id.in_(accessible_project_ids)).all()
         ]
@@ -5076,7 +6693,7 @@ def clarification_register(project_id):
         ).all()
     )
 
-    users = User.query.order_by(User.display_name).all()
+    users = _org_users_query().order_by(User.display_name).all()
 
     return render_template(
         "clarification_register.html",
@@ -5276,7 +6893,7 @@ def proposal_reviews(proposal_id):
             if stripped.startswith("## ") or stripped.startswith("### "):
                 sections.append(stripped)
 
-    users = User.query.order_by(User.display_name).all()
+    users = _org_users_query().order_by(User.display_name).all()
 
     return render_template(
         "proposal_reviews.html",
@@ -5575,7 +7192,7 @@ def addendum_analysis(project_id):
     try:
         result = analyze_addendum_impact(
             original_rfp_text, addendum_text, current_md,
-            user_api_key=current_user.api_key_encrypted or None,
+            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
             user_model=current_user.llm_model or None,
         )
 
@@ -5651,7 +7268,7 @@ def regenerate_proposal_section(proposal_id):
             clarification_answer=clarification_answer,
             original_rfp_text=rfp_text,
             company_name=current_user.company_name,
-            user_api_key=current_user.api_key_encrypted or None,
+            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
             user_model=current_user.llm_model or None,
         )
 
@@ -5717,10 +7334,12 @@ def export_activity_csv():
         abort(403)
 
     role_filter = request.args.get("role", "")
-    logs_query = ActivityLog.query.order_by(ActivityLog.created_at.desc())
+    logs_query = ActivityLog.query.filter(
+        ActivityLog.user_id.in_([u.id for u in _org_users_query().all()])
+    ).order_by(ActivityLog.created_at.desc())
 
     if role_filter in ("admin", "sales", "proposal"):
-        role_user_ids = [u.id for u in User.query.filter_by(role=role_filter).all()]
+        role_user_ids = [u.id for u in _org_users_query().filter_by(role=role_filter).all()]
         logs_query = logs_query.filter(ActivityLog.user_id.in_(role_user_ids))
 
     logs = logs_query.limit(5000).all()
@@ -5810,42 +7429,80 @@ def faq_page():
 # Help Chatbot (FAQ-based)
 # ---------------------------------------------------------------------------
 
+_HELP_KB = """You are the in-app help assistant for Proposal Manager, an AI proposal platform.
+Answer concisely (2-5 sentences) and only about using the product. If unsure, point
+the user to the relevant page. Key features and where they live:
+- Dashboard: "Pick up where you left off" list; drop an RFP on the hero to start.
+- New Proposal / Projects: upload RFP/RFQ/ROM docs (PDF, DOCX, TXT, MD, XLSX).
+- Request types: RFP, RFQ, and ROM (a lighter range-priced budgetary estimate you
+  can later convert to a full proposal).
+- Scope of Work: AI drafts a checklist you approve before generating.
+- Generation runs as a background job with a progress page.
+- Internal Review: assign reviewers, they approve or request changes; the owner
+  batch-applies revision requests to generate a new version.
+- Structured pricing: the Estimate page (from a proposal) has an editable grid with
+  live totals, CSV export, and "insert into proposal".
+- Proposal Posture: templates, company standards, staff/equipment/travel rates, and
+  branding. "AI import & review" extracts rates/standards from an uploaded file.
+- Customer Portal: create a secure share link; the customer views, comments, and
+  accepts/declines; you see open tracking.
+- Export: DOCX and PDF; redline DOCX shows tracked changes vs the AI original.
+- Reports: win/loss analysis, pipeline, competitors.
+- Billing & Plans (admins): Free/Pro/Business with seat, project, and generation limits.
+- People & Roles (admins): invite teammates by email, set roles.
+- Settings > Profile & AI: set your Anthropic API key and model.
+"""
+
+
+def _fallback_help(message: str) -> str:
+    responses = {
+        ("generate", "proposal", "create"): "To generate a proposal: create a project, upload your RFP/RFQ, optionally approve a Scope of Work, then click Generate. It runs as a background job with a progress page.",
+        ("upload", "file", "document", "format"): "You can upload PDF, Word (.docx), text (.txt), Markdown (.md), and Excel (.xlsx) files on the project page.",
+        ("rate", "pricing", "cost", "estimate", "staff", "equipment", "travel"): "Set rates in Proposal Posture. For structured pricing, open a proposal and click Estimate — an editable grid with live totals, CSV export, and insert-into-proposal.",
+        ("share", "customer", "send", "portal"): "On an approved proposal, use the Customer Portal panel to create a secure share link. The customer can view, comment, and accept/decline, and you get open tracking.",
+        ("rom", "budgetary", "ballpark"): "Choose ROM as the request type for a lighter, range-priced budgetary estimate. You can convert it to a full RFP/RFQ later.",
+        ("invite", "team", "seat", "member"): "Admins invite teammates from People & Roles by email and assign a role.",
+        ("bill", "plan", "upgrade", "subscription"): "See Billing & Plans (admin) for your plan, usage vs limits, and upgrades.",
+        ("api", "key", "model", "llm"): "Set your Anthropic API key and model in Settings > Profile & AI.",
+    }
+    best, score = None, 0
+    for kws, resp in responses.items():
+        s = sum(1 for kw in kws if kw in message)
+        if s > score:
+            best, score = resp, s
+    return best or "I can help with generating proposals, pricing/estimates, the customer portal, posture setup, invites, and billing. Try rephrasing, or see the FAQ page."
+
+
 @app.route("/api/chat", methods=["POST"])
 @login_required
 def chat_help():
-    """Simple FAQ-based chatbot that matches user questions to predefined answers."""
+    """Claude-powered help assistant grounded in the product knowledge base,
+    with a keyword fallback when no API key is configured or the call fails."""
     data = request.get_json(silent=True) or {}
-    message = data.get("message", "").strip().lower()
-
+    message = (data.get("message", "") or "").strip()
     if not message:
         return {"reply": "Please type a question and I'll do my best to help!"}
 
-    # Simple keyword matching for help topics
-    responses = {
-        ("generate", "proposal", "create"): "To generate a proposal: Create a new project, upload your RFP/RFQ documents, choose cost estimation options, and click 'Generate Proposal'. The AI will analyze your docs and produce a draft in seconds.",
-        ("upload", "file", "document", "format"): "You can upload PDF, Word (.docx), text (.txt), Markdown (.md), and Excel (.xlsx) files. Use the project page to upload RFP documents, and Settings for rate sheets.",
-        ("learn", "teach", "finalize", "correction"): "After editing a proposal, click 'Finalize & Teach AI' in the editor. The system captures your editing patterns and uses them to improve future proposals.",
-        ("rate", "pricing", "cost", "staff", "equipment", "travel"): "Configure your rates in the Proposal Posture page. Add staff hourly rates, equipment prices, and travel rates. The AI uses these when you check the cost estimation boxes during generation.",
-        ("version", "history", "revert", "restore"): "Open the proposal editor to see Version History in the right sidebar. You can view any version and restore previous ones. Restoring creates a new version so nothing is ever lost.",
-        ("redline", "tracked", "changes", "diff"): "Download Redline DOCX from the proposal view page. It shows AI-original vs your edits with red strikethrough (deletions) and blue underline (insertions).",
-        ("api", "key", "provider", "model", "llm"): "Go to Settings > Profile & AI to configure your AI provider, model, and API key. Currently supports Anthropic Claude, OpenAI GPT, and Google Gemini.",
-        ("vertical", "industry", "template"): "Verticals are industry-specific templates: Data Center, Life Science, Food & Beverage, and General. Choose during proposal generation or let the AI auto-detect from your RFP.",
-        ("admin", "user", "manage"): "Admins can view company-wide metrics, manage user permissions, and track activity from the Admin panel in the sidebar.",
-        ("standard", "boilerplate", "mission", "certification"): "Company Standards are reusable content blocks. Go to the Proposal Posture page to add mission statements, certifications, past performance, etc. The AI includes these in every proposal.",
-    }
+    api_key = decrypt_api_key(current_user.api_key_encrypted) or None
+    from config.settings import ANTHROPIC_API_KEY as _GLOBAL_KEY
+    effective_key = api_key or _GLOBAL_KEY
+    if effective_key:
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=effective_key, timeout=30, max_retries=1)
+            resp = client.messages.create(
+                model=current_user.llm_model or "claude-opus-4-6",
+                max_tokens=400,
+                system=_HELP_KB,
+                messages=[{"role": "user", "content": message[:2000]}],
+            )
+            text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+            if text:
+                return {"reply": text}
+        except Exception:
+            pass  # fall through to keyword help
 
-    best_match = None
-    best_score = 0
-    for keywords, response in responses.items():
-        score = sum(1 for kw in keywords if kw in message)
-        if score > best_score:
-            best_score = score
-            best_match = response
-
-    if best_match and best_score > 0:
-        return {"reply": best_match}
-
-    return {"reply": "I'm not sure about that. Try checking the FAQ page for detailed answers, or rephrase your question. I can help with: generating proposals, uploading files, cost estimation, version history, redline exports, API setup, and company standards."}
+    return {"reply": _fallback_help(message.lower())}
 
 
 # ---------------------------------------------------------------------------

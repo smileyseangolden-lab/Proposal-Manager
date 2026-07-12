@@ -90,7 +90,9 @@
                         <a href="#" title="Redlines available once the proposal has been edited (2+ versions)" style="opacity:0.4; cursor:not-allowed;" onclick="return false;">&#9776; Redlines</a>
                         {% endif %}
                     </div>
+                    <a href="{{ url_for('proposal_estimate', proposal_id=proposal.id) }}" class="btn btn-small btn-secondary">&#128200; Estimate</a>
                     <a href="{{ url_for('download', proposal_id=proposal.id, fmt='docx') }}" class="btn btn-small btn-secondary">&#8681; Export .docx</a>
+                    <a href="{{ url_for('download', proposal_id=proposal.id, fmt='pdf') }}" class="btn btn-small btn-secondary">&#8681; Export .pdf</a>
                     {% if redline_available %}
                     <a href="{{ url_for('download_redline', proposal_id=proposal.id) }}" class="btn btn-small btn-secondary" title="Word document with tracked changes">&#8681; Redline .docx</a>
                     {% endif %}
@@ -240,6 +242,35 @@
                 {% endif %}
             </div>
             <div id="preflight-results" class="preflight-box" style="display:none;"></div>
+        </div>
+        {% endif %}
+
+        {% if is_owner and proposal.review_status in ('internally_approved', 'submitted_to_customer', 'customer_feedback', 'customer_approved', 'customer_declined', 'won', 'lost') %}
+        <div class="rail-card">
+            <h3>Customer Portal</h3>
+            {% if share %}
+            <p class="rail-sub">Share link is live.</p>
+            <div class="share-link-box">
+                <input type="text" readonly value="{{ share_url }}" id="share-url-input" onclick="this.select()">
+                <button type="button" class="btn btn-small btn-secondary" onclick="navigator.clipboard.writeText(document.getElementById('share-url-input').value)">Copy</button>
+            </div>
+            <ul class="share-stats">
+                <li><strong>{{ share.view_count or 0 }}</strong> view(s){% if share.last_viewed_at %} · last {{ share.last_viewed_at.strftime('%b %d, %H:%M') }}{% endif %}</li>
+                {% if share.decision %}<li>Customer <strong>{{ share.decision }}</strong>{{ ' on ' + share.decided_at.strftime('%b %d') if share.decided_at }}</li>{% endif %}
+            </ul>
+            <form method="post" action="{{ url_for('revoke_share', proposal_id=proposal.id) }}" class="inline-form">
+                <button type="submit" class="btn btn-small btn-secondary">Revoke link</button>
+            </form>
+            {% else %}
+            <p class="rail-sub">Create a secure link the customer can view, comment on, and accept/decline — with open tracking.</p>
+            <form method="post" action="{{ url_for('create_share', proposal_id=proposal.id) }}">
+                <input type="email" name="customer_email" placeholder="customer@company.com" value="{{ project.client_email or '' }}" style="width:100%; margin-bottom:8px;">
+                <label class="check-inline"><input type="checkbox" name="allow_comments" value="1" checked> Allow comments</label>
+                <label class="check-inline"><input type="checkbox" name="allow_decision" value="1" checked> Allow accept/decline</label>
+                <label class="check-inline"><input type="checkbox" name="send_email" value="1"> Email it with PDF attached</label>
+                <button type="submit" class="btn btn-primary" style="margin-top:8px; width:100%;">Create share link</button>
+            </form>
+            {% endif %}
         </div>
         {% endif %}
 

@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Proposal — {{ project.name }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <style>
+        body.portal { background: #f4f7f7; margin: 0; color: #1a1a1a; }
+        .portal-shell { max-width: 900px; margin: 0 auto; padding: 24px 16px 60px; }
+        .portal-head { display: flex; align-items: center; gap: 14px; padding: 18px 0; border-bottom: 2px solid var(--sea-800, #0f6b6b); margin-bottom: 22px; }
+        .portal-head img { height: 46px; }
+        .portal-head .co { font-size: 18px; font-weight: 700; color: var(--sea-800, #0f6b6b); }
+        .portal-doc { background: #fff; border-radius: 12px; padding: 40px 44px; box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+        .portal-doc h1 { color: var(--sea-800, #0f6b6b); }
+        .portal-doc table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+        .portal-doc th, .portal-doc td { border: 1px solid #ddd; padding: 6px 9px; text-align: left; }
+        .portal-doc th { background: var(--sea-800, #0f6b6b); color: #fff; }
+        .portal-actions { background: #fff; border-radius: 12px; padding: 26px 30px; margin-top: 20px; box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+        .portal-actions h3 { margin-top: 0; }
+        .decision-row { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 10px; }
+        .decided-banner { padding: 14px 18px; border-radius: 8px; font-weight: 600; margin-bottom: 18px; }
+        .decided-accepted { background: #e6f4ea; color: #1e7d34; }
+        .decided-declined { background: #fdecea; color: #b3261e; }
+        textarea { width: 100%; min-height: 90px; padding: 10px; border: 1px solid #ccc; border-radius: 8px; font: inherit; }
+        .portal-foot { text-align: center; color: #888; font-size: 13px; margin-top: 28px; }
+    </style>
+</head>
+<body class="portal">
+    <div class="portal-shell">
+        <div class="portal-head">
+            {% if logo_url %}<img src="{{ logo_url }}" alt="{{ company_name }}">{% endif %}
+            <div class="co">{{ company_name or 'Proposal' }}</div>
+        </div>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}{% for category, message in messages %}
+        <div class="flash flash-{{ category }}">{{ message }}</div>
+        {% endfor %}{% endif %}
+        {% endwith %}
+
+        {% if share.decision %}
+        <div class="decided-banner decided-{{ share.decision }}">
+            You {{ 'accepted' if share.decision == 'accepted' else 'declined' }} this proposal
+            {{ 'on ' + share.decided_at.strftime('%B %d, %Y') if share.decided_at else '' }}.
+        </div>
+        {% endif %}
+
+        <div class="portal-doc">
+            {{ proposal_html | safe }}
+        </div>
+
+        {% if not share.decision and (share.allow_comments or share.allow_decision) %}
+        <div class="portal-actions">
+            {% if share.allow_decision %}
+            <h3>Your decision</h3>
+            <p>Ready to move forward, or need changes?</p>
+            <div class="decision-row">
+                <form method="post" action="{{ url_for('portal_decision', token=share.token) }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="hidden" name="decision" value="accepted">
+                    <button type="submit" class="btn btn-primary">Accept proposal</button>
+                </form>
+                <form method="post" action="{{ url_for('portal_decision', token=share.token) }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="hidden" name="decision" value="declined">
+                    <button type="submit" class="btn btn-secondary">Decline</button>
+                </form>
+            </div>
+            {% endif %}
+
+            {% if share.allow_comments %}
+            <h3 style="margin-top:24px;">Questions or change requests</h3>
+            <form method="post" action="{{ url_for('portal_comment', token=share.token) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <textarea name="comment" placeholder="Let the team know what you'd like adjusted…" required></textarea>
+                <button type="submit" class="btn btn-secondary" style="margin-top:10px;">Send to team</button>
+            </form>
+            {% endif %}
+        </div>
+        {% endif %}
+
+        <p class="portal-foot">Powered by {{ app_name }}</p>
+    </div>
+</body>
+</html>

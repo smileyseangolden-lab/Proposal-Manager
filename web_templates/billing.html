@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Billing &amp; Plans — {{ app_name }}{% endblock %}
+{% block breadcrumb %}<span class="crumb-current">Billing &amp; Plans</span>{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <h1>Billing &amp; Plans</h1>
+    <p class="page-subtitle">{{ org.name if org else 'Workspace' }} — you're on the <strong>{{ current_plan.name }}</strong> plan.</p>
+</section>
+
+{% if not stripe_enabled %}
+<div class="flash flash-info">Payments aren't configured on this deployment, so plan changes apply immediately without checkout.</div>
+{% endif %}
+
+<section class="stats-grid">
+    <div class="stat-card">
+        <span class="stat-number">{{ usage.generations }}{% if usage.limits.generations_per_month >= 0 %} / {{ usage.limits.generations_per_month }}{% endif %}</span>
+        <span class="stat-label">AI proposals this month</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-number">{{ usage.seats }}{% if usage.limits.seats >= 0 %} / {{ usage.limits.seats }}{% endif %}</span>
+        <span class="stat-label">Seats used</span>
+    </div>
+    <div class="stat-card">
+        <span class="stat-number">{{ current_plan.name }}</span>
+        <span class="stat-label">Current plan</span>
+    </div>
+</section>
+
+<div class="plan-grid">
+    {% for key, plan in plans.items() %}
+    <div class="card plan-card {{ 'plan-current' if key == current_plan_key }}">
+        <h2>{{ plan.name }}</h2>
+        <p class="plan-price">${{ plan.monthly_price }}<span>/mo</span></p>
+        <ul class="plan-features">
+            {% for f in plan.features %}<li>{{ f }}</li>{% endfor %}
+        </ul>
+        {% if key == current_plan_key %}
+        <button class="btn btn-secondary btn-large" disabled>Current plan</button>
+        {% elif is_admin %}
+        <form method="post" action="{{ url_for('billing_checkout', plan_key=key) }}">
+            <button type="submit" class="btn btn-primary btn-large">
+                {% if plan.monthly_price > current_plan.monthly_price %}Upgrade{% else %}Switch{% endif %} to {{ plan.name }}
+            </button>
+        </form>
+        {% else %}
+        <button class="btn btn-secondary btn-large" disabled>Admins only</button>
+        {% endif %}
+    </div>
+    {% endfor %}
+</div>
+
+{% if is_admin and stripe_enabled and org and org.stripe_customer_id %}
+<div class="card">
+    <h2>Manage subscription</h2>
+    <p class="card-desc">Update payment method, view invoices, or cancel.</p>
+    <form method="post" action="{{ url_for('billing_portal') }}">
+        <button type="submit" class="btn btn-secondary">Open billing portal</button>
+    </form>
+</div>
+{% endif %}
+{% endblock %}

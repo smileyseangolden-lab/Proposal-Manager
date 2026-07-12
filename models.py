@@ -18,10 +18,93 @@ def _utcnow():
     return datetime.now(timezone.utc)
 
 
+class Organization(db.Model):
+    """A company workspace (tenant). All posture, projects, and members are
+    scoped to an organization. Created at signup or via invitation."""
+    __tablename__ = "organizations"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    name = db.Column(db.String(300), nullable=False)
+    created_at = db.Column(db.DateTime, default=_utcnow)
+
+    # Billing (Phase 5)
+    plan = db.Column(db.String(30), default="free")  # free, pro, business
+    stripe_customer_id = db.Column(db.String(100), default="")
+    stripe_subscription_id = db.Column(db.String(100), default="")
+    billing_status = db.Column(db.String(30), default="")  # active, past_due, canceled
+    trial_ends_at = db.Column(db.DateTime, nullable=True)
+
+    # Integrations (Phase 6)
+    slack_webhook_url = db.Column(db.String(1000), default="")
+    outbound_webhook_url = db.Column(db.String(1000), default="")
+
+    members = db.relationship("User", backref="organization", lazy="dynamic",
+                              foreign_keys="User.org_id")
+
+
+class OrgInvitation(db.Model):
+    """An email invitation to join an organization with a given role."""
+    __tablename__ = "org_invitations"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    org_id = db.Column(db.String(32), db.ForeignKey("organizations.id"), nullable=False)
+    email = db.Column(db.String(200), nullable=False)
+    role = db.Column(db.String(20), default="proposal")  # admin, sales, proposal
+    token = db.Column(db.String(64), unique=True, nullable=False, default=lambda: uuid.uuid4().hex + uuid.uuid4().hex)
+    invited_by = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    created_at = db.Column(db.DateTime, default=_utcnow)
+    expires_at = db.Column(db.DateTime, nullable=True)
+    accepted_at = db.Column(db.DateTime, nullable=True)
+    accepted_user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    revoked_at = db.Column(db.DateTime, nullable=True)
+
+    organization = db.relationship("Organization", backref="invitations")
+    inviter = db.relationship("User", foreign_keys=[invited_by])
+
+
+class UserToken(db.Model):
+    """Single-use, time-limited tokens for password reset and email verification."""
+    __tablename__ = "user_tokens"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    purpose = db.Column(db.String(20), nullable=False)  # reset, verify
+    token = db.Column(db.String(64), unique=True, nullable=False,
+                      default=lambda: uuid.uuid4().hex + uuid.uuid4().hex)
+    created_at = db.Column(db.DateTime, default=_utcnow)
+    expires_at = db.Column(db.DateTime, nullable=True)
+    used_at = db.Column(db.DateTime, nullable=True)
+
+    user = db.relationship("User")
+
+
+class BackgroundJob(db.Model):
+    """DB-backed background job for long-running AI work (generation, revision,
+    scope drafting). A small in-process worker pool claims and runs these."""
+    __tablename__ = "background_jobs"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    org_id = db.Column(db.String(32), nullable=True)
+    user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    kind = db.Column(db.String(50), nullable=False)  # generate_proposal, revise_proposal, draft_scope
+    status = db.Column(db.String(20), default="queued")  # queued, running, done, failed
+    phase = db.Column(db.String(50), default="")
+    message = db.Column(db.Text, default="")
+    payload = db.Column(db.Text, default="{}")  # JSON
+    result = db.Column(db.Text, default="{}")  # JSON (e.g. {"redirect": "/proposal/..."} )
+    error = db.Column(db.Text, default="")
+    created_at = db.Column(db.DateTime, default=_utcnow)
+    started_at = db.Column(db.DateTime, nullable=True)
+    finished_at = db.Column(db.DateTime, nullable=True)
+
+    user = db.relationship("User")
+
+
 class User(UserMixin, db.Model):
     __tablename__ = "users"
 
     id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    org_id = db.Column(db.String(32), db.ForeignKey("organizations.id"), nullable=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     email = db.Column(db.String(200), nullable=False)
     password_hash = db.Column(db.String(200), nullable=False)
@@ -30,6 +113,7 @@ class User(UserMixin, db.Model):
     font_preference = db.Column(db.String(100), default="Calibri")
     is_admin = db.Column(db.Boolean, default=False)
     role = db.Column(db.String(20), default="proposal")  # admin, sales, proposal
+    email_verified = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=_utcnow)
 
     # LLM settings — per-user overrides
@@ -64,8 +148,11 @@ class Project(db.Model):
 
     id = db.Column(db.String(32), primary_key=True, default=_uuid)
     user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    org_id = db.Column(db.String(32), db.ForeignKey("organizations.id"), nullable=True)
     name = db.Column(db.String(300), nullable=False)
     client_name = db.Column(db.String(300), default="")
+    client_email = db.Column(db.String(200), default="")  # customer contact for sends
+    request_type = db.Column(db.String(10), default="")  # rfp, rfq, rom, ''
     vertical = db.Column(db.String(50), default="general")
     vertical_label = db.Column(db.String(100), default="General")
     status = db.Column(db.String(30), default="active")  # active, submitted, won, lost, archived
@@ -206,6 +293,7 @@ class UserRateSheet(db.Model):
 
     id = db.Column(db.String(32), primary_key=True, default=_uuid)
     user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    org_id = db.Column(db.String(32), db.ForeignKey("organizations.id"), nullable=True)
     name = db.Column(db.String(300), nullable=False)
     sheet_type = db.Column(db.String(50), default="labor_rates")  # labor_rates, product_pricing
     file_path = db.Column(db.String(1000), nullable=False)
@@ -222,6 +310,7 @@ class UserVerticalTemplate(db.Model):
 
     id = db.Column(db.String(32), primary_key=True, default=_uuid)
     user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    org_id = db.Column(db.String(32), db.ForeignKey("organizations.id"), nullable=True)
     vertical = db.Column(db.String(50), nullable=False)
     template_type = db.Column(db.String(50), default="proposal")  # proposal, workflow, boilerplate
     name = db.Column(db.String(300), nullable=False)
@@ -239,6 +328,7 @@ class StaffRole(db.Model):
 
     id = db.Column(db.String(32), primary_key=True, default=_uuid)
     user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    org_id = db.Column(db.String(32), db.ForeignKey("organizations.id"), nullable=True)
     role_name = db.Column(db.String(200), nullable=False)
     category = db.Column(db.String(100), default="")  # e.g., Engineering, Management, Admin
     hourly_rate = db.Column(db.Float, nullable=False)
@@ -258,6 +348,7 @@ class EquipmentItem(db.Model):
 
     id = db.Column(db.String(32), primary_key=True, default=_uuid)
     user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    org_id = db.Column(db.String(32), db.ForeignKey("organizations.id"), nullable=True)
     item_name = db.Column(db.String(300), nullable=False)
     category = db.Column(db.String(100), default="")  # e.g., Electrical, Mechanical, Software
     part_number = db.Column(db.String(100), default="")
@@ -279,6 +370,7 @@ class TravelExpenseRate(db.Model):
 
     id = db.Column(db.String(32), primary_key=True, default=_uuid)
     user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    org_id = db.Column(db.String(32), db.ForeignKey("organizations.id"), nullable=True)
     expense_type = db.Column(db.String(100), nullable=False)  # airfare, hotel, per_diem, mileage, rental_car, other
     description = db.Column(db.String(300), default="")
     rate = db.Column(db.Float, nullable=False)
@@ -297,6 +389,7 @@ class CompanyStandard(db.Model):
 
     id = db.Column(db.String(32), primary_key=True, default=_uuid)
     user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    org_id = db.Column(db.String(32), db.ForeignKey("organizations.id"), nullable=True)
     category = db.Column(db.String(100), nullable=False)  # mission, certifications, past_performance, terms, safety, quality, etc.
     title = db.Column(db.String(300), nullable=False)
     content = db.Column(db.Text, nullable=False)
@@ -314,6 +407,7 @@ class ProposalCorrection(db.Model):
 
     id = db.Column(db.String(32), primary_key=True, default=_uuid)
     user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    org_id = db.Column(db.String(32), db.ForeignKey("organizations.id"), nullable=True)
     proposal_id = db.Column(db.String(32), db.ForeignKey("proposals.id"), nullable=False)
     vertical = db.Column(db.String(50), default="general")
     correction_summary = db.Column(db.Text, nullable=False)  # Natural language summary of changes
@@ -662,6 +756,7 @@ class RevisionTemplate(db.Model):
 
     id = db.Column(db.String(32), primary_key=True, default=_uuid)
     user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    org_id = db.Column(db.String(32), db.ForeignKey("organizations.id"), nullable=True)
     name = db.Column(db.String(200), nullable=False)
     category = db.Column(db.String(40), default="other")
     # Directive body, may contain {placeholder} tokens
@@ -670,3 +765,101 @@ class RevisionTemplate(db.Model):
     created_at = db.Column(db.DateTime, default=_utcnow)
 
     user = db.relationship("User", backref="revision_templates")
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Customer share portal
+# ---------------------------------------------------------------------------
+
+
+class ProposalShare(db.Model):
+    """A secure, tokenized share of a proposal with a customer. Renders a
+    read-only branded view at /p/<token>; tracks views and optionally lets the
+    customer comment or record an accept/decline decision."""
+    __tablename__ = "proposal_shares"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    proposal_id = db.Column(db.String(32), db.ForeignKey("proposals.id"), nullable=False)
+    project_id = db.Column(db.String(32), db.ForeignKey("projects.id"), nullable=False)
+    token = db.Column(db.String(64), unique=True, nullable=False,
+                      default=lambda: uuid.uuid4().hex + uuid.uuid4().hex)
+    created_by = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    customer_email = db.Column(db.String(200), default="")
+    version_number = db.Column(db.Integer, default=0)  # snapshot version shown
+
+    allow_comments = db.Column(db.Boolean, default=True)
+    allow_decision = db.Column(db.Boolean, default=True)
+
+    view_count = db.Column(db.Integer, default=0)
+    last_viewed_at = db.Column(db.DateTime, nullable=True)
+
+    # Customer's decision recorded through the portal
+    decision = db.Column(db.String(20), default="")  # accepted, declined
+    decision_note = db.Column(db.Text, default="")
+    decided_at = db.Column(db.DateTime, nullable=True)
+
+    revoked_at = db.Column(db.DateTime, nullable=True)
+    expires_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=_utcnow)
+
+    proposal = db.relationship("Proposal", backref="shares")
+    project = db.relationship("Project", backref="shares")
+    creator = db.relationship("User")
+
+
+class ShareView(db.Model):
+    """A single customer view of a shared proposal (for open analytics)."""
+    __tablename__ = "share_views"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    share_id = db.Column(db.String(32), db.ForeignKey("proposal_shares.id"), nullable=False)
+    viewed_at = db.Column(db.DateTime, default=_utcnow)
+    ip = db.Column(db.String(64), default="")
+    user_agent = db.Column(db.String(400), default="")
+
+    share = db.relationship("ProposalShare", backref="views")
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Structured pricing estimate
+# ---------------------------------------------------------------------------
+
+
+class ProposalEstimate(db.Model):
+    """A structured, editable cost estimate for a proposal. The AI drafts line
+    items from the RFP + the org's rates; humans edit them in a grid with live
+    totals; the estimate renders into the proposal's Pricing section."""
+    __tablename__ = "proposal_estimates"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    proposal_id = db.Column(db.String(32), db.ForeignKey("proposals.id"), nullable=False)
+    project_id = db.Column(db.String(32), db.ForeignKey("projects.id"), nullable=False)
+    org_id = db.Column(db.String(32), db.ForeignKey("organizations.id"), nullable=True)
+    currency = db.Column(db.String(10), default="USD")
+    markup_pct = db.Column(db.Float, default=0.0)  # applied to subtotal
+    status = db.Column(db.String(20), default="draft")  # draft, final
+    created_at = db.Column(db.DateTime, default=_utcnow)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow)
+
+    proposal = db.relationship("Proposal", backref=db.backref("estimate", uselist=False))
+    items = db.relationship("EstimateLineItem", backref="estimate",
+                            lazy="dynamic", cascade="all, delete-orphan")
+
+
+class EstimateLineItem(db.Model):
+    """One line in a ProposalEstimate. total = quantity * unit_cost.
+    For labor, quantity is hours and unit_cost is the hourly rate."""
+    __tablename__ = "estimate_line_items"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    estimate_id = db.Column(db.String(32), db.ForeignKey("proposal_estimates.id"), nullable=False)
+    kind = db.Column(db.String(20), default="labor")  # labor, equipment, travel, other
+    description = db.Column(db.String(400), nullable=False)
+    quantity = db.Column(db.Float, default=0.0)
+    unit = db.Column(db.String(40), default="")  # hrs, each, trip, ...
+    unit_cost = db.Column(db.Float, default=0.0)
+    sort_order = db.Column(db.Integer, default=0)
+
+    @property
+    def total(self) -> float:
+        return (self.quantity or 0) * (self.unit_cost or 0)

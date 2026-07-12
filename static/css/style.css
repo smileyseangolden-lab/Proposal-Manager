@@ -3005,3 +3005,72 @@ body {
     .sidebar, .topbar, .chatbot-trigger, .chatbot-panel, .footer { display: none !important; }
     .main-wrapper { margin-left: 0; }
 }
+
+/* ============================================================
+   SaaS additions: jobs, plans, portal, auth sub
+   ============================================================ */
+.page-narrow { max-width: 640px; margin: 0 auto; }
+.auth-sub { color: var(--gray-500, #667); font-size: 14px; margin: -6px 0 16px; }
+
+.job-card { text-align: center; padding: 48px 32px; }
+.job-spinner {
+    width: 46px; height: 46px; margin: 0 auto 22px;
+    border: 4px solid var(--sea-100, #d8ecec); border-top-color: var(--sea-800, #0f6b6b);
+    border-radius: 50%; animation: job-spin 0.9s linear infinite;
+}
+@keyframes job-spin { to { transform: rotate(360deg); } }
+.job-title { font-size: 22px; margin: 0 0 8px; }
+.job-phase { color: var(--gray-500, #667); margin: 0 0 22px; }
+.job-steps { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+.job-step {
+    font-size: 12px; padding: 6px 12px; border-radius: 999px;
+    background: var(--gray-100, #eef1f2); color: var(--gray-500, #667);
+}
+.job-step.active { background: var(--sea-800, #0f6b6b); color: #fff; }
+.job-step.done { background: var(--sea-100, #d8ecec); color: var(--sea-800, #0f6b6b); }
+.job-error { color: #b3261e; background: #fdecea; padding: 12px 16px; border-radius: 8px; margin-top: 12px; }
+.job-actions { margin-top: 20px; }
+
+.plan-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 18px; margin-bottom: 22px; }
+.plan-card { display: flex; flex-direction: column; }
+.plan-card.plan-current { border: 2px solid var(--sea-800, #0f6b6b); }
+.plan-price { font-size: 34px; font-weight: 700; margin: 6px 0 14px; }
+.plan-price span { font-size: 15px; font-weight: 400; color: var(--gray-500, #667); }
+.plan-features { list-style: none; padding: 0; margin: 0 0 18px; flex: 1; }
+.plan-features li { padding: 6px 0 6px 22px; position: relative; font-size: 14px; }
+.plan-features li::before { content: "✓"; position: absolute; left: 0; color: var(--sea-800, #0f6b6b); font-weight: 700; }
+.flash-info { background: #eaf4fb; color: #1c5d86; }
+
+.verify-banner { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.link-button {
+    background: none; border: none; color: inherit; text-decoration: underline;
+    cursor: pointer; font: inherit; padding: 0;
+}
+
+/* Customer share panel */
+.share-link-box { display: flex; gap: 6px; margin-bottom: 10px; }
+.share-link-box input { flex: 1; padding: 6px 8px; border: 1px solid var(--gray-200, #dfe3e6); border-radius: 6px; font-size: 12px; }
+.share-stats { list-style: none; padding: 0; margin: 0 0 10px; font-size: 13px; color: var(--gray-500, #667); }
+.share-stats li { padding: 2px 0; }
+.check-inline { display: block; font-size: 13px; margin: 4px 0; }
+.rail-sub { font-size: 13px; color: var(--gray-500, #667); margin: 0 0 10px; }
+
+/* Structured estimate grid */
+#estimate-grid input, #estimate-grid select { padding: 5px 6px; border: 1px solid var(--gray-200, #dfe3e6); border-radius: 5px; font-size: 13px; }
+.est-total { text-align: right; font-variant-numeric: tabular-nums; }
+.estimate-summary { margin: 18px 0 6px; margin-left: auto; max-width: 340px; }
+.est-summary-row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--gray-100, #eef1f2); }
+.est-summary-row.grand { border-top: 2px solid var(--sea-800, #0f6b6b); border-bottom: none; font-size: 17px; padding-top: 10px; }
+.form-actions { margin-top: 16px; display: flex; gap: 10px; flex-wrap: wrap; }
+
+/* AI ingestion import box */
+.ai-import-box { display: block; background: var(--sea-50, #f0f7f7); border: 1px dashed var(--sea-300, #9fcece); border-radius: 8px; padding: 12px 14px; margin: 10px 0 16px; }
+.ai-import-box strong { display: block; color: var(--sea-800, #0f6b6b); }
+.ai-import-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+.ingest-block { border: 1px solid var(--gray-200, #dfe3e6); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+
+/* Phase 6: editor AI assist, sample banner */
+.toolbar-divider { display: inline-block; width: 1px; height: 20px; background: var(--gray-200, #dfe3e6); margin: 0 4px; vertical-align: middle; }
+.ai-assist-group { display: inline-flex; align-items: center; gap: 4px; }
+.ai-assist-label { font-size: 12px; color: var(--sea-800, #0f6b6b); font-weight: 600; }
+.sample-banner { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; background: var(--sea-50, #f0f7f7); border-left: 3px solid var(--sea-800, #0f6b6b); }

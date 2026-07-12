@@ -4,9 +4,60 @@
 
 {% block content %}
 <section class="page-header">
-    <h1>Admin Panel</h1>
-    <p class="page-subtitle">Rep management dashboard &mdash; Company-wide tracking and metrics</p>
+    <h1>People &amp; Roles</h1>
+    <p class="page-subtitle">{{ org.name if org else 'Workspace' }} &mdash; team, invitations, and company-wide metrics</p>
 </section>
+
+<!-- Workspace + Team invitations -->
+<div class="card">
+    <h2>Workspace</h2>
+    <form method="post" action="{{ url_for('update_org_name') }}" class="inline-form" style="margin-bottom:18px; gap:8px; display:flex; flex-wrap:wrap; align-items:flex-end;">
+        <div class="form-group" style="margin:0; min-width:260px;">
+            <label for="org_name">Workspace name</label>
+            <input type="text" id="org_name" name="org_name" value="{{ org.name if org else '' }}" required>
+        </div>
+        <button type="submit" class="btn btn-secondary">Save</button>
+        <span class="form-hint" style="margin-left:auto;">Plan: <strong>{{ (org.plan or 'free')|title }}</strong> &middot; <a href="{{ url_for('billing_page') }}">Manage billing</a></span>
+    </form>
+
+    <h3 style="margin-top:8px;">Invite a teammate</h3>
+    <p class="card-desc">They'll get a link to create an account inside this workspace with the role you choose.</p>
+    <form method="post" action="{{ url_for('create_invitation') }}" class="inline-form" style="gap:8px; display:flex; flex-wrap:wrap; align-items:flex-end;">
+        <div class="form-group" style="margin:0; min-width:240px;">
+            <label for="invite_email">Email address</label>
+            <input type="email" id="invite_email" name="invite_email" placeholder="teammate@company.com" required>
+        </div>
+        <div class="form-group" style="margin:0;">
+            <label for="invite_role">Role</label>
+            <select id="invite_role" name="invite_role">
+                <option value="proposal">Proposal</option>
+                <option value="sales">Sales</option>
+                <option value="admin">Admin</option>
+            </select>
+        </div>
+        <button type="submit" class="btn btn-primary">Send invite</button>
+    </form>
+
+    {% if pending_invitations %}
+    <table class="mini-table" style="margin-top:16px;">
+        <thead><tr><th>Pending invitation</th><th>Role</th><th>Invited</th><th></th></tr></thead>
+        <tbody>
+        {% for inv in pending_invitations %}
+        <tr>
+            <td>{{ inv.email }}</td>
+            <td><span class="role-badge role-{{ inv.role }}">{{ inv.role|title }}</span></td>
+            <td style="white-space:nowrap;">{{ inv.created_at.strftime('%Y-%m-%d') }}</td>
+            <td>
+                <form method="post" action="{{ url_for('revoke_invitation', invite_id=inv.id) }}" class="inline-form">
+                    <button type="submit" class="btn btn-small btn-secondary">Revoke</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+</div>
 
 <!-- Company-wide stats -->
 <section class="stats-grid">
@@ -118,6 +169,30 @@
             {% endfor %}
         </tbody>
     </table>
+</div>
+
+<!-- Integrations -->
+<div class="card" id="integrations">
+    <h2>Integrations</h2>
+    <p class="card-desc">Get a message in Slack (or your own endpoint) when proposals are generated and deals are won or lost.</p>
+    <form method="post" action="{{ url_for('update_integrations') }}">
+        <div class="form-group">
+            <label for="slack_webhook_url">Slack incoming webhook URL</label>
+            <input type="url" id="slack_webhook_url" name="slack_webhook_url" placeholder="https://hooks.slack.com/services/…" value="{{ org.slack_webhook_url if org else '' }}">
+        </div>
+        <div class="form-group">
+            <label for="outbound_webhook_url">Outbound webhook URL <span class="form-hint">(receives JSON events)</span></label>
+            <input type="url" id="outbound_webhook_url" name="outbound_webhook_url" placeholder="https://your-app.example.com/hooks/proposals" value="{{ org.outbound_webhook_url if org else '' }}">
+        </div>
+        <button type="submit" class="btn btn-secondary">Save integrations</button>
+    </form>
+</div>
+
+<!-- Data & workspace -->
+<div class="card">
+    <h2>Data &amp; Workspace</h2>
+    <p class="card-desc">Export every project and proposal in this workspace as JSON.</p>
+    <a href="{{ url_for('export_org_data') }}" class="btn btn-secondary">Export workspace data (JSON)</a>
 </div>
 
 <!-- Recent Activity Log -->

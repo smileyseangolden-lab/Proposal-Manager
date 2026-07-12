@@ -254,15 +254,52 @@ The web interface highlights these in a summary panel so the proposal team knows
 
 ---
 
+## SaaS Platform Features
+
+Proposal Manager runs as a multi-tenant SaaS. Each signup creates an isolated
+**workspace (organization)**; the creator is its admin and invites teammates by
+email from **People & Roles**. All posture, projects, proposals, and reporting
+are scoped to the workspace.
+
+- **Multi-tenancy & invites** — org-scoped data, email invitations with roles.
+- **Background generation** — AI proposal/estimate work runs off-request with a
+  live progress page (no gunicorn/load-balancer timeouts).
+- **Postgres & object storage** — set `DATABASE_URL` for Postgres and `S3_*` for
+  S3/Spaces so uploads and generated files survive ephemeral disks.
+- **Auth hardening** — password reset, email verification, CSRF protection,
+  login rate limiting, secure cookies, and Fernet-encrypted API keys.
+- **Customer portal** — share a secure link (`/p/<token>`); the customer views a
+  branded proposal, comments, and accepts/declines, with open tracking. Email it
+  with a branded **PDF** attached.
+- **ROM support** — Rough Order of Magnitude request type produces a lighter,
+  range-priced budgetary estimate you can later convert to a full proposal.
+- **Structured pricing** — an editable estimate grid (labor/equipment/travel)
+  with live totals, CSV export, and one-click insertion into the proposal.
+- **AI ingestion** — upload a rate sheet, price list, or capabilities deck and
+  the AI extracts structured rows/standards you review before importing.
+- **Billing & plans** — Free/Pro/Business with seat, project, and generation
+  limits. Optional Stripe checkout/portal (self-hosted mode switches plans
+  directly when Stripe is unconfigured).
+- **Integrations** — per-workspace Slack incoming webhook and generic outbound
+  webhook fire on proposal-generated and won/lost events.
+- **AI help assistant** — a Claude-powered in-app assistant grounded in the
+  product; **editor AI actions** (tighten / formalize / expand / fix grammar).
+
 ## Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `ANTHROPIC_API_KEY` | Your Anthropic API key | (required) |
+| `ANTHROPIC_API_KEY` | Platform Anthropic API key (users may also set their own) | (required) |
 | `FLASK_SECRET_KEY` | Flask session secret | `dev-secret-change-me` |
-| `FLASK_HOST` | Bind address | `0.0.0.0` |
-| `FLASK_PORT` | Port number | `5000` |
+| `APP_ENCRYPTION_KEY` | Secret used to encrypt stored API keys (falls back to `FLASK_SECRET_KEY`) | (optional) |
+| `DATABASE_URL` | Postgres URL; SQLite is used if unset | SQLite in `data/` |
+| `FLASK_HOST` / `FLASK_PORT` | Bind address / port | `0.0.0.0` / `5000` |
 | `FLASK_DEBUG` | Debug mode | `false` |
+| `SESSION_COOKIE_SECURE` | Send session cookie only over HTTPS | `true` |
 | `MAX_UPLOAD_SIZE_MB` | Max upload size | `50` |
+| `JOBS_INLINE` | Run background jobs synchronously (dev/test) | `false` |
+| `S3_BUCKET`, `S3_REGION`, `S3_ENDPOINT_URL`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | S3/Spaces object storage (optional) | (unset = local files) |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `MAIL_FROM` | Email delivery (optional; console fallback) | (unset) |
+| `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_PRO`, `STRIPE_PRICE_BUSINESS` | Billing (optional) | (unset = self-hosted plan switching) |
 | `DEFAULT_OUTPUT_FORMAT` | Output format | `docx` |
 

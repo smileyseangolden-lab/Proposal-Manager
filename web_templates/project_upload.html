@@ -23,6 +23,7 @@
                 </a>
                 {% endif %}
                 <span>{{ project.client_name or 'No client specified' }}</span>
+                {% if project.request_type %}<span class="badge badge-status-open">{{ project.request_type | upper }}</span>{% endif %}
                 {% if project.vertical_label %}<span>&middot; {{ project.vertical_label }}</span>{% endif %}
                 {% if project.dollar_amount %}<span>&middot; ${{ "{:,.0f}".format(project.dollar_amount) }}</span>{% endif %}
                 {% if project.due_date %}<span>&middot; Due {{ project.due_date.strftime('%b %d, %Y') }}</span>{% endif %}
@@ -38,6 +39,24 @@
 </section>
 
 {% include "_stepper.html" %}
+
+{% if project.request_type == 'rom' and latest_prop %}
+<div class="card" style="background: var(--sea-50, #f0f7f7); border-left: 3px solid var(--sea-800, #0f6b6b);">
+    <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+        <div>
+            <strong>This is a ROM (budgetary) estimate.</strong>
+            <span class="form-hint">When the customer is ready for a firm number, convert it to a full proposal and regenerate.</span>
+        </div>
+        <form method="post" action="{{ url_for('convert_rom_to_full', project_id=project.id) }}" class="inline-form" style="gap:6px;">
+            <select name="new_type" class="role-select">
+                <option value="rfp">RFP</option>
+                <option value="rfq">RFQ</option>
+            </select>
+            <button type="submit" class="btn btn-small btn-primary">Convert to full proposal</button>
+        </form>
+    </div>
+</div>
+{% endif %}
 
 {% if pending_questions %}
 <a class="insight-banner" href="{{ url_for('project_questions', project_id=project.id) }}">

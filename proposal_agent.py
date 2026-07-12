@@ -95,7 +95,8 @@ def _build_system_prompt(vertical_key: str, vertical_resources: dict,
                          equipment_data: list = None,
                          travel_data: list = None,
                          past_corrections: list = None,
-                         company_standards: list = None) -> str:
+                         company_standards: list = None,
+                         request_type: str = "") -> str:
     """Assemble the system prompt with all context."""
 
     vertical_label = VERTICALS.get(vertical_key, {}).get("label", "General")
@@ -293,10 +294,30 @@ Apply these lessons: match the user's preferred tone, detail level, structure,
 and content choices. Avoid repeating the same mistakes identified above.
 """
 
-    return f"""You are the Proposal Manager Agent — an expert proposal writer that generates
-professional proposals in response to customer RFP (Request for Proposal) and
-RFQ (Request for Quotation) documents.
+    rom_block = ""
+    if (request_type or "").lower() == "rom":
+        rom_block = """
+## ROUGH ORDER OF MAGNITUDE (ROM) MODE
 
+This is a **Rough Order of Magnitude budgetary estimate**, NOT a firm proposal.
+Adjust your output accordingly:
+- Present pricing as **ranges** (e.g., "$180,000 – $240,000") reflecting ROM-level
+  accuracy (typically -25% to +50%), not precise line-item totals.
+- Keep it concise: an executive summary, high-level scope/assumptions, a
+  budgetary cost range table, key exclusions, and clearly stated assumptions.
+- OMIT exhaustive compliance matrices, detailed terms & conditions, and
+  resume/personnel sections — those belong in a full proposal.
+- Add a prominent disclaimer that this is a preliminary budgetary estimate for
+  planning purposes only, subject to a formal proposal upon detailed scope
+  definition, and valid for a limited period.
+- Still use `[ACTION REQUIRED: ...]` markers where the customer must clarify
+  scope before a firm number can be given.
+"""
+
+    return f"""You are the Proposal Manager Agent — an expert proposal writer that generates
+professional proposals in response to customer RFP (Request for Proposal),
+RFQ (Request for Quotation), and ROM (Rough Order of Magnitude) requests.
+{rom_block}
 {company_line}## Industry Vertical
 
 You are generating a **{vertical_label}** proposal. Use the vertical-specific
@@ -504,7 +525,8 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
                       travel_data: list = None,
                       past_corrections: list = None,
                       company_standards: list = None,
-                      approved_scope: list = None) -> dict:
+                      approved_scope: list = None,
+                      request_type: str = "") -> dict:
     """Generate a proposal from the given RFP/RFQ text.
 
     Args:
@@ -579,14 +601,18 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
         travel_data=travel_data,
         past_corrections=past_corrections,
         company_standards=company_standards,
+        request_type=request_type,
     )
 
     _report("analysis", f"Generating {vertical_label} proposal...")
 
+    is_rom = (request_type or "").lower() == "rom"
+    doc_kind = "Rough Order of Magnitude (ROM) budgetary estimate" if is_rom else f"{vertical_label} proposal"
+
     # Build messages
     user_message = (
-        f"Please generate a complete {vertical_label} proposal in "
-        "response to the following RFP/RFQ document. Follow the "
+        f"Please generate a complete {doc_kind} in "
+        "response to the following document. Follow the "
         "workflow exactly.\n\n"
         "---BEGIN DOCUMENT---\n"
         f"{rfp_text}\n"
@@ -1297,3 +1323,215 @@ Return your analysis as the JSON object described in the instructions.
         }
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Structured estimate & ingestion extraction
+# ---------------------------------------------------------------------------
+
+
+def draft_estimate(rfp_text: str,
+                   staff_roles: list = None,
+                   equipment: list = None,
+                   travel: list = None,
+                   approved_scope: list = None,
+                   user_api_key: str = None,
+                   user_model: str = None) -> dict:
+    """Draft a structured cost estimate as line items the human can edit.
+
+    Returns {"currency": str, "items": [{"kind","description","quantity","unit","unit_cost"}]}.
+    Only uses rates the org provided — never invents unit costs. Where a needed
+    rate is missing it sets unit_cost to 0 so the human fills it in.
+    """
+    api_key = user_api_key or ANTHROPIC_API_KEY
+    model = user_model or CLAUDE_MODEL
+    if not api_key:
+        raise RuntimeError("No API key configured. Add your Anthropic API key in Settings.")
+
+    def _rate_lines(items, cols):
+        out = []
+        for it in (items or []):
+            out.append(", ".join(f"{c}={it.get(c)}" for c in cols if it.get(c) is not None))
+        return "\n".join(out) or "(none provided)"
+
+    staff_block = _rate_lines(staff_roles, ["role_name", "category", "hourly_rate", "overtime_rate"])
+    equip_block = _rate_lines(equipment, ["item_name", "category", "unit_cost", "unit"])
+    travel_block = _rate_lines(travel, ["expense_type", "rate", "unit"])
+    scope_block = "\n".join(f"- {s}" for s in (approved_scope or [])) or "(use the RFP)"
+
+    system_prompt = f"""You are a cost estimator. Produce a structured, itemized cost estimate for
+the project described, as JSON only.
+
+## Available rates (use ONLY these unit costs — do not invent prices)
+### Labor roles (unit_cost = hourly_rate)
+{staff_block}
+### Equipment (unit_cost = unit price)
+{equip_block}
+### Travel (unit_cost = rate)
+{travel_block}
+
+## Scope to price
+{scope_block}
+
+## Output — JSON only:
+{{
+  "currency": "USD",
+  "items": [
+    {{"kind": "labor", "description": "Controls Engineer — programming", "quantity": 120, "unit": "hrs", "unit_cost": 145}},
+    {{"kind": "equipment", "description": "EPMS meter", "quantity": 40, "unit": "each", "unit_cost": 850}},
+    {{"kind": "travel", "description": "Site trips", "quantity": 4, "unit": "trip", "unit_cost": 1200}}
+  ]
+}}
+
+## Rules
+- kind is one of: labor, equipment, travel, other.
+- For labor, quantity is estimated HOURS and unit_cost is the hourly rate from the list.
+- Estimate realistic quantities from the scope. If a needed rate is not in the
+  lists above, still include the line with your best quantity and set unit_cost to 0.
+- 3-25 line items. Output JSON only, no preamble.
+"""
+    client = _make_client(api_key)
+    text = ""
+    with client.messages.stream(
+        model=model, max_tokens=4000, system=system_prompt,
+        messages=[{"role": "user", "content": f"---RFP---\n{rfp_text[:40000]}\n---END---"}],
+    ) as stream:
+        for chunk in stream.text_stream:
+            text += chunk
+
+    items = []
+    currency = "USD"
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            currency = (data.get("currency") or "USD")[:10]
+            for e in data.get("items", []):
+                if not isinstance(e, dict):
+                    continue
+                desc = (e.get("description") or "").strip()
+                if not desc:
+                    continue
+                kind = (e.get("kind") or "other").lower()
+                if kind not in ("labor", "equipment", "travel", "other"):
+                    kind = "other"
+                items.append({
+                    "kind": kind,
+                    "description": desc[:400],
+                    "quantity": float(e.get("quantity") or 0),
+                    "unit": (e.get("unit") or "")[:40],
+                    "unit_cost": float(e.get("unit_cost") or 0),
+                })
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+    if not items:
+        raise RuntimeError("The AI could not draft an estimate. Try adding rates or an approved scope first.")
+    return {"currency": currency, "items": items}
+
+
+def extract_rates_from_sheet(raw_text: str, target_type: str,
+                             user_api_key: str = None, user_model: str = None) -> list[dict]:
+    """Map a parsed rate-sheet's raw text into structured rows for review.
+
+    target_type: 'labor_rates' -> [{role_name, category, hourly_rate, overtime_rate}]
+                 'product_pricing' -> [{item_name, category, unit_cost, unit, part_number, manufacturer}]
+                 'travel' -> [{expense_type, rate, unit, description}]
+    Returns [] if nothing could be extracted.
+    """
+    api_key = user_api_key or ANTHROPIC_API_KEY
+    model = user_model or CLAUDE_MODEL
+    if not api_key:
+        raise RuntimeError("No API key configured. Add your Anthropic API key in Settings.")
+
+    schemas = {
+        "labor_rates": '[{"role_name": "Senior Engineer", "category": "Engineering", "hourly_rate": 165, "overtime_rate": 247}]',
+        "product_pricing": '[{"item_name": "PLC", "category": "Controls", "unit_cost": 3200, "unit": "each", "part_number": "1756-L83E", "manufacturer": "Allen-Bradley"}]',
+        "travel": '[{"expense_type": "Per Diem", "rate": 75, "unit": "per day", "description": ""}]',
+    }
+    schema = schemas.get(target_type, schemas["labor_rates"])
+
+    system_prompt = f"""You convert a spreadsheet's text into clean structured rows.
+Extract every priced row from the sheet below into JSON matching this shape:
+{schema}
+
+Rules:
+- Output a JSON array ONLY, no preamble.
+- Numbers must be plain numbers (strip $ and commas).
+- Skip header rows, totals, blank rows, and notes.
+- If a column is missing, omit it or use a sensible empty value.
+- Do not invent rows that aren't in the data.
+"""
+    client = _make_client(api_key)
+    text = ""
+    with client.messages.stream(
+        model=model, max_tokens=4000, system=system_prompt,
+        messages=[{"role": "user", "content": f"---SHEET---\n{raw_text[:30000]}\n---END---"}],
+    ) as stream:
+        for chunk in stream.text_stream:
+            text += chunk
+
+    m = re.search(r"\[.*\]", text, re.DOTALL)
+    if not m:
+        return []
+    try:
+        rows = json.loads(m.group(0))
+    except (json.JSONDecodeError, ValueError):
+        return []
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def extract_standards(document_text: str,
+                      user_api_key: str = None, user_model: str = None) -> list[dict]:
+    """Propose reusable company standard blocks from an uploaded document
+    (capabilities deck, past proposal, boilerplate). Returns
+    [{category, title, content}] for human review before import."""
+    api_key = user_api_key or ANTHROPIC_API_KEY
+    model = user_model or CLAUDE_MODEL
+    if not api_key:
+        raise RuntimeError("No API key configured. Add your Anthropic API key in Settings.")
+
+    system_prompt = """You extract reusable proposal boilerplate from a company document.
+Identify self-contained content blocks worth reusing across proposals:
+company overview, certifications, safety record, quality approach, past
+performance, warranty/terms, differentiators.
+
+Output a JSON array ONLY:
+[{"category": "certifications", "title": "ISO 9001 & Safety", "content": "..."}]
+
+Rules:
+- category is a short slug (mission, certifications, past_performance, safety,
+  quality, terms, differentiators, general).
+- content is the actual reusable prose (may be lightly cleaned up), 1-3 paragraphs.
+- 2-12 blocks. Do NOT fabricate certifications, numbers, or claims not present
+  in the source. Output JSON only.
+"""
+    client = _make_client(api_key)
+    text = ""
+    with client.messages.stream(
+        model=model, max_tokens=4000, system=system_prompt,
+        messages=[{"role": "user", "content": f"---DOCUMENT---\n{document_text[:40000]}\n---END---"}],
+    ) as stream:
+        for chunk in stream.text_stream:
+            text += chunk
+
+    m = re.search(r"\[.*\]", text, re.DOTALL)
+    if not m:
+        return []
+    try:
+        rows = json.loads(m.group(0))
+    except (json.JSONDecodeError, ValueError):
+        return []
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        title = (r.get("title") or "").strip()
+        content = (r.get("content") or "").strip()
+        if not title or not content:
+            continue
+        out.append({
+            "category": (r.get("category") or "general").strip().lower()[:100],
+            "title": title[:300],
+            "content": content,
+        })
+    return out
