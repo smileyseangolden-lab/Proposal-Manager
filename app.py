@@ -14,12 +14,13 @@ Full-featured intranet application with:
 import difflib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import markdown as md
@@ -57,11 +58,14 @@ from config.settings import (
     INSECURE_SECRETS,
     IS_PRODUCTION,
     MAX_UPLOAD_SIZE_MB,
+    SELF_HOSTED,
+    TRUST_PROXY_HOPS,
     UPLOADS_DIR,
     VERTICALS,
 )
 import billing
 import crypto_util
+import htmlsafe
 import jobs
 import proposal_agent
 import storage
@@ -173,6 +177,12 @@ def _verify_production_secrets():
 
 _verify_production_secrets()
 
+# Structured logging to stdout (captured by the platform's log aggregation).
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+
 # Whether to surface reset/verification links in the UI when email is
 # unconfigured. NEVER true in production — otherwise /forgot-password would hand
 # a valid reset token to any unauthenticated requester (account takeover).
@@ -192,6 +202,14 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", "true").lower() == "true"
 app.config["PERMANENT_SESSION_LIFETIME"] = 60 * 60 * 24 * 14  # 14 days
+
+# Behind a reverse proxy, trust its forwarding headers so request.remote_addr is
+# the real client IP (used for login rate limiting), not the proxy's.
+if TRUST_PROXY_HOPS > 0:
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(
+        app.wsgi_app, x_for=TRUST_PROXY_HOPS, x_proto=TRUST_PROXY_HOPS, x_host=TRUST_PROXY_HOPS
+    )
 
 # Ensure data directory exists
 (Path(__file__).resolve().parent / "data").mkdir(exist_ok=True)
@@ -225,6 +243,24 @@ def inject_branding():
 @login_manager.user_loader
 def load_user(user_id):
     return db.session.get(User, user_id)
+
+
+@app.route("/healthz")
+def healthz():
+    """Readiness probe for load balancers: verifies the DB is reachable."""
+    from sqlalchemy import text as _sql_text
+    try:
+        db.session.execute(_sql_text("SELECT 1"))
+        return {"status": "ok"}, 200
+    except Exception:
+        app.logger.exception("healthz DB check failed")
+        return {"status": "error"}, 503
+
+
+@app.route("/livez")
+def livez():
+    """Liveness probe: the process is up (no dependencies checked)."""
+    return {"status": "ok"}, 200
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +325,18 @@ _LOGIN_ATTEMPTS: dict[str, list[float]] = {}
 _LOGIN_MAX_ATTEMPTS = 8
 _LOGIN_WINDOW_SECONDS = 300
 
+# Cross-worker, per-account lockout (DB-backed): after this many consecutive
+# failures the account is locked for this long.
+_ACCOUNT_LOCK_THRESHOLD = 10
+_ACCOUNT_LOCK_SECONDS = 15 * 60
+
+
+def _aware(dt):
+    """Treat a naive datetime (as SQLite returns) as UTC for safe comparison."""
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
 
 def _login_rate_limited(key: str) -> bool:
     now = time.time()
@@ -327,6 +375,15 @@ jobs.init_app(app)
 # an org exceeds its monthly AI budget. See security audit (LLM spend control).
 proposal_agent.set_usage_sink(billing.record_llm_usage)
 proposal_agent.set_budget_checker(billing.check_ai_budget)
+
+# Reap any jobs orphaned by a previous process (e.g. a deploy mid-generation)
+# so they stop polling forever. Workers themselves start lazily on first enqueue
+# and re-run the reaper each poll.
+with app.app_context():
+    try:
+        jobs.reap_stale_jobs()
+    except Exception:
+        app.logger.warning("Startup job reap failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -741,8 +798,12 @@ def signup():
     user.set_password(password)
 
     if invitation:
-        # Join the inviting organization with the invited role
+        # Join the inviting organization with the invited role.
+        # Bind the account to the INVITED email, not whatever was typed in the
+        # form — otherwise a forwarded invite link could be claimed under an
+        # arbitrary address (and marked verified below).
         org = db.session.get(Organization, invitation.org_id)
+        user.email = invitation.email
         user.org_id = org.id
         user.company_name = org.name
         user.role = invitation.role if invitation.role in ("admin", "sales", "proposal") else "proposal"
@@ -803,12 +864,30 @@ def login():
 
     user = User.query.filter_by(username=username).first()
 
+    # Cross-worker, per-account lockout (survives multiple gunicorn workers and
+    # catches password spraying against one account regardless of source IP).
+    now = datetime.now(timezone.utc)
+    if user and user.lockout_until and _aware(user.lockout_until) > now:
+        flash("This account is temporarily locked after too many failed attempts. "
+              "Please wait a few minutes and try again.", "error")
+        return redirect(url_for("login"))
+
     if not user or not user.check_password(password):
         _record_login_attempt(rl_key)
+        if user:
+            user.failed_login_count = (user.failed_login_count or 0) + 1
+            if user.failed_login_count >= _ACCOUNT_LOCK_THRESHOLD:
+                user.lockout_until = now + timedelta(seconds=_ACCOUNT_LOCK_SECONDS)
+                user.failed_login_count = 0
+            db.session.commit()
         flash("Invalid username or password.", "error")
         return redirect(url_for("login"))
 
     _LOGIN_ATTEMPTS.pop(rl_key, None)
+    if user.failed_login_count or user.lockout_until:
+        user.failed_login_count = 0
+        user.lockout_until = None
+        db.session.commit()
     login_user(user)
     _log_activity("login")
     return redirect(url_for("dashboard"))
@@ -3465,7 +3544,7 @@ def view_proposal(proposal_id):
         view_mode = "clean"
         proposal_md_render = proposal_md
 
-    proposal_html = md.markdown(proposal_md_render, extensions=["tables", "fenced_code"])
+    proposal_html = htmlsafe.sanitize(md.markdown(proposal_md_render, extensions=["tables", "fenced_code"]))
 
     meta = {
         "source_file": project.name,
@@ -4012,7 +4091,7 @@ def view_version(proposal_id, version_id):
     if not version or version.proposal_id != proposal_id:
         abort(404)
 
-    proposal_html = md.markdown(version.markdown_content, extensions=["tables", "fenced_code"])
+    proposal_html = htmlsafe.sanitize(md.markdown(version.markdown_content, extensions=["tables", "fenced_code"]))
 
     return render_template(
         "proposal_version.html",
@@ -4390,7 +4469,7 @@ def proposal_review_page(proposal_id):
     version = latest_version(proposal_id)
     md_path = GENERATED_DIR / proposal.md_file
     proposal_md = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
-    proposal_html = md.markdown(proposal_md, extensions=["tables", "fenced_code"])
+    proposal_html = htmlsafe.sanitize(md.markdown(proposal_md, extensions=["tables", "fenced_code"]))
 
     # My pending/existing revision requests on this proposal
     my_requests = RevisionRequest.query.filter_by(
@@ -4958,7 +5037,7 @@ def customer_portal(token):
     # Strip internal-only markers from the customer-facing view
     md_text = re.sub(r"\[ACTION REQUIRED:.*?\]", "", md_text)
     md_text = re.sub(r"\[ASSUMED:.*?\]", "", md_text)
-    proposal_html = md.markdown(md_text, extensions=["tables", "fenced_code"])
+    proposal_html = htmlsafe.sanitize(md.markdown(md_text, extensions=["tables", "fenced_code"]))
 
     company_name = (owner.company_name if owner else "") or ""
     logo_url = url_for("portal_logo", token=token) if (
@@ -5594,15 +5673,29 @@ def update_integrations():
     """Save the org's Slack incoming webhook and generic outbound webhook URLs."""
     if not current_user.is_admin or not current_user.org_id:
         abort(403)
+    import integrations
     org = db.session.get(Organization, current_user.org_id)
     slack = request.form.get("slack_webhook_url", "").strip()
     webhook = request.form.get("outbound_webhook_url", "").strip()
-    # Basic sanity: only accept https URLs (or empty to clear)
-    org.slack_webhook_url = slack if (slack.startswith("https://") or not slack) else org.slack_webhook_url
-    org.outbound_webhook_url = webhook if (webhook.startswith("https://") or not webhook) else org.outbound_webhook_url
+    # Validate against SSRF: must be a public host (no internal/metadata targets),
+    # Slack pinned to slack.com. Empty clears the value; an invalid URL is rejected.
+    errors = []
+    if not slack:
+        org.slack_webhook_url = ""
+    elif integrations.is_safe_webhook_url(slack, require_https=True, host_suffix="slack.com"):
+        org.slack_webhook_url = slack
+    else:
+        errors.append("Slack webhook must be a valid https://hooks.slack.com URL.")
+    if not webhook:
+        org.outbound_webhook_url = ""
+    elif integrations.is_safe_webhook_url(webhook):
+        org.outbound_webhook_url = webhook
+    else:
+        errors.append("Outbound webhook must be a valid public http(s) URL.")
     db.session.commit()
     _log_activity("integrations_update", "Updated integrations")
-    flash("Integrations saved.", "success")
+    flash("Integrations saved." if not errors else " ".join(errors),
+          "success" if not errors else "error")
     return redirect(url_for("admin_panel") + "#integrations")
 
 
@@ -5744,9 +5837,15 @@ def billing_checkout(plan_key):
     org = db.session.get(Organization, current_user.org_id)
 
     if not billing.stripe_enabled():
-        # No Stripe configured — switch plan directly (self-hosted / trial mode)
+        # No Stripe configured. Direct plan switching is only for self-hosted
+        # single-tenant installs (SELF_HOSTED=true). In hosted/SaaS mode a
+        # missing Stripe key must NOT let an admin self-upgrade to a paid plan
+        # for free — allow only downgrades to the free plan.
+        if not SELF_HOSTED and plan_key != "free":
+            flash("Online payments aren't available right now. Please try again later.", "error")
+            return redirect(url_for("billing_page"))
         org.plan = plan_key
-        org.billing_status = "active"
+        org.billing_status = "active" if plan_key != "free" else ""
         db.session.commit()
         _log_activity("plan_change", f"Switched to {plan_key} plan (no Stripe)")
         flash(f"Plan changed to {billing.PLANS[plan_key]['name']}.", "success")
@@ -5901,7 +6000,9 @@ def toggle_admin(user_id):
         flash("You cannot change your own role.", "error")
         return redirect(url_for("admin_panel"))
     user = db.session.get(User, user_id)
-    if not user:
+    # Scope to the caller's own organization — is_admin is a tenant admin, so an
+    # admin must not be able to flip roles of users in another org.
+    if not user or not _same_org(user):
         abort(404)
     user.is_admin = not user.is_admin
     user.role = "admin" if user.is_admin else "proposal"
@@ -5921,7 +6022,8 @@ def update_user_role(user_id):
         return redirect(url_for("admin_panel"))
 
     user = db.session.get(User, user_id)
-    if not user:
+    # Scope to the caller's own organization (see toggle_admin).
+    if not user or not _same_org(user):
         abort(404)
 
     new_role = request.form.get("role", "").strip().lower()
@@ -6727,6 +6829,12 @@ def delete_proposal_comment(proposal_id, comment_id):
     """Delete a comment (author or admin only)."""
     comment = db.session.get(ProposalComment, comment_id)
     if not comment or comment.proposal_id != proposal_id:
+        abort(404)
+    # Enforce tenant isolation first: the caller must be able to access the
+    # parent proposal's project (org-scoped) before any author/admin check.
+    proposal = db.session.get(Proposal, proposal_id)
+    project = db.session.get(Project, proposal.project_id) if proposal else None
+    if not _can_access_project(project):
         abort(404)
     if comment.author_id != current_user.id and not current_user.is_admin:
         abort(403)

@@ -116,6 +116,11 @@ class User(UserMixin, db.Model):
     email_verified = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=_utcnow)
 
+    # Login throttling — cross-worker, per-account (complements the in-process
+    # per-IP limiter, which doesn't survive multiple gunicorn workers).
+    failed_login_count = db.Column(db.Integer, default=0)
+    lockout_until = db.Column(db.DateTime, nullable=True)
+
     # LLM settings — per-user overrides
     llm_provider = db.Column(db.String(50), default="anthropic")
     llm_model = db.Column(db.String(100), default="claude-opus-4-6")

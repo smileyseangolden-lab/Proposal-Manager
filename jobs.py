@@ -26,6 +26,9 @@ _HANDLERS: dict[str, callable] = {}
 _WORKERS_STARTED = False
 _WORKER_COUNT = 2
 _POLL_SECONDS = 1.5
+# A job stuck in "running" longer than this is assumed orphaned (its worker
+# died / was killed on deploy) and is reaped to "failed" so it stops polling.
+_STALE_JOB_SECONDS = 60 * 30
 
 _app = None  # set by init_app
 
@@ -135,10 +138,30 @@ def _run_job(job_id: str):
             pass
 
 
+def reap_stale_jobs():
+    """Fail jobs stuck in 'running' past the staleness threshold (their worker
+    died mid-run, e.g. on a deploy). Without this they poll forever."""
+    from datetime import timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=_STALE_JOB_SECONDS)
+    stale = BackgroundJob.query.filter(
+        BackgroundJob.status == "running",
+        BackgroundJob.started_at.isnot(None),
+        BackgroundJob.started_at < cutoff,
+    ).all()
+    for job in stale:
+        job.status = "failed"
+        job.error = "Job timed out or its worker stopped; please retry."
+        job.finished_at = datetime.now(timezone.utc)
+    if stale:
+        db.session.commit()
+        logger.warning("Reaped %d stale running job(s)", len(stale))
+
+
 def _worker_loop():
     while True:
         try:
             with _app.app_context():
+                reap_stale_jobs()
                 job_id = _claim()
                 if job_id:
                     _run_job(job_id)

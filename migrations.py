@@ -69,6 +69,29 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # Phase 6: integrations
     ("organizations", "slack_webhook_url", "VARCHAR(1000) DEFAULT ''"),
     ("organizations", "outbound_webhook_url", "VARCHAR(1000) DEFAULT ''"),
+    # Hardening: cross-worker login throttling
+    ("users", "failed_login_count", "INTEGER DEFAULT 0"),
+    ("users", "lockout_until", "TIMESTAMP"),
+]
+
+# Indexes on hot filter / foreign-key columns. CREATE INDEX IF NOT EXISTS is
+# valid on SQLite and PostgreSQL and idempotent, so this runs safely every boot.
+# (name, table, column)
+_INDEX_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("ix_projects_org_id", "projects", "org_id"),
+    ("ix_projects_user_id", "projects", "user_id"),
+    ("ix_projects_assigned_to", "projects", "assigned_to"),
+    ("ix_projects_status", "projects", "status"),
+    ("ix_users_org_id", "users", "org_id"),
+    ("ix_proposals_project_id", "proposals", "project_id"),
+    ("ix_project_documents_project_id", "project_documents", "project_id"),
+    ("ix_proposal_versions_proposal_id", "proposal_versions", "proposal_id"),
+    ("ix_clarification_items_project_id", "clarification_items", "project_id"),
+    ("ix_notifications_user_id", "notifications", "user_id"),
+    ("ix_activity_logs_user_id", "activity_logs", "user_id"),
+    ("ix_background_jobs_org_id", "background_jobs", "org_id"),
+    ("ix_background_jobs_status", "background_jobs", "status"),
+    ("ix_background_jobs_created_at", "background_jobs", "created_at"),
 ]
 
 # Tables that carry a per-user org_id needing backfill from the owning user.
@@ -114,6 +137,20 @@ def _add_missing_columns():
         except Exception:
             db.session.rollback()
             logger.exception("Migration: failed to add column %s.%s", table, column)
+
+
+def _add_indexes():
+    inspector = inspect(db.engine)
+    tables = set(inspector.get_table_names())
+    for name, table, column in _INDEX_MIGRATIONS:
+        if table not in tables:
+            continue
+        try:
+            db.session.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({column})"))
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            logger.exception("Migration: failed to create index %s", name)
 
 
 def _backfill_organizations():
@@ -166,4 +203,5 @@ def ensure_schema():
             raise
         db.session.rollback()
     _add_missing_columns()
+    _add_indexes()
     _backfill_organizations()

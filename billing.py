@@ -83,15 +83,20 @@ def _month_key(dt=None) -> str:
 
 
 def generations_this_month(org_id) -> int:
-    """Count successful generations for the org in the current calendar month."""
+    """Count generations for the org in the current calendar month.
+
+    Counts queued + running + done (everything except failed), keyed on
+    created_at, so in-flight jobs count against the limit too. This closes the
+    burst/parallel bypass where only completed jobs were counted, letting a user
+    enqueue many generations before any finished."""
     from models import BackgroundJob
     start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     return (
         BackgroundJob.query.filter(
             BackgroundJob.org_id == org_id,
             BackgroundJob.kind == "generate_proposal",
-            BackgroundJob.status == "done",
-            BackgroundJob.finished_at >= start,
+            BackgroundJob.status.in_(("queued", "running", "done")),
+            BackgroundJob.created_at >= start,
         ).count()
     )
 
