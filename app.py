@@ -82,6 +82,7 @@ from models import (
     ProposalQuestion,
     ProposalReviewer,
     ProposalRevisionBatch,
+    ProposalShare,
     ProposalStatusHistory,
     ProposalVersion,
     ReviewComment,
@@ -89,6 +90,7 @@ from models import (
     RevisionRequest,
     RevisionTemplate,
     ScopeItem,
+    ShareView,
     StaffRole,
     TravelExpenseRate,
     User,
@@ -110,6 +112,7 @@ from proposal_agent import (
 )
 from proposal_export import (
     markdown_to_docx,
+    markdown_to_pdf,
     markdown_to_redline_docx,
     markdown_to_rfi_docx,
 )
@@ -184,7 +187,7 @@ def load_user(user_id):
 
 # Endpoints exempt from CSRF: external webhooks (signed separately) and any
 # read-only JSON polled by same-origin fetch (which sends the header anyway).
-_CSRF_EXEMPT_ENDPOINTS = {"billing_webhook", "customer_portal_action"}
+_CSRF_EXEMPT_ENDPOINTS = {"billing_webhook"}
 
 
 def _csrf_token() -> str:
@@ -301,6 +304,20 @@ def _notify_role_org(org_id, role, category, title, message="", link="", exclude
             continue
         db.session.add(Notification(user_id=u.id, category=category, title=title, message=message, link=link))
     db.session.commit()
+
+
+def _notify_via_integrations(org_id, text, event="", payload=None):
+    """Fan a message out to an org's configured Slack / outbound webhook."""
+    if not org_id:
+        return
+    org = db.session.get(Organization, org_id)
+    if not org:
+        return
+    import integrations
+    if org.slack_webhook_url:
+        integrations.notify_slack(org.slack_webhook_url, text)
+    if org.outbound_webhook_url and event:
+        integrations.notify_webhook(org.outbound_webhook_url, event, payload or {})
 
 
 # ---------------------------------------------------------------------------
@@ -2144,6 +2161,10 @@ def new_project():
 
     name = request.form.get("project_name", "").strip()
     client = request.form.get("client_name", "").strip()
+    client_email = request.form.get("client_email", "").strip()
+    request_type = request.form.get("request_type", "").strip().lower()
+    if request_type not in ("rfp", "rfq", "rom", ""):
+        request_type = ""
     due_date_raw = request.form.get("due_date", "").strip()
     if not name:
         flash("Project name is required.", "error")
@@ -2154,6 +2175,8 @@ def new_project():
         org_id=current_user.org_id,
         name=name,
         client_name=client,
+        client_email=client_email,
+        request_type=request_type,
     )
 
     # Optional due date (YYYY-MM-DD or YYYY-MM-DDTHH:MM)
@@ -2170,6 +2193,25 @@ def new_project():
     db.session.commit()
     _log_activity("project_create", f"Created project: {name}", project.id)
     return redirect(url_for("project_upload", project_id=project.id))
+
+
+@app.route("/projects/<project_id>/convert-to-full", methods=["POST"])
+@login_required
+def convert_rom_to_full(project_id):
+    """Promote a ROM project to a full RFP/RFQ so a firm proposal can be drafted."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    if (project.request_type or "").lower() != "rom":
+        flash("This project is not a ROM.", "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+    project.request_type = request.form.get("new_type", "rfp").strip().lower()
+    if project.request_type not in ("rfp", "rfq"):
+        project.request_type = "rfp"
+    db.session.commit()
+    _log_activity("rom_convert", f"Converted ROM to {project.request_type.upper()}", project_id)
+    flash(f"Converted to a full {project.request_type.upper()}. Regenerate to produce a firm proposal.", "success")
+    return redirect(url_for("project_upload", project_id=project_id))
 
 
 @app.route("/projects/<project_id>/set-due-date", methods=["POST"])
@@ -2509,6 +2551,7 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
         past_corrections=corrections_data,
         company_standards=company_standards_data,
         approved_scope=approved_scope_items,
+        request_type=project.request_type or "",
     )
 
     billing_record_generation(org_id)
@@ -2561,10 +2604,11 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
     project.vertical = result["vertical"]
     project.vertical_label = result["vertical_label"]
 
+    doc_type = "ROM" if (project.request_type or "").lower() == "rom" else result["document_type"]
     proposal = Proposal(
         project_id=project_id,
         job_id=job_slug,
-        document_type=result["document_type"],
+        document_type=doc_type,
         vertical=result["vertical"],
         vertical_label=result["vertical_label"],
         confidence_score=result["confidence_score"],
@@ -3137,6 +3181,10 @@ def view_proposal(proposal_id):
 
     phases = compute_phases(project, proposal)
 
+    # Customer share (Phase 3)
+    share = _active_share(proposal_id)
+    share_url = url_for("customer_portal", token=share.token, _external=True) if share else ""
+
     return render_template(
         "proposal.html",
         meta=meta,
@@ -3157,6 +3205,8 @@ def view_proposal(proposal_id):
         versions=versions,
         view_mode=view_mode,
         redline_available=redline_available,
+        share=share,
+        share_url=share_url,
     )
 
 
@@ -3178,11 +3228,48 @@ def download(proposal_id, fmt):
     elif fmt == "md":
         file_path = GENERATED_DIR / proposal.md_file
         mimetype = "text/markdown"
+    elif fmt == "pdf":
+        try:
+            file_path = _ensure_proposal_pdf(proposal, project)
+        except Exception as e:
+            flash(f"Could not generate PDF: {e}", "error")
+            return redirect(url_for("view_proposal", proposal_id=proposal_id))
+        mimetype = "application/pdf"
     else:
         flash("Invalid format.", "error")
         return redirect(url_for("view_proposal", proposal_id=proposal_id))
 
-    return send_file(str(file_path), mimetype=mimetype, as_attachment=True, download_name=file_path.name)
+    return _send_stored_file(file_path, mimetype=mimetype, as_attachment=True, download_name=file_path.name)
+
+
+def _ensure_proposal_pdf(proposal, project):
+    """Generate (or regenerate) the proposal PDF from its latest markdown and
+    return the local path. Branding uses the project owner's logo/company."""
+    latest = latest_version(proposal.id)
+    md_text = latest.markdown_content if latest else ""
+    if not md_text:
+        storage.ensure_local(GENERATED_DIR / proposal.md_file)
+        md_path = GENERATED_DIR / proposal.md_file
+        md_text = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+
+    owner = project.owner or db.session.get(User, project.user_id)
+    pdf_filename = proposal.pdf_file or f"proposal_{proposal.job_id}.pdf"
+    pdf_path = GENERATED_DIR / pdf_filename
+
+    logo_path = None
+    company_name = ""
+    if owner:
+        company_name = owner.company_name or ""
+        if (owner.company_logo_path and getattr(owner, "company_logo_use_in_proposals", False)
+                and Path(owner.company_logo_path).exists()):
+            logo_path = owner.company_logo_path
+
+    markdown_to_pdf(md_text, str(pdf_path), logo_path=logo_path, company_name=company_name)
+    storage.sync_up(pdf_path)
+    if proposal.pdf_file != pdf_filename:
+        proposal.pdf_file = pdf_filename
+        db.session.commit()
+    return pdf_path
 
 
 # ---------------------------------------------------------------------------
@@ -4071,6 +4158,275 @@ def submit_to_customer(proposal_id):
     _log_activity("proposal_submit_to_customer", f"Submitted proposal for '{project.name}' to customer", project.id)
     flash("Proposal marked as submitted to customer.", "success")
     return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
+
+# ---------------------------------------------------------------------------
+# Customer share portal (Phase 3)
+# ---------------------------------------------------------------------------
+
+def _active_share(proposal_id):
+    return (
+        ProposalShare.query.filter_by(proposal_id=proposal_id)
+        .filter(ProposalShare.revoked_at.is_(None))
+        .order_by(ProposalShare.created_at.desc())
+        .first()
+    )
+
+
+@app.route("/proposal/<proposal_id>/share", methods=["POST"])
+@login_required
+def create_share(proposal_id):
+    """Create (or refresh) a customer share link, optionally emailing it with
+    the PDF attached. Also advances the lifecycle to submitted_to_customer."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal or not _is_proposal_owner(proposal):
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+
+    customer_email = request.form.get("customer_email", "").strip()
+    allow_comments = request.form.get("allow_comments", "1") == "1"
+    allow_decision = request.form.get("allow_decision", "1") == "1"
+    send_email_flag = request.form.get("send_email") == "1"
+
+    if customer_email:
+        project.client_email = customer_email
+
+    version = latest_version(proposal_id)
+
+    # Reuse an existing active share or create a new one
+    share = _active_share(proposal_id)
+    if not share:
+        share = ProposalShare(
+            proposal_id=proposal_id,
+            project_id=project.id,
+            created_by=current_user.id,
+        )
+        db.session.add(share)
+    share.customer_email = customer_email or share.customer_email
+    share.allow_comments = allow_comments
+    share.allow_decision = allow_decision
+    share.version_number = version.version_number if version else 0
+    db.session.flush()
+
+    # Advance lifecycle if we're at the internally-approved gate
+    if proposal.review_status == "internally_approved":
+        try:
+            lifecycle_transition(proposal, "submitted_to_customer", current_user.id,
+                                 note="Shared with customer via portal link.")
+        except LifecycleError:
+            pass
+
+    share_url = url_for("customer_portal", token=share.token, _external=True)
+
+    emailed = False
+    if send_email_flag and customer_email:
+        try:
+            pdf_path = _ensure_proposal_pdf(proposal, project)
+        except Exception:
+            pdf_path = None
+        import mailer
+        body = (
+            f"Hello,\n\n{current_user.company_name or 'We'} have prepared a proposal for "
+            f"{project.name}. You can review it online here:\n\n{share_url}\n\n"
+        )
+        if share.allow_decision:
+            body += "You can accept, decline, or leave comments directly on that page.\n\n"
+        body += f"Thank you,\n{current_user.display_name or current_user.username}"
+        attachments = [str(pdf_path)] if pdf_path else None
+        emailed = mailer.send_email(
+            to=customer_email,
+            subject=f"Proposal for {project.name}",
+            body=body,
+            attachments=attachments,
+        )
+
+    db.session.commit()
+    _log_activity("proposal_share", f"Created customer share for '{project.name}'", project.id)
+    if emailed:
+        flash(f"Proposal emailed to {customer_email}. Share link is also on this page.", "success")
+    else:
+        flash(f"Share link ready: {share_url}", "success")
+    return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
+
+@app.route("/proposal/<proposal_id>/share/revoke", methods=["POST"])
+@login_required
+def revoke_share(proposal_id):
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal or not _is_proposal_owner(proposal):
+        abort(404)
+    share = _active_share(proposal_id)
+    if share:
+        share.revoked_at = datetime.now(timezone.utc)
+        db.session.commit()
+        flash("Customer share link revoked.", "success")
+    return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
+
+def _valid_share(token):
+    share = ProposalShare.query.filter_by(token=token).first()
+    if not share or share.revoked_at:
+        return None
+    if share.expires_at:
+        exp = share.expires_at.replace(tzinfo=None) if share.expires_at.tzinfo else share.expires_at
+        if exp < datetime.utcnow():
+            return None
+    return share
+
+
+@app.route("/p/<token>")
+def customer_portal(token):
+    """Public, read-only branded proposal view for a customer. No login."""
+    share = _valid_share(token)
+    if not share:
+        return render_template("portal_invalid.html"), 404
+
+    proposal = db.session.get(Proposal, share.proposal_id)
+    project = db.session.get(Project, share.project_id)
+    owner = db.session.get(User, project.user_id) if project else None
+
+    # Record the view (dedupe rapid reloads within 60s from same IP)
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()
+    recent = (
+        ShareView.query.filter_by(share_id=share.id, ip=ip)
+        .order_by(ShareView.viewed_at.desc())
+        .first()
+    )
+    now = datetime.now(timezone.utc)
+    is_new_view = True
+    if recent and recent.viewed_at:
+        last = recent.viewed_at.replace(tzinfo=timezone.utc) if recent.viewed_at.tzinfo is None else recent.viewed_at
+        if (now - last).total_seconds() < 60:
+            is_new_view = False
+    if is_new_view:
+        db.session.add(ShareView(
+            share_id=share.id, ip=ip,
+            user_agent=(request.headers.get("User-Agent", "") or "")[:400],
+        ))
+        share.view_count = (share.view_count or 0) + 1
+        share.last_viewed_at = now
+        db.session.commit()
+
+    version = latest_version(proposal.id)
+    md_text = version.markdown_content if version else ""
+    # Strip internal-only markers from the customer-facing view
+    md_text = re.sub(r"\[ACTION REQUIRED:.*?\]", "", md_text)
+    md_text = re.sub(r"\[ASSUMED:.*?\]", "", md_text)
+    proposal_html = md.markdown(md_text, extensions=["tables", "fenced_code"])
+
+    company_name = (owner.company_name if owner else "") or ""
+    logo_url = url_for("portal_logo", token=token) if (
+        owner and owner.company_logo_path and getattr(owner, "company_logo_use_in_proposals", False)
+        and Path(owner.company_logo_path).exists()
+    ) else ""
+
+    return render_template(
+        "portal.html",
+        share=share,
+        proposal=proposal,
+        project=project,
+        proposal_html=proposal_html,
+        company_name=company_name,
+        logo_url=logo_url,
+    )
+
+
+@app.route("/p/<token>/logo")
+def portal_logo(token):
+    share = _valid_share(token)
+    if not share:
+        abort(404)
+    project = db.session.get(Project, share.project_id)
+    owner = db.session.get(User, project.user_id) if project else None
+    if not owner or not owner.company_logo_path or not Path(owner.company_logo_path).exists():
+        abort(404)
+    return send_file(owner.company_logo_path, mimetype="image/png")
+
+
+@app.route("/p/<token>/comment", methods=["POST"])
+def portal_comment(token):
+    """Customer leaves a comment → becomes a pending customer revision request."""
+    share = _valid_share(token)
+    if not share or not share.allow_comments:
+        abort(404)
+    proposal = db.session.get(Proposal, share.proposal_id)
+    project = db.session.get(Project, share.project_id)
+
+    body = request.form.get("comment", "").strip()
+    section = request.form.get("section", "").strip()[:200]
+    if not body:
+        flash("Please enter a comment.", "error")
+        return redirect(url_for("customer_portal", token=token))
+
+    db.session.add(RevisionRequest(
+        proposal_id=proposal.id,
+        author_id=None,
+        source="customer",
+        category="other",
+        directive=body,
+        target_section=section,
+        status="pending",
+    ))
+    # Move the proposal into customer_feedback so the owner sees it
+    if proposal.review_status == "submitted_to_customer":
+        try:
+            lifecycle_transition(proposal, "customer_feedback", None,
+                                 note="Customer left a comment via the portal.")
+        except LifecycleError:
+            pass
+    db.session.commit()
+
+    if project:
+        _notify(project.user_id, "customer_feedback",
+                f"Customer comment on {project.name}",
+                body[:160], link=f"/proposal/{proposal.id}")
+        _notify_via_integrations(project.org_id,
+                                 f"💬 Customer comment on *{project.name}*: {body[:200]}")
+    flash("Thanks — your comment has been sent to the team.", "success")
+    return redirect(url_for("customer_portal", token=token))
+
+
+@app.route("/p/<token>/decision", methods=["POST"])
+def portal_decision(token):
+    """Customer accepts or declines through the portal."""
+    share = _valid_share(token)
+    if not share or not share.allow_decision:
+        abort(404)
+    proposal = db.session.get(Proposal, share.proposal_id)
+    project = db.session.get(Project, share.project_id)
+
+    decision = request.form.get("decision", "").strip()
+    note = request.form.get("note", "").strip()
+    if decision not in ("accepted", "declined"):
+        flash("Invalid decision.", "error")
+        return redirect(url_for("customer_portal", token=token))
+
+    share.decision = decision
+    share.decision_note = note
+    share.decided_at = datetime.now(timezone.utc)
+
+    try:
+        if decision == "accepted":
+            if proposal.review_status in ("submitted_to_customer", "customer_feedback"):
+                lifecycle_transition(proposal, "customer_approved", None, note="Accepted by customer via portal.")
+                lifecycle_transition(proposal, "won", None, note="Customer accepted.")
+        else:
+            if proposal.review_status in ("submitted_to_customer", "customer_feedback"):
+                lifecycle_transition(proposal, "customer_declined", None, note=note or "Declined by customer via portal.")
+                lifecycle_transition(proposal, "lost", None, note="Customer declined.")
+    except LifecycleError:
+        pass
+    db.session.commit()
+
+    if project:
+        verb = "accepted" if decision == "accepted" else "declined"
+        _notify(project.user_id, "customer_decision",
+                f"Customer {verb}: {project.name}", note[:160],
+                link=f"/proposal/{proposal.id}")
+        _notify_via_integrations(project.org_id,
+                                 f"{'✅' if decision=='accepted' else '❌'} Customer *{verb}* the proposal for *{project.name}*.")
+    flash("Thank you — your response has been recorded.", "success")
+    return redirect(url_for("customer_portal", token=token))
 
 
 @app.route("/proposal/<proposal_id>/customer-feedback", methods=["GET", "POST"])

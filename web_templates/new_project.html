@@ -15,10 +15,27 @@
             <input type="text" id="project_name" name="project_name" required autofocus
                    placeholder="e.g., AWS ATL078 EPMS Proposal">
         </div>
+        <div class="form-row">
+            <div class="form-group">
+                <label for="client_name">Client / Customer Name</label>
+                <input type="text" id="client_name" name="client_name"
+                       placeholder="e.g., Amazon Web Services">
+            </div>
+            <div class="form-group">
+                <label for="client_email">Customer Contact Email <span class="form-hint">(optional)</span></label>
+                <input type="email" id="client_email" name="client_email"
+                       placeholder="buyer@customer.com">
+            </div>
+        </div>
         <div class="form-group">
-            <label for="client_name">Client / Customer Name</label>
-            <input type="text" id="client_name" name="client_name"
-                   placeholder="e.g., Amazon Web Services">
+            <label for="request_type">Request Type</label>
+            <select id="request_type" name="request_type">
+                <option value="">Auto / Not sure</option>
+                <option value="rfp">RFP — Request for Proposal</option>
+                <option value="rfq">RFQ — Request for Quotation</option>
+                <option value="rom">ROM — Rough Order of Magnitude (budgetary estimate)</option>
+            </select>
+            <span class="form-hint">ROM produces a lighter, range-priced budgetary estimate you can later convert to a full proposal.</span>
         </div>
         <div class="form-group">
             <label for="due_date">Proposal Due Date <span class="form-hint">(optional — tracked on dashboard &amp; calendar)</span></label>

@@ -151,6 +151,8 @@ class Project(db.Model):
     org_id = db.Column(db.String(32), db.ForeignKey("organizations.id"), nullable=True)
     name = db.Column(db.String(300), nullable=False)
     client_name = db.Column(db.String(300), default="")
+    client_email = db.Column(db.String(200), default="")  # customer contact for sends
+    request_type = db.Column(db.String(10), default="")  # rfp, rfq, rom, ''
     vertical = db.Column(db.String(50), default="general")
     vertical_label = db.Column(db.String(100), default="General")
     status = db.Column(db.String(30), default="active")  # active, submitted, won, lost, archived
@@ -763,3 +765,56 @@ class RevisionTemplate(db.Model):
     created_at = db.Column(db.DateTime, default=_utcnow)
 
     user = db.relationship("User", backref="revision_templates")
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Customer share portal
+# ---------------------------------------------------------------------------
+
+
+class ProposalShare(db.Model):
+    """A secure, tokenized share of a proposal with a customer. Renders a
+    read-only branded view at /p/<token>; tracks views and optionally lets the
+    customer comment or record an accept/decline decision."""
+    __tablename__ = "proposal_shares"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    proposal_id = db.Column(db.String(32), db.ForeignKey("proposals.id"), nullable=False)
+    project_id = db.Column(db.String(32), db.ForeignKey("projects.id"), nullable=False)
+    token = db.Column(db.String(64), unique=True, nullable=False,
+                      default=lambda: uuid.uuid4().hex + uuid.uuid4().hex)
+    created_by = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    customer_email = db.Column(db.String(200), default="")
+    version_number = db.Column(db.Integer, default=0)  # snapshot version shown
+
+    allow_comments = db.Column(db.Boolean, default=True)
+    allow_decision = db.Column(db.Boolean, default=True)
+
+    view_count = db.Column(db.Integer, default=0)
+    last_viewed_at = db.Column(db.DateTime, nullable=True)
+
+    # Customer's decision recorded through the portal
+    decision = db.Column(db.String(20), default="")  # accepted, declined
+    decision_note = db.Column(db.Text, default="")
+    decided_at = db.Column(db.DateTime, nullable=True)
+
+    revoked_at = db.Column(db.DateTime, nullable=True)
+    expires_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=_utcnow)
+
+    proposal = db.relationship("Proposal", backref="shares")
+    project = db.relationship("Project", backref="shares")
+    creator = db.relationship("User")
+
+
+class ShareView(db.Model):
+    """A single customer view of a shared proposal (for open analytics)."""
+    __tablename__ = "share_views"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    share_id = db.Column(db.String(32), db.ForeignKey("proposal_shares.id"), nullable=False)
+    viewed_at = db.Column(db.DateTime, default=_utcnow)
+    ip = db.Column(db.String(64), default="")
+    user_agent = db.Column(db.String(400), default="")
+
+    share = db.relationship("ProposalShare", backref="views")

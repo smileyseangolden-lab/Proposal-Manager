@@ -132,6 +132,62 @@ def markdown_to_docx(
     return output_path
 
 
+def markdown_to_pdf(
+    markdown_text: str,
+    output_path: str,
+    logo_path: str | None = None,
+    company_name: str = "",
+    accent_hex: str = "#0f6b6b",
+) -> str:
+    """Render a Markdown proposal to a styled PDF using xhtml2pdf (pure-Python,
+    no system libraries required). Returns the output path.
+
+    Falls back to raising the underlying error only if PDF generation fails;
+    callers should handle that and offer DOCX instead.
+    """
+    import base64
+
+    import markdown as _md
+    from xhtml2pdf import pisa
+
+    body_html = _md.markdown(markdown_text, extensions=["tables", "fenced_code"])
+
+    logo_tag = ""
+    if logo_path and Path(logo_path).exists():
+        try:
+            data = base64.b64encode(Path(logo_path).read_bytes()).decode("ascii")
+            logo_tag = f'<img src="data:image/png;base64,{data}" class="logo" />'
+        except Exception:
+            logo_tag = ""
+
+    header = ""
+    if logo_tag or company_name:
+        company_tag = f'<div class="company">{company_name}</div>' if company_name else ""
+        header = f'<div class="header">{logo_tag}{company_tag}</div>'
+
+    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+        @page {{ size: letter; margin: 1in 1.1in; }}
+        body {{ font-family: Helvetica, Arial, sans-serif; font-size: 10.5pt; color: #1a1a1a; line-height: 1.45; }}
+        .header {{ border-bottom: 2px solid {accent_hex}; padding-bottom: 8px; margin-bottom: 18px; }}
+        .header .logo {{ height: 46px; }}
+        .header .company {{ font-size: 13pt; font-weight: bold; color: {accent_hex}; margin-top: 4px; }}
+        h1 {{ font-size: 20pt; color: {accent_hex}; margin: 0 0 10px; }}
+        h2 {{ font-size: 14pt; color: {accent_hex}; border-bottom: 1px solid #ddd; padding-bottom: 3px; margin-top: 18px; }}
+        h3 {{ font-size: 12pt; margin-top: 14px; }}
+        table {{ width: 100%; border-collapse: collapse; margin: 10px 0; }}
+        th, td {{ border: 1px solid #cccccc; padding: 5px 7px; text-align: left; font-size: 9.5pt; }}
+        th {{ background-color: {accent_hex}; color: #ffffff; }}
+        tr:nth-child(even) td {{ background-color: #f4f7f7; }}
+        code {{ background: #f0f0f0; padding: 1px 3px; }}
+    </style></head><body>{header}{body_html}</body></html>"""
+
+    with open(output_path, "wb") as f:
+        result = pisa.CreatePDF(html, dest=f)
+    if result.err:
+        raise RuntimeError("PDF generation failed.")
+    return output_path
+
+
 def _add_table(doc, rows: list[list[str]]):
     """Add a table to the document."""
     if not rows:

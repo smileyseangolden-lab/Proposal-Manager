@@ -53,7 +53,9 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("users", "email_verified", "BOOLEAN DEFAULT 0"),
     # Phase 3: customer send + ROM
     ("projects", "request_type", "VARCHAR(10) DEFAULT ''"),
+    ("projects", "client_email", "VARCHAR(200) DEFAULT ''"),
     ("proposals", "pdf_file", "VARCHAR(500) DEFAULT ''"),
+    ("users", "email_verified", "BOOLEAN DEFAULT 0"),
     # Phase 5: billing
     ("organizations", "plan", "VARCHAR(30) DEFAULT 'free'"),
     ("organizations", "stripe_customer_id", "VARCHAR(100) DEFAULT ''"),

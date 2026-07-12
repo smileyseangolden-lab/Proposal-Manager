@@ -95,7 +95,8 @@ def _build_system_prompt(vertical_key: str, vertical_resources: dict,
                          equipment_data: list = None,
                          travel_data: list = None,
                          past_corrections: list = None,
-                         company_standards: list = None) -> str:
+                         company_standards: list = None,
+                         request_type: str = "") -> str:
     """Assemble the system prompt with all context."""
 
     vertical_label = VERTICALS.get(vertical_key, {}).get("label", "General")
@@ -293,10 +294,30 @@ Apply these lessons: match the user's preferred tone, detail level, structure,
 and content choices. Avoid repeating the same mistakes identified above.
 """
 
-    return f"""You are the Proposal Manager Agent — an expert proposal writer that generates
-professional proposals in response to customer RFP (Request for Proposal) and
-RFQ (Request for Quotation) documents.
+    rom_block = ""
+    if (request_type or "").lower() == "rom":
+        rom_block = """
+## ROUGH ORDER OF MAGNITUDE (ROM) MODE
 
+This is a **Rough Order of Magnitude budgetary estimate**, NOT a firm proposal.
+Adjust your output accordingly:
+- Present pricing as **ranges** (e.g., "$180,000 – $240,000") reflecting ROM-level
+  accuracy (typically -25% to +50%), not precise line-item totals.
+- Keep it concise: an executive summary, high-level scope/assumptions, a
+  budgetary cost range table, key exclusions, and clearly stated assumptions.
+- OMIT exhaustive compliance matrices, detailed terms & conditions, and
+  resume/personnel sections — those belong in a full proposal.
+- Add a prominent disclaimer that this is a preliminary budgetary estimate for
+  planning purposes only, subject to a formal proposal upon detailed scope
+  definition, and valid for a limited period.
+- Still use `[ACTION REQUIRED: ...]` markers where the customer must clarify
+  scope before a firm number can be given.
+"""
+
+    return f"""You are the Proposal Manager Agent — an expert proposal writer that generates
+professional proposals in response to customer RFP (Request for Proposal),
+RFQ (Request for Quotation), and ROM (Rough Order of Magnitude) requests.
+{rom_block}
 {company_line}## Industry Vertical
 
 You are generating a **{vertical_label}** proposal. Use the vertical-specific
@@ -504,7 +525,8 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
                       travel_data: list = None,
                       past_corrections: list = None,
                       company_standards: list = None,
-                      approved_scope: list = None) -> dict:
+                      approved_scope: list = None,
+                      request_type: str = "") -> dict:
     """Generate a proposal from the given RFP/RFQ text.
 
     Args:
@@ -579,14 +601,18 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
         travel_data=travel_data,
         past_corrections=past_corrections,
         company_standards=company_standards,
+        request_type=request_type,
     )
 
     _report("analysis", f"Generating {vertical_label} proposal...")
 
+    is_rom = (request_type or "").lower() == "rom"
+    doc_kind = "Rough Order of Magnitude (ROM) budgetary estimate" if is_rom else f"{vertical_label} proposal"
+
     # Build messages
     user_message = (
-        f"Please generate a complete {vertical_label} proposal in "
-        "response to the following RFP/RFQ document. Follow the "
+        f"Please generate a complete {doc_kind} in "
+        "response to the following document. Follow the "
         "workflow exactly.\n\n"
         "---BEGIN DOCUMENT---\n"
         f"{rfp_text}\n"

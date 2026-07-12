@@ -27,10 +27,12 @@ def configured() -> bool:
     return bool(SMTP_HOST)
 
 
-def send_email(to: str, subject: str, body: str, html: str = "") -> bool:
+def send_email(to: str, subject: str, body: str, html: str = "", attachments: list = None) -> bool:
     """Send an email. Returns True if it was dispatched via SMTP.
     When SMTP is not configured, logs to the console and returns False so the
-    caller can fall back to showing a link in the UI."""
+    caller can fall back to showing a link in the UI.
+
+    attachments: optional list of local file paths to attach."""
     if not to:
         return False
 
@@ -45,6 +47,21 @@ def send_email(to: str, subject: str, body: str, html: str = "") -> bool:
     msg.set_content(body)
     if html:
         msg.add_alternative(html, subtype="html")
+
+    for path in (attachments or []):
+        try:
+            import os
+            with open(path, "rb") as fh:
+                data = fh.read()
+            fname = os.path.basename(path)
+            maintype, subtype = ("application", "octet-stream")
+            if fname.lower().endswith(".pdf"):
+                maintype, subtype = ("application", "pdf")
+            elif fname.lower().endswith(".docx"):
+                maintype, subtype = ("application", "vnd.openxmlformats-officedocument.wordprocessingml.document")
+            msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=fname)
+        except Exception:
+            logger.exception("Failed to attach %s", path)
 
     try:
         if SMTP_USE_TLS:
