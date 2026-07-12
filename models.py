@@ -62,6 +62,22 @@ class OrgInvitation(db.Model):
     inviter = db.relationship("User", foreign_keys=[invited_by])
 
 
+class UserToken(db.Model):
+    """Single-use, time-limited tokens for password reset and email verification."""
+    __tablename__ = "user_tokens"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=False)
+    purpose = db.Column(db.String(20), nullable=False)  # reset, verify
+    token = db.Column(db.String(64), unique=True, nullable=False,
+                      default=lambda: uuid.uuid4().hex + uuid.uuid4().hex)
+    created_at = db.Column(db.DateTime, default=_utcnow)
+    expires_at = db.Column(db.DateTime, nullable=True)
+    used_at = db.Column(db.DateTime, nullable=True)
+
+    user = db.relationship("User")
+
+
 class BackgroundJob(db.Model):
     """DB-backed background job for long-running AI work (generation, revision,
     scope drafting). A small in-process worker pool claims and runs these."""
@@ -97,6 +113,7 @@ class User(UserMixin, db.Model):
     font_preference = db.Column(db.String(100), default="Calibri")
     is_admin = db.Column(db.Boolean, default=False)
     role = db.Column(db.String(20), default="proposal")  # admin, sales, proposal
+    email_verified = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=_utcnow)
 
     # LLM settings — per-user overrides

@@ -31,6 +31,7 @@
             {% endwith %}
 
             <form method="post" action="{{ url_for('signup') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                 {% if invitation %}<input type="hidden" name="invite_token" value="{{ invitation.token }}">{% endif %}
                 <div class="form-row">
                     <div class="form-group">

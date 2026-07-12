@@ -3040,3 +3040,9 @@ body {
 .plan-features li { padding: 6px 0 6px 22px; position: relative; font-size: 14px; }
 .plan-features li::before { content: "✓"; position: absolute; left: 0; color: var(--sea-800, #0f6b6b); font-weight: 700; }
 .flash-info { background: #eaf4fb; color: #1c5d86; }
+
+.verify-banner { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.link-button {
+    background: none; border: none; color: inherit; text-decoration: underline;
+    cursor: pointer; font: inherit; padding: 0;
+}

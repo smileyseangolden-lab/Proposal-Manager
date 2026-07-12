@@ -12,9 +12,12 @@ Full-featured intranet application with:
 """
 
 import difflib
+import hmac
 import json
 import os
 import re
+import secrets
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +31,7 @@ from flask import (
     render_template,
     request,
     send_file,
+    session,
     url_for,
 )
 from flask_login import (
@@ -89,6 +93,7 @@ from models import (
     TravelExpenseRate,
     User,
     UserRateSheet,
+    UserToken,
     UserVerticalTemplate,
     VerticalClarificationTemplate,
     db,
@@ -132,6 +137,13 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 if DATABASE_URL.startswith("postgresql"):
     app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"pool_pre_ping": True, "pool_recycle": 280}
 
+# Secure session cookies. SESSION_COOKIE_SECURE defaults on unless explicitly
+# disabled (set to false for plain-HTTP intranet deployments).
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", "true").lower() == "true"
+app.config["PERMANENT_SESSION_LIFETIME"] = 60 * 60 * 24 * 14  # 14 days
+
 # Ensure data directory exists
 (Path(__file__).resolve().parent / "data").mkdir(exist_ok=True)
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
@@ -164,6 +176,62 @@ def inject_branding():
 @login_manager.user_loader
 def load_user(user_id):
     return db.session.get(User, user_id)
+
+
+# ---------------------------------------------------------------------------
+# CSRF protection (session double-submit token)
+# ---------------------------------------------------------------------------
+
+# Endpoints exempt from CSRF: external webhooks (signed separately) and any
+# read-only JSON polled by same-origin fetch (which sends the header anyway).
+_CSRF_EXEMPT_ENDPOINTS = {"billing_webhook", "customer_portal_action"}
+
+
+def _csrf_token() -> str:
+    token = session.get("_csrf_token")
+    if not token:
+        token = secrets.token_hex(32)
+        session["_csrf_token"] = token
+    return token
+
+
+@app.context_processor
+def inject_csrf():
+    return dict(csrf_token=_csrf_token)
+
+
+@app.before_request
+def _csrf_protect():
+    if app.testing:
+        return
+    if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return
+    if request.endpoint in _CSRF_EXEMPT_ENDPOINTS:
+        return
+    sent = request.form.get("csrf_token") or request.headers.get("X-CSRFToken", "")
+    expected = session.get("_csrf_token", "")
+    if not expected or not hmac.compare_digest(str(sent), str(expected)):
+        abort(400, description="Invalid or missing CSRF token. Please reload and try again.")
+
+
+# ---------------------------------------------------------------------------
+# Login rate limiting (in-process sliding window per IP+username)
+# ---------------------------------------------------------------------------
+
+_LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+_LOGIN_MAX_ATTEMPTS = 8
+_LOGIN_WINDOW_SECONDS = 300
+
+
+def _login_rate_limited(key: str) -> bool:
+    now = time.time()
+    attempts = [t for t in _LOGIN_ATTEMPTS.get(key, []) if now - t < _LOGIN_WINDOW_SECONDS]
+    _LOGIN_ATTEMPTS[key] = attempts
+    return len(attempts) >= _LOGIN_MAX_ATTEMPTS
+
+
+def _record_login_attempt(key: str):
+    _LOGIN_ATTEMPTS.setdefault(key, []).append(time.time())
 
 
 with app.app_context():
@@ -597,6 +665,18 @@ def signup():
     db.session.commit()
     login_user(user)
     _log_activity("signup", f"User {username} created account")
+
+    # Kick off email verification (best-effort; never blocks signup)
+    if invitation:
+        # Invited users arrived via a link sent to their address — trust it
+        user.email_verified = True
+        db.session.commit()
+    else:
+        try:
+            _send_verification_email(user)
+        except Exception:
+            pass
+
     flash("Account created successfully." if not invitation
           else f"Welcome to {org.name}!", "success")
     return redirect(url_for("dashboard"))
@@ -611,15 +691,141 @@ def login():
 
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "")
+
+    rl_key = f"{request.remote_addr}:{username.lower()}"
+    if _login_rate_limited(rl_key):
+        flash("Too many login attempts. Please wait a few minutes and try again.", "error")
+        return redirect(url_for("login"))
+
     user = User.query.filter_by(username=username).first()
 
     if not user or not user.check_password(password):
+        _record_login_attempt(rl_key)
         flash("Invalid username or password.", "error")
         return redirect(url_for("login"))
 
+    _LOGIN_ATTEMPTS.pop(rl_key, None)
     login_user(user)
     _log_activity("login")
     return redirect(url_for("dashboard"))
+
+
+# ---------------------------------------------------------------------------
+# Email verification & password reset
+# ---------------------------------------------------------------------------
+
+def _issue_token(user, purpose: str, hours: int = 24) -> UserToken:
+    from datetime import timedelta
+    tok = UserToken(
+        user_id=user.id,
+        purpose=purpose,
+        expires_at=datetime.utcnow() + timedelta(hours=hours),
+    )
+    db.session.add(tok)
+    db.session.commit()
+    return tok
+
+
+def _consume_token(token_str: str, purpose: str):
+    tok = UserToken.query.filter_by(token=token_str, purpose=purpose).first()
+    if not tok or tok.used_at:
+        return None
+    if tok.expires_at:
+        exp = tok.expires_at.replace(tzinfo=None) if tok.expires_at.tzinfo else tok.expires_at
+        if exp < datetime.utcnow():
+            return None
+    return tok
+
+
+def _send_verification_email(user):
+    tok = _issue_token(user, "verify", hours=72)
+    link = url_for("verify_email", token=tok.token, _external=True)
+    import mailer
+    sent = mailer.send_email(
+        to=user.email,
+        subject=f"Verify your email for {APP_NAME}",
+        body=(f"Welcome to {APP_NAME}!\n\nPlease verify your email address:\n{link}\n\n"
+              f"This link expires in 72 hours."),
+    )
+    return link, sent
+
+
+@app.route("/verify-email/<token>")
+def verify_email(token):
+    tok = _consume_token(token, "verify")
+    if not tok:
+        flash("This verification link is invalid or has expired.", "error")
+        return redirect(url_for("login"))
+    user = db.session.get(User, tok.user_id)
+    user.email_verified = True
+    tok.used_at = datetime.now(timezone.utc)
+    db.session.commit()
+    flash("Email verified. Thanks!", "success")
+    return redirect(url_for("dashboard") if current_user.is_authenticated else url_for("login"))
+
+
+@app.route("/resend-verification", methods=["POST"])
+@login_required
+def resend_verification():
+    if current_user.email_verified:
+        flash("Your email is already verified.", "success")
+        return redirect(request.referrer or url_for("dashboard"))
+    link, sent = _send_verification_email(current_user)
+    if sent:
+        flash("Verification email sent.", "success")
+    else:
+        flash(f"Verify your email here: {link}", "success")
+    return redirect(request.referrer or url_for("dashboard"))
+
+
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    if request.method == "GET":
+        return render_template("forgot_password.html")
+    email = request.form.get("email", "").strip().lower()
+    # Always show the same message to avoid leaking which emails exist
+    generic = "If an account exists for that email, a reset link has been sent."
+    user = User.query.filter(User.email.ilike(email)).first() if email else None
+    if user:
+        tok = _issue_token(user, "reset", hours=2)
+        link = url_for("reset_password", token=tok.token, _external=True)
+        import mailer
+        sent = mailer.send_email(
+            to=user.email,
+            subject=f"Reset your {APP_NAME} password",
+            body=(f"A password reset was requested for your account.\n\n"
+                  f"Reset your password:\n{link}\n\nThis link expires in 2 hours. "
+                  f"If you didn't request this, you can ignore this email."),
+        )
+        if not sent:
+            # Dev fallback: surface the link so the flow is testable without SMTP
+            flash(f"Password reset link: {link}", "success")
+    flash(generic, "success")
+    return redirect(url_for("login"))
+
+
+@app.route("/reset-password/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    tok = _consume_token(token, "reset")
+    if not tok:
+        flash("This password reset link is invalid or has expired.", "error")
+        return redirect(url_for("forgot_password"))
+    if request.method == "GET":
+        return render_template("reset_password.html", token=token)
+    password = request.form.get("password", "")
+    confirm = request.form.get("confirm_password", "")
+    if len(password) < 8:
+        flash("Password must be at least 8 characters.", "error")
+        return redirect(url_for("reset_password", token=token))
+    if password != confirm:
+        flash("Passwords do not match.", "error")
+        return redirect(url_for("reset_password", token=token))
+    user = db.session.get(User, tok.user_id)
+    user.set_password(password)
+    tok.used_at = datetime.now(timezone.utc)
+    db.session.commit()
+    flash("Password updated. You can now sign in.", "success")
+    return redirect(url_for("login"))
 
 
 @app.route("/logout")

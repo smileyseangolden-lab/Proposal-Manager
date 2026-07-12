@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token() }}">
     <title>{% block title %}{{ app_name }}{% endblock %}</title>
     <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='img/pm-logo-mark.svg') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
@@ -138,6 +139,15 @@
             </div>
         </header>
         <main class="main-content">
+            {% if current_user.is_authenticated and not current_user.email_verified %}
+            <div class="flash flash-info verify-banner">
+                Please verify your email address ({{ current_user.email }}).
+                <form method="post" action="{{ url_for('resend_verification') }}" class="inline-form" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="link-button">Resend verification email</button>
+                </form>
+            </div>
+            {% endif %}
             {% with messages = get_flashed_messages(with_categories=true) %}
             {% if messages %}
             <div class="flash-messages">
@@ -191,6 +201,30 @@
     {% block scripts %}{% endblock %}
     {% if current_user.is_authenticated %}
     <script>
+    (function(){
+        // CSRF: inject token into every same-origin POST form and fetch call
+        var csrfToken = (document.querySelector('meta[name="csrf-token"]') || {}).content || "";
+        function ensureFormToken(form){
+            if (!form || (form.method || "").toLowerCase() !== "post") return;
+            if (form.querySelector('input[name="csrf_token"]')) return;
+            var input = document.createElement("input");
+            input.type = "hidden"; input.name = "csrf_token"; input.value = csrfToken;
+            form.appendChild(input);
+        }
+        document.querySelectorAll("form").forEach(ensureFormToken);
+        document.addEventListener("submit", function(e){ ensureFormToken(e.target); }, true);
+        // Patch fetch to attach the CSRF header for same-origin mutating requests
+        var _fetch = window.fetch;
+        window.fetch = function(input, init){
+            init = init || {};
+            var method = (init.method || (typeof input === "object" && input.method) || "GET").toUpperCase();
+            if (["POST","PUT","PATCH","DELETE"].indexOf(method) !== -1){
+                init.headers = new Headers(init.headers || {});
+                if (!init.headers.has("X-CSRFToken")) init.headers.set("X-CSRFToken", csrfToken);
+            }
+            return _fetch(input, init);
+        };
+    })();
     (function(){
         // Sidebar toggle
         var toggle = document.getElementById("sidebar-toggle");
