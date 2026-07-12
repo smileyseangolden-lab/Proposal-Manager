@@ -380,6 +380,14 @@ def billing_record_generation(org_id):
     return billing.record_generation(org_id)
 
 
+def billing_check_seat(org_id, pending_invites=0):
+    return billing.can_add_seat(org_id, pending_invites)
+
+
+def billing_check_project(org_id):
+    return billing.can_add_project(org_id)
+
+
 @app.context_processor
 def inject_notifications():
     if hasattr(current_user, "id") and current_user.is_authenticated:
@@ -676,7 +684,12 @@ def signup():
         invitation.accepted_user_id = user.id
     else:
         # Fresh signup creates a new workspace; the creator is its admin
-        org = Organization(name=company_name or f"{display_name or username}'s Workspace")
+        from datetime import timedelta
+        org = Organization(
+            name=company_name or f"{display_name or username}'s Workspace",
+            plan="free",
+            trial_ends_at=datetime.utcnow() + timedelta(days=14),
+        )
         db.session.add(org)
         db.session.flush()
         user.org_id = org.id
@@ -1100,6 +1113,11 @@ def quick_start():
     # Derive a readable project name from the first file
     stem = Path(valid[0].filename).stem.replace("_", " ").replace("-", " ").strip()
     project_name = (stem[:280] or "New Proposal") + " Proposal"
+
+    ok, msg = billing_check_project(current_user.org_id)
+    if not ok:
+        flash(msg, "error")
+        return redirect(url_for("billing_page"))
 
     project = Project(user_id=current_user.id, org_id=current_user.org_id, name=project_name)
     db.session.add(project)
@@ -2360,6 +2378,11 @@ def new_project():
     if not name:
         flash("Project name is required.", "error")
         return redirect(url_for("new_project"))
+
+    ok, msg = billing_check_project(current_user.org_id)
+    if not ok:
+        flash(msg, "error")
+        return redirect(url_for("billing_page"))
 
     project = Project(
         user_id=current_user.id,
@@ -5338,6 +5361,15 @@ def create_invitation():
     if existing:
         flash(f"{email} is already a member of this workspace.", "error")
         return redirect(url_for("admin_panel"))
+
+    # Seat-limit gate (counts members + outstanding invites)
+    pending = OrgInvitation.query.filter_by(org_id=current_user.org_id).filter(
+        OrgInvitation.accepted_at.is_(None), OrgInvitation.revoked_at.is_(None)
+    ).count()
+    ok, msg = billing_check_seat(current_user.org_id, pending_invites=pending)
+    if not ok:
+        flash(msg, "error")
+        return redirect(url_for("billing_page"))
 
     from datetime import timedelta
     inv = OrgInvitation(

@@ -100,14 +100,37 @@ def record_generation(org_id):
     return None
 
 
-def can_add_seat(org_id) -> tuple[bool, str]:
+def can_add_seat(org_id, pending_invites=0) -> tuple[bool, str]:
+    """Seat check that also counts outstanding (unaccepted) invitations so an
+    org can't over-provision by inviting past its limit."""
     from models import Organization, db
     org = db.session.get(Organization, org_id) if org_id else None
     limit = limits_for(org)["seats"]
     if limit < 0:
         return True, ""
-    if seats_used(org_id) >= limit:
+    if seats_used(org_id) + pending_invites >= limit:
         return False, (
-            f"Your plan allows {limit} seats. Upgrade to invite more teammates."
+            f"Your plan allows {limit} seats (members + pending invites). "
+            f"Upgrade to add more teammates."
+        )
+    return True, ""
+
+
+def projects_used(org_id) -> int:
+    from models import Project
+    return Project.query.filter_by(org_id=org_id).count()
+
+
+def can_add_project(org_id) -> tuple[bool, str]:
+    from models import Organization, db
+    org = db.session.get(Organization, org_id) if org_id else None
+    limit = limits_for(org)["projects"]
+    if limit < 0:
+        return True, ""
+    if projects_used(org_id) >= limit:
+        plan_name = plan_for(org)["name"]
+        return False, (
+            f"Your {plan_name} plan allows {limit} projects. "
+            f"Upgrade your plan to create more."
         )
     return True, ""
