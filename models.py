@@ -863,3 +863,27 @@ class EstimateLineItem(db.Model):
     @property
     def total(self) -> float:
         return (self.quantity or 0) * (self.unit_cost or 0)
+
+
+# ---------------------------------------------------------------------------
+# AI cost metering
+# ---------------------------------------------------------------------------
+
+
+class LlmUsage(db.Model):
+    """One row per LLM API call: token counts + estimated cost. Written after
+    each generation/revision/etc. so AI spend can be metered per org (monthly
+    budget enforcement) and reported platform-wide. Deliberately cross-tenant."""
+    __tablename__ = "llm_usage"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    org_id = db.Column(db.String(32), db.ForeignKey("organizations.id"), nullable=True, index=True)
+    user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    job_id = db.Column(db.String(32), nullable=True)
+    kind = db.Column(db.String(50), default="")  # generate_proposal, revise_proposal, ...
+    provider = db.Column(db.String(50), default="anthropic")
+    model = db.Column(db.String(100), default="")
+    input_tokens = db.Column(db.Integer, default=0)
+    output_tokens = db.Column(db.Integer, default=0)
+    est_cost_usd = db.Column(db.Float, default=0.0)
+    created_at = db.Column(db.DateTime, default=_utcnow, index=True)

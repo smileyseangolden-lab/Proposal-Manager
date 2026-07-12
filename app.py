@@ -51,8 +51,11 @@ from config.settings import (
     APP_NAME,
     APP_SHORT_NAME,
     DATABASE_URL,
+    FLASK_DEBUG,
     FLASK_SECRET_KEY,
     GENERATED_DIR,
+    INSECURE_SECRETS,
+    IS_PRODUCTION,
     MAX_UPLOAD_SIZE_MB,
     UPLOADS_DIR,
     VERTICALS,
@@ -60,6 +63,7 @@ from config.settings import (
 import billing
 import crypto_util
 import jobs
+import proposal_agent
 import storage
 from document_parser import parse_document
 from models import (
@@ -136,6 +140,43 @@ from rate_sheet_parser import parse_rate_sheet
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
+
+def _verify_production_secrets():
+    """Fail closed in production (APP_ENV=production) when security-critical
+    secrets are unset or left at a known public default.
+
+    Prevents two audited blockers:
+      - a forgeable session-signing key (FLASK_SECRET_KEY) → auth bypass, and
+      - tenant API keys encrypted under a guessable key (APP_ENCRYPTION_KEY),
+        which must be a DISTINCT random value, never derived from the session key.
+    Dev/test (APP_ENV unset) keep working with the built-in fallbacks.
+    """
+    if not IS_PRODUCTION:
+        return
+    problems = []
+    if (FLASK_SECRET_KEY or "").strip() in INSECURE_SECRETS:
+        problems.append("FLASK_SECRET_KEY is unset or a known default")
+    enc = os.getenv("APP_ENCRYPTION_KEY", "").strip()
+    if enc in INSECURE_SECRETS:
+        problems.append(
+            "APP_ENCRYPTION_KEY is unset or weak (set a distinct random key; "
+            "it must not fall back to FLASK_SECRET_KEY)"
+        )
+    if problems:
+        raise RuntimeError(
+            "Refusing to start in production with insecure secrets: "
+            + "; ".join(problems)
+            + '. Generate strong values, e.g. '
+            + '`python -c "import secrets; print(secrets.token_urlsafe(48))"`.'
+        )
+
+
+_verify_production_secrets()
+
+# Whether to surface reset/verification links in the UI when email is
+# unconfigured. NEVER true in production — otherwise /forgot-password would hand
+# a valid reset token to any unauthenticated requester (account takeover).
+_EXPOSE_DEV_LINKS = FLASK_DEBUG and not IS_PRODUCTION
 
 app = Flask(__name__, template_folder="web_templates", static_folder="static")
 app.secret_key = FLASK_SECRET_KEY
@@ -222,6 +263,24 @@ def _csrf_protect():
         abort(400, description="Invalid or missing CSRF token. Please reload and try again.")
 
 
+@app.before_request
+def _tag_ai_usage():
+    """Attribute any LLM calls made while serving this request to the current
+    org/user, so token usage is metered and the monthly AI budget is enforced.
+    Background jobs set their own attribution in the job runner."""
+    try:
+        if getattr(current_user, "is_authenticated", False):
+            proposal_agent.set_call_attribution(
+                org_id=getattr(current_user, "org_id", None),
+                user_id=current_user.id,
+                kind=(request.endpoint or ""),
+            )
+        else:
+            proposal_agent.set_call_attribution()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Login rate limiting (in-process sliding window per IP+username)
 # ---------------------------------------------------------------------------
@@ -262,6 +321,12 @@ with app.app_context():
 
 # Background job runner (AI generation/revision run out-of-request)
 jobs.init_app(app)
+
+# AI cost metering + budget enforcement. Every LLM call flows through the metered
+# client in proposal_agent, which records token usage here and blocks calls once
+# an org exceeds its monthly AI budget. See security audit (LLM spend control).
+proposal_agent.set_usage_sink(billing.record_llm_usage)
+proposal_agent.set_budget_checker(billing.check_ai_budget)
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +439,10 @@ def decrypt_api_key(stored: str) -> str:
 
 def billing_check_generation(org_id):
     return billing.check_generation(org_id)
+
+
+def billing_check_ai_budget(org_id):
+    return billing.check_ai_budget(org_id)
 
 
 def billing_record_generation(org_id):
@@ -832,9 +901,11 @@ def forgot_password():
                   f"Reset your password:\n{link}\n\nThis link expires in 2 hours. "
                   f"If you didn't request this, you can ignore this email."),
         )
-        if not sent:
-            # Dev fallback: surface the link so the flow is testable without SMTP
-            flash(f"Password reset link: {link}", "success")
+        if not sent and _EXPOSE_DEV_LINKS:
+            # Local-dev only: surface the link so the flow is testable without
+            # SMTP. Gated so production never discloses a reset token to an
+            # unauthenticated requester.
+            flash(f"[dev] Password reset link: {link}", "success")
     flash(generic, "success")
     return redirect(url_for("login"))
 
@@ -2564,6 +2635,13 @@ def project_generate(project_id):
         flash(limit_msg, "error")
         return redirect(url_for("project_upload", project_id=project_id))
 
+    # AI cost gate: enforce the monthly token budget so a single org can't run up
+    # unbounded pay-per-use LLM spend (a large upload can cost 10-50x a normal run).
+    budget_ok, budget_msg = billing_check_ai_budget(current_user.org_id)
+    if not budget_ok:
+        flash(budget_msg, "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
     vertical = request.form.get("vertical", "auto")
     output_format = request.form.get("output_format", "docx")
     project.output_format = output_format
@@ -4139,11 +4217,12 @@ def _can_view_proposal(proposal: Proposal) -> bool:
     project = db.session.get(Project, proposal.project_id)
     if not project:
         return False
-    if (
-        project.user_id == current_user.id
-        or project.assigned_to == current_user.id
-        or current_user.is_admin
-    ):
+    if project.user_id == current_user.id or project.assigned_to == current_user.id:
+        return True
+    # Admins can view — but only within their OWN organization. `is_admin` is a
+    # tenant admin, not a platform super-admin, so it must be org-scoped or any
+    # workspace owner could read every other tenant's proposals.
+    if current_user.is_admin and _same_org(project.org_id or _owner_org_id(project)):
         return True
     # Assigned reviewer?
     reviewer = ProposalReviewer.query.filter_by(
@@ -4160,11 +4239,10 @@ def _is_proposal_owner(proposal: Proposal) -> bool:
     project = db.session.get(Project, proposal.project_id)
     if not project:
         return False
-    return (
-        project.user_id == current_user.id
-        or project.assigned_to == current_user.id
-        or current_user.is_admin
-    )
+    if project.user_id == current_user.id or project.assigned_to == current_user.id:
+        return True
+    # Org-scoped admin only — never a cross-tenant super-admin (see _can_view_proposal).
+    return bool(current_user.is_admin and _same_org(project.org_id or _owner_org_id(project)))
 
 
 def _source_for_review_role(review_role: str) -> str:
@@ -5726,11 +5804,16 @@ def billing_webhook():
     import stripe
     payload = request.get_data()
     sig = request.headers.get("Stripe-Signature", "")
+    # Never trust an unsigned event. Without the webhook secret an attacker could
+    # POST a forged checkout.session.completed to upgrade any org for free, so we
+    # refuse to process webhooks at all until the secret is configured.
+    if not billing.STRIPE_WEBHOOK_SECRET:
+        app.logger.error(
+            "Stripe webhook received but STRIPE_WEBHOOK_SECRET is not set; refusing to process."
+        )
+        return {"ok": False, "error": "webhook signature secret not configured"}, 503
     try:
-        if billing.STRIPE_WEBHOOK_SECRET:
-            event = stripe.Webhook.construct_event(payload, sig, billing.STRIPE_WEBHOOK_SECRET)
-        else:
-            event = json.loads(payload)
+        event = stripe.Webhook.construct_event(payload, sig, billing.STRIPE_WEBHOOK_SECRET)
     except Exception:
         return {"ok": False}, 400
 

@@ -64,6 +64,19 @@ S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY", os.getenv("AWS_SECRET_A
 # Background jobs: set JOBS_INLINE=true to run jobs synchronously (tests/dev)
 JOBS_INLINE = os.getenv("JOBS_INLINE", "false").lower() == "true"
 
+# Deployment environment. Set APP_ENV=production to enable strict, fail-closed
+# secret checks (see _verify_production_secrets in app.py).
+APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+IS_PRODUCTION = APP_ENV == "production"
+
+# Secrets known to be insecure defaults — refused in production.
+INSECURE_SECRETS = {
+    "",
+    "dev-secret-change-me",
+    "change-this-to-a-random-secret-key",
+    "your-api-key-here",
+}
+
 # Flask
 FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me")
 FLASK_HOST = os.getenv("FLASK_HOST", "0.0.0.0")

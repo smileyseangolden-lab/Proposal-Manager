@@ -100,6 +100,15 @@ def _run_job(job_id: str):
         job = db.session.get(BackgroundJob, job_id)
 
     handler = _HANDLERS.get(job.kind)
+    # Attribute any LLM calls this job makes to its org/user so token usage is
+    # metered and the monthly AI budget is enforced (same as request-scoped calls).
+    try:
+        import proposal_agent
+        proposal_agent.set_call_attribution(
+            org_id=job.org_id, user_id=job.user_id, kind=job.kind, job_id=job.id
+        )
+    except Exception:
+        pass
     try:
         if handler is None:
             raise RuntimeError(f"No handler registered for job kind '{job.kind}'")
@@ -118,6 +127,12 @@ def _run_job(job_id: str):
         job.error = str(e)
         job.finished_at = datetime.now(timezone.utc)
         db.session.commit()
+    finally:
+        try:
+            import proposal_agent
+            proposal_agent.set_call_attribution()
+        except Exception:
+            pass
 
 
 def _worker_loop():

@@ -37,7 +37,9 @@ def send_email(to: str, subject: str, body: str, html: str = "", attachments: li
         return False
 
     if not configured():
-        logger.info("[mailer:console] To: %s | Subject: %s\n%s", to, subject, body)
+        # SMTP is not configured. Do NOT log the body — it may contain a
+        # password-reset token or other secrets/PII. Log only a redacted notice.
+        logger.info("[mailer:console] email suppressed (SMTP not configured) | subject: %s", subject)
         return False
 
     msg = EmailMessage()

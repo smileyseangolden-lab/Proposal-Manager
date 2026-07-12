@@ -10,15 +10,20 @@ Works on both SQLite (dev) and PostgreSQL (production). Strategy:
      is stamped onto their projects and posture rows.
 """
 
+import logging
+
 from sqlalchemy import inspect, text
 
 from models import Organization, Project, User, db
 
+logger = logging.getLogger(__name__)
+
 # Columns added after initial schema. ALTER TABLE ... ADD COLUMN with these
-# types is valid on both SQLite and PostgreSQL.
+# types must be valid on BOTH SQLite and PostgreSQL — booleans use the TRUE/FALSE
+# keywords because PostgreSQL rejects integer literals (0/1) for a boolean default.
 _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # Legacy (pre-Phase-1) migrations, preserved from the old SQLite-only block
-    ("project_documents", "is_reference", "BOOLEAN DEFAULT 0"),
+    ("project_documents", "is_reference", "BOOLEAN DEFAULT FALSE"),
     ("project_documents", "notes", "TEXT DEFAULT ''"),
     ("project_documents", "version_group", "VARCHAR(32) DEFAULT ''"),
     ("project_documents", "version_label", "VARCHAR(100) DEFAULT ''"),
@@ -31,9 +36,9 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("users", "role", "VARCHAR(20) DEFAULT 'proposal'"),
     ("users", "company_logo_path", "VARCHAR(1000) DEFAULT ''"),
     ("users", "company_logo_original_name", "VARCHAR(500) DEFAULT ''"),
-    ("users", "company_logo_use_in_proposals", "BOOLEAN DEFAULT 1"),
+    ("users", "company_logo_use_in_proposals", "BOOLEAN DEFAULT TRUE"),
     ("users", "company_logo_placement", "VARCHAR(20) DEFAULT 'top_left'"),
-    ("users", "company_logo_show_on_cover", "BOOLEAN DEFAULT 1"),
+    ("users", "company_logo_show_on_cover", "BOOLEAN DEFAULT TRUE"),
     ("proposals", "review_status", "VARCHAR(40) DEFAULT 'draft'"),
     ("proposals", "review_deadline", "TIMESTAMP"),
     ("projects", "clarification_sub_status", "VARCHAR(30) DEFAULT 'none'"),
@@ -50,12 +55,11 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("proposal_corrections", "org_id", "VARCHAR(32)"),
     ("revision_templates", "org_id", "VARCHAR(32)"),
     # Phase 2: auth hardening
-    ("users", "email_verified", "BOOLEAN DEFAULT 0"),
+    ("users", "email_verified", "BOOLEAN DEFAULT FALSE"),
     # Phase 3: customer send + ROM
     ("projects", "request_type", "VARCHAR(10) DEFAULT ''"),
     ("projects", "client_email", "VARCHAR(200) DEFAULT ''"),
     ("proposals", "pdf_file", "VARCHAR(500) DEFAULT ''"),
-    ("users", "email_verified", "BOOLEAN DEFAULT 0"),
     # Phase 5: billing
     ("organizations", "plan", "VARCHAR(30) DEFAULT 'free'"),
     ("organizations", "stripe_customer_id", "VARCHAR(100) DEFAULT ''"),
@@ -100,9 +104,16 @@ def _add_missing_columns():
             cols_cache[table] = _existing_columns(table)
         if column in cols_cache[table]:
             continue
-        db.session.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"))
-        cols_cache[table].add(column)
-    db.session.commit()
+        # Each ALTER runs in its own transaction so a single failed/legacy
+        # migration can't abort the whole schema bootstrap and brick startup
+        # for a live paid database.
+        try:
+            db.session.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"))
+            db.session.commit()
+            cols_cache[table].add(column)
+        except Exception:
+            db.session.rollback()
+            logger.exception("Migration: failed to add column %s.%s", table, column)
 
 
 def _backfill_organizations():

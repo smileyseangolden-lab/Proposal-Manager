@@ -15,14 +15,16 @@ PLANS = {
         "name": "Free",
         "price_id": "",
         "monthly_price": 0,
-        "limits": {"seats": 2, "generations_per_month": 5, "projects": 10},
+        "limits": {"seats": 2, "generations_per_month": 5, "projects": 10,
+                   "ai_tokens_per_month": 500_000},
         "features": ["Up to 2 seats", "5 AI proposals / month", "Core workflow"],
     },
     "pro": {
         "name": "Pro",
         "price_id": os.getenv("STRIPE_PRICE_PRO", ""),
         "monthly_price": 49,
-        "limits": {"seats": 10, "generations_per_month": 100, "projects": -1},
+        "limits": {"seats": 10, "generations_per_month": 100, "projects": -1,
+                   "ai_tokens_per_month": 10_000_000},
         "features": ["Up to 10 seats", "100 AI proposals / month",
                      "Customer portal & PDF", "Structured pricing"],
     },
@@ -30,11 +32,33 @@ PLANS = {
         "name": "Business",
         "price_id": os.getenv("STRIPE_PRICE_BUSINESS", ""),
         "monthly_price": 149,
-        "limits": {"seats": -1, "generations_per_month": -1, "projects": -1},
+        "limits": {"seats": -1, "generations_per_month": -1, "projects": -1,
+                   "ai_tokens_per_month": -1},
         "features": ["Unlimited seats", "Unlimited AI proposals",
                      "Integrations", "Priority support"],
     },
 }
+
+# Approximate Anthropic list prices in USD per 1M tokens: (input, output).
+# Used only for internal cost estimates / budgeting, matched by substring.
+MODEL_PRICING = {
+    "opus": (15.0, 75.0),
+    "sonnet": (3.0, 15.0),
+    "haiku": (0.80, 4.0),
+}
+_DEFAULT_PRICING = (15.0, 75.0)
+
+
+def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Estimated USD cost of one call from token counts."""
+    m = (model or "").lower()
+    rate = _DEFAULT_PRICING
+    for key, r in MODEL_PRICING.items():
+        if key in m:
+            rate = r
+            break
+    return round((input_tokens or 0) / 1_000_000 * rate[0]
+                 + (output_tokens or 0) / 1_000_000 * rate[1], 6)
 
 STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
@@ -95,9 +119,75 @@ def check_generation(org_id) -> tuple[bool, str]:
 
 
 def record_generation(org_id):
-    """Metering hook. Generations are counted from completed job rows, so this
-    is currently a no-op placeholder kept for future per-token accounting."""
+    """Metering hook. Generations are counted from completed job rows; per-token
+    accounting is handled separately by record_llm_usage()."""
     return None
+
+
+def record_llm_usage(org_id, user_id, kind, model, input_tokens, output_tokens, job_id=None):
+    """Persist one LLM call's token usage + estimated cost.
+
+    Best-effort: writes via an autonomous transaction (its own connection) so it
+    never flushes or interferes with the caller's ORM session, and never raises
+    into the request/generation path."""
+    try:
+        import logging
+        import uuid
+
+        from models import LlmUsage, db
+
+        cost = estimate_cost(model, input_tokens, output_tokens)
+        stmt = LlmUsage.__table__.insert().values(
+            id=uuid.uuid4().hex,
+            org_id=org_id,
+            user_id=user_id,
+            job_id=job_id,
+            kind=(kind or "")[:50],
+            provider="anthropic",
+            model=(model or "")[:100],
+            input_tokens=int(input_tokens or 0),
+            output_tokens=int(output_tokens or 0),
+            est_cost_usd=cost,
+            created_at=datetime.now(timezone.utc),
+        )
+        with db.engine.begin() as conn:
+            conn.execute(stmt)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("record_llm_usage failed")
+
+
+def tokens_this_month(org_id) -> int:
+    """Total input+output tokens billed to an org in the current calendar month."""
+    from sqlalchemy import func
+
+    from models import LlmUsage, db
+    start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    total = (
+        db.session.query(
+            func.coalesce(func.sum(LlmUsage.input_tokens + LlmUsage.output_tokens), 0)
+        )
+        .filter(LlmUsage.org_id == org_id, LlmUsage.created_at >= start)
+        .scalar()
+    )
+    return int(total or 0)
+
+
+def check_ai_budget(org_id) -> tuple[bool, str]:
+    """Return (allowed, message). Enforces the monthly AI token budget so a
+    single org can't run up unbounded pay-per-use LLM cost."""
+    from models import Organization, db
+    org = db.session.get(Organization, org_id) if org_id else None
+    limit = limits_for(org).get("ai_tokens_per_month", -1)
+    if limit is None or limit < 0:
+        return True, ""
+    if tokens_this_month(org_id) >= limit:
+        plan_name = plan_for(org)["name"]
+        return False, (
+            f"You've reached your {plan_name} plan's monthly AI usage limit. "
+            f"Upgrade your plan to continue generating."
+        )
+    return True, ""
 
 
 def can_add_seat(org_id, pending_invites=0) -> tuple[bool, str]:
