@@ -2866,6 +2866,12 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
             f"{user.display_name or user.username} generated a proposal for '{project.name}'.",
             link=f"/proposal/{proposal.id}",
         )
+    _notify_via_integrations(
+        org_id,
+        f"\U0001F4C4 Proposal generated for *{project.name}* ({result['vertical_label']}).",
+        event="proposal_generated",
+        payload={"project": project.name, "proposal_id": proposal.id},
+    )
     return {"redirect": url_for("view_proposal", proposal_id=proposal.id)}
 
 
@@ -3258,6 +3264,14 @@ def update_project_status(project_id):
     dollar_amount = request.form.get("dollar_amount")
 
     prev_status = project.status
+
+    # Require a win/loss reason category when closing a deal (retrospective quality)
+    if new_status in ("won", "lost") and prev_status not in ("won", "lost"):
+        close_category = request.form.get("close_category", "").strip()
+        if not close_category:
+            flash("Please select a win/loss reason category before closing this deal.", "error")
+            return redirect(request.referrer or url_for("dashboard"))
+
     project.status = new_status
     if dollar_amount:
         try:
@@ -3284,6 +3298,16 @@ def update_project_status(project_id):
 
     db.session.commit()
     _log_activity("project_status_update", f"Status → {new_status}", project_id)
+    if new_status in ("won", "lost") and prev_status not in ("won", "lost"):
+        emoji = "\U0001F3C6" if new_status == "won" else "\U0001F4C9"
+        _notify_via_integrations(
+            project.org_id,
+            f"{emoji} *{project.name}* marked **{new_status.upper()}**"
+            + (f" (${project.dollar_amount:,.0f})" if project.dollar_amount else ""),
+            event=f"project_{new_status}",
+            payload={"project": project.name, "value": project.dollar_amount,
+                     "category": project.close_category},
+        )
     flash(f"Project status updated to {new_status}.", "success")
     return redirect(request.referrer or url_for("dashboard"))
 
@@ -3831,6 +3855,69 @@ def edit_proposal(proposal_id):
         current_content=current_content,
         versions=versions,
     )
+
+
+@app.route("/proposal/<proposal_id>/preview", methods=["POST"])
+@login_required
+def preview_markdown(proposal_id):
+    """Render posted markdown to HTML for the live editor preview pane."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+    data = request.get_json(silent=True) or {}
+    content = data.get("markdown", "")
+    html = md.markdown(content, extensions=["tables", "fenced_code"])
+    return {"html": html}
+
+
+@app.route("/proposal/<proposal_id>/ai-assist", methods=["POST"])
+@login_required
+def ai_assist(proposal_id):
+    """Rewrite a selected passage with a quick instruction (tighten, formalize,
+    expand). Returns {"result": text}. Used inline from the editor."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text", "") or "").strip()
+    action = (data.get("action", "") or "").strip().lower()
+    if not text:
+        return {"error": "Select some text first."}, 400
+
+    instructions = {
+        "tighten": "Rewrite this passage to be more concise and punchy without losing meaning.",
+        "formal": "Rewrite this passage in a more formal, professional business tone.",
+        "expand": "Expand this passage with more specific, persuasive detail. Do not invent facts, pricing, names, or certifications — use [ACTION REQUIRED: ...] for anything unknown.",
+        "grammar": "Fix grammar, spelling, and punctuation in this passage. Keep the meaning and tone.",
+    }
+    instr = instructions.get(action, instructions["tighten"])
+
+    api_key = decrypt_api_key(current_user.api_key_encrypted) or None
+    from config.settings import ANTHROPIC_API_KEY as _GK
+    key = api_key or _GK
+    if not key:
+        return {"error": "No API key configured. Add one in Settings."}, 400
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=key, timeout=45, max_retries=1)
+        resp = client.messages.create(
+            model=current_user.llm_model or "claude-opus-4-6",
+            max_tokens=1500,
+            system=("You are a proposal editor. Return ONLY the rewritten passage in "
+                    "Markdown — no preamble, no explanation, no code fences."),
+            messages=[{"role": "user", "content": f"{instr}\n\n---PASSAGE---\n{text[:6000]}"}],
+        )
+        out = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+        return {"result": out or text}
+    except Exception as e:
+        return {"error": friendly_api_error(e)}, 500
 
 
 @app.route("/proposal/<proposal_id>/version/<version_id>")
@@ -5421,6 +5508,125 @@ def revoke_invitation(invite_id):
     db.session.commit()
     flash(f"Invitation for {inv.email} revoked.", "success")
     return redirect(url_for("admin_panel"))
+
+
+@app.route("/admin/integrations", methods=["POST"])
+@login_required
+def update_integrations():
+    """Save the org's Slack incoming webhook and generic outbound webhook URLs."""
+    if not current_user.is_admin or not current_user.org_id:
+        abort(403)
+    org = db.session.get(Organization, current_user.org_id)
+    slack = request.form.get("slack_webhook_url", "").strip()
+    webhook = request.form.get("outbound_webhook_url", "").strip()
+    # Basic sanity: only accept https URLs (or empty to clear)
+    org.slack_webhook_url = slack if (slack.startswith("https://") or not slack) else org.slack_webhook_url
+    org.outbound_webhook_url = webhook if (webhook.startswith("https://") or not webhook) else org.outbound_webhook_url
+    db.session.commit()
+    _log_activity("integrations_update", "Updated integrations")
+    flash("Integrations saved.", "success")
+    return redirect(url_for("admin_panel") + "#integrations")
+
+
+@app.route("/admin/export-data")
+@login_required
+def export_org_data():
+    """Export all of the org's projects + proposals as a JSON file."""
+    if not current_user.is_admin:
+        abort(403)
+    from flask import Response
+    org = db.session.get(Organization, current_user.org_id)
+    projects = Project.query.filter_by(org_id=current_user.org_id).all()
+    data = {
+        "organization": {"id": org.id, "name": org.name, "plan": org.plan} if org else {},
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "projects": [],
+    }
+    for p in projects:
+        proposals = []
+        for prop in Proposal.query.filter_by(project_id=p.id).all():
+            latest = latest_version(prop.id)
+            proposals.append({
+                "id": prop.id,
+                "document_type": prop.document_type,
+                "review_status": prop.review_status,
+                "confidence_score": prop.confidence_score,
+                "generated_at": prop.generated_at.isoformat() if prop.generated_at else None,
+                "markdown": latest.markdown_content if latest else "",
+            })
+        data["projects"].append({
+            "id": p.id,
+            "name": p.name,
+            "client_name": p.client_name,
+            "request_type": p.request_type,
+            "status": p.status,
+            "vertical": p.vertical_label,
+            "dollar_amount": p.dollar_amount,
+            "close_reason": p.close_reason,
+            "close_category": p.close_category,
+            "competitor_name": p.competitor_name,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+            "proposals": proposals,
+        })
+    _log_activity("data_export", f"Exported {len(projects)} project(s)")
+    return Response(
+        json.dumps(data, indent=2),
+        mimetype="application/json",
+        headers={"Content-Disposition": "attachment; filename=proposal_manager_export.json"},
+    )
+
+
+@app.route("/load-sample-data", methods=["POST"])
+@login_required
+def load_sample_data():
+    """Seed the workspace with a sample project + posture so a new trial can see
+    the product working immediately. Admin-only; refuses if data already exists."""
+    if not current_user.is_admin:
+        abort(403)
+    org_id = current_user.org_id
+    if Project.query.filter_by(org_id=org_id).count() > 0:
+        flash("Sample data is only available for an empty workspace.", "error")
+        return redirect(url_for("dashboard"))
+
+    # Sample posture
+    if StaffRole.query.filter_by(org_id=org_id).count() == 0:
+        for rn, cat, hr in [("Senior Engineer", "Engineering", 165),
+                            ("Project Manager", "Management", 185),
+                            ("Field Technician", "Technician", 95)]:
+            db.session.add(StaffRole(user_id=current_user.id, org_id=org_id,
+                                     role_name=rn, category=cat, hourly_rate=hr))
+    if CompanyStandard.query.filter_by(org_id=org_id).count() == 0:
+        db.session.add(CompanyStandard(
+            user_id=current_user.id, org_id=org_id, category="certifications",
+            title="Certifications & Safety",
+            content="ISO 9001:2015 certified. EMR of 0.72. OSHA 30 trained field staff."))
+
+    # Sample project + RFP document
+    project = Project(user_id=current_user.id, org_id=org_id,
+                      name="Sample — Data Center EPMS", client_name="Acme Colo",
+                      request_type="rfp", vertical="data_center",
+                      vertical_label="Data Center / Mission Critical")
+    db.session.add(project)
+    db.session.flush()
+    sample_rfp = (
+        "REQUEST FOR PROPOSAL — Electrical Power Monitoring System (EPMS)\n\n"
+        "Acme Colo seeks a complete EPMS for a new 5MW data hall: metering at all "
+        "switchgear, PDUs, and RPPs; integration to the existing BMS; factory and "
+        "site acceptance testing; and O&M documentation. Redundant (N+1) monitoring "
+        "required. Provide a fixed-price proposal with schedule and staffing plan."
+    )
+    dpath = UPLOADS_DIR / f"projects/{project.id}"
+    dpath.mkdir(parents=True, exist_ok=True)
+    fpath = dpath / "sample_rfp.txt"
+    fpath.write_text(sample_rfp, encoding="utf-8")
+    storage.sync_up(fpath)
+    db.session.add(ProjectDocument(
+        project_id=project.id, filename="sample_rfp.txt", original_filename="sample_rfp.txt",
+        file_type="rfp", file_path=str(fpath), file_size=fpath.stat().st_size))
+    db.session.commit()
+    _log_activity("sample_data", "Loaded sample data", project.id)
+    flash("Sample project and posture loaded. Open it and try generating a proposal!", "success")
+    return redirect(url_for("project_upload", project_id=project.id))
 
 
 # ---------------------------------------------------------------------------
@@ -7223,42 +7429,80 @@ def faq_page():
 # Help Chatbot (FAQ-based)
 # ---------------------------------------------------------------------------
 
+_HELP_KB = """You are the in-app help assistant for Proposal Manager, an AI proposal platform.
+Answer concisely (2-5 sentences) and only about using the product. If unsure, point
+the user to the relevant page. Key features and where they live:
+- Dashboard: "Pick up where you left off" list; drop an RFP on the hero to start.
+- New Proposal / Projects: upload RFP/RFQ/ROM docs (PDF, DOCX, TXT, MD, XLSX).
+- Request types: RFP, RFQ, and ROM (a lighter range-priced budgetary estimate you
+  can later convert to a full proposal).
+- Scope of Work: AI drafts a checklist you approve before generating.
+- Generation runs as a background job with a progress page.
+- Internal Review: assign reviewers, they approve or request changes; the owner
+  batch-applies revision requests to generate a new version.
+- Structured pricing: the Estimate page (from a proposal) has an editable grid with
+  live totals, CSV export, and "insert into proposal".
+- Proposal Posture: templates, company standards, staff/equipment/travel rates, and
+  branding. "AI import & review" extracts rates/standards from an uploaded file.
+- Customer Portal: create a secure share link; the customer views, comments, and
+  accepts/declines; you see open tracking.
+- Export: DOCX and PDF; redline DOCX shows tracked changes vs the AI original.
+- Reports: win/loss analysis, pipeline, competitors.
+- Billing & Plans (admins): Free/Pro/Business with seat, project, and generation limits.
+- People & Roles (admins): invite teammates by email, set roles.
+- Settings > Profile & AI: set your Anthropic API key and model.
+"""
+
+
+def _fallback_help(message: str) -> str:
+    responses = {
+        ("generate", "proposal", "create"): "To generate a proposal: create a project, upload your RFP/RFQ, optionally approve a Scope of Work, then click Generate. It runs as a background job with a progress page.",
+        ("upload", "file", "document", "format"): "You can upload PDF, Word (.docx), text (.txt), Markdown (.md), and Excel (.xlsx) files on the project page.",
+        ("rate", "pricing", "cost", "estimate", "staff", "equipment", "travel"): "Set rates in Proposal Posture. For structured pricing, open a proposal and click Estimate — an editable grid with live totals, CSV export, and insert-into-proposal.",
+        ("share", "customer", "send", "portal"): "On an approved proposal, use the Customer Portal panel to create a secure share link. The customer can view, comment, and accept/decline, and you get open tracking.",
+        ("rom", "budgetary", "ballpark"): "Choose ROM as the request type for a lighter, range-priced budgetary estimate. You can convert it to a full RFP/RFQ later.",
+        ("invite", "team", "seat", "member"): "Admins invite teammates from People & Roles by email and assign a role.",
+        ("bill", "plan", "upgrade", "subscription"): "See Billing & Plans (admin) for your plan, usage vs limits, and upgrades.",
+        ("api", "key", "model", "llm"): "Set your Anthropic API key and model in Settings > Profile & AI.",
+    }
+    best, score = None, 0
+    for kws, resp in responses.items():
+        s = sum(1 for kw in kws if kw in message)
+        if s > score:
+            best, score = resp, s
+    return best or "I can help with generating proposals, pricing/estimates, the customer portal, posture setup, invites, and billing. Try rephrasing, or see the FAQ page."
+
+
 @app.route("/api/chat", methods=["POST"])
 @login_required
 def chat_help():
-    """Simple FAQ-based chatbot that matches user questions to predefined answers."""
+    """Claude-powered help assistant grounded in the product knowledge base,
+    with a keyword fallback when no API key is configured or the call fails."""
     data = request.get_json(silent=True) or {}
-    message = data.get("message", "").strip().lower()
-
+    message = (data.get("message", "") or "").strip()
     if not message:
         return {"reply": "Please type a question and I'll do my best to help!"}
 
-    # Simple keyword matching for help topics
-    responses = {
-        ("generate", "proposal", "create"): "To generate a proposal: Create a new project, upload your RFP/RFQ documents, choose cost estimation options, and click 'Generate Proposal'. The AI will analyze your docs and produce a draft in seconds.",
-        ("upload", "file", "document", "format"): "You can upload PDF, Word (.docx), text (.txt), Markdown (.md), and Excel (.xlsx) files. Use the project page to upload RFP documents, and Settings for rate sheets.",
-        ("learn", "teach", "finalize", "correction"): "After editing a proposal, click 'Finalize & Teach AI' in the editor. The system captures your editing patterns and uses them to improve future proposals.",
-        ("rate", "pricing", "cost", "staff", "equipment", "travel"): "Configure your rates in the Proposal Posture page. Add staff hourly rates, equipment prices, and travel rates. The AI uses these when you check the cost estimation boxes during generation.",
-        ("version", "history", "revert", "restore"): "Open the proposal editor to see Version History in the right sidebar. You can view any version and restore previous ones. Restoring creates a new version so nothing is ever lost.",
-        ("redline", "tracked", "changes", "diff"): "Download Redline DOCX from the proposal view page. It shows AI-original vs your edits with red strikethrough (deletions) and blue underline (insertions).",
-        ("api", "key", "provider", "model", "llm"): "Go to Settings > Profile & AI to configure your AI provider, model, and API key. Currently supports Anthropic Claude, OpenAI GPT, and Google Gemini.",
-        ("vertical", "industry", "template"): "Verticals are industry-specific templates: Data Center, Life Science, Food & Beverage, and General. Choose during proposal generation or let the AI auto-detect from your RFP.",
-        ("admin", "user", "manage"): "Admins can view company-wide metrics, manage user permissions, and track activity from the Admin panel in the sidebar.",
-        ("standard", "boilerplate", "mission", "certification"): "Company Standards are reusable content blocks. Go to the Proposal Posture page to add mission statements, certifications, past performance, etc. The AI includes these in every proposal.",
-    }
+    api_key = decrypt_api_key(current_user.api_key_encrypted) or None
+    from config.settings import ANTHROPIC_API_KEY as _GLOBAL_KEY
+    effective_key = api_key or _GLOBAL_KEY
+    if effective_key:
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=effective_key, timeout=30, max_retries=1)
+            resp = client.messages.create(
+                model=current_user.llm_model or "claude-opus-4-6",
+                max_tokens=400,
+                system=_HELP_KB,
+                messages=[{"role": "user", "content": message[:2000]}],
+            )
+            text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
+            if text:
+                return {"reply": text}
+        except Exception:
+            pass  # fall through to keyword help
 
-    best_match = None
-    best_score = 0
-    for keywords, response in responses.items():
-        score = sum(1 for kw in keywords if kw in message)
-        if score > best_score:
-            best_score = score
-            best_match = response
-
-    if best_match and best_score > 0:
-        return {"reply": best_match}
-
-    return {"reply": "I'm not sure about that. Try checking the FAQ page for detailed answers, or rephrase your question. I can help with: generating proposals, uploading files, cost estimation, version history, redline exports, API setup, and company standards."}
+    return {"reply": _fallback_help(message.lower())}
 
 
 # ---------------------------------------------------------------------------

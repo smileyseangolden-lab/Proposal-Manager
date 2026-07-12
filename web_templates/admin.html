@@ -171,6 +171,30 @@
     </table>
 </div>
 
+<!-- Integrations -->
+<div class="card" id="integrations">
+    <h2>Integrations</h2>
+    <p class="card-desc">Get a message in Slack (or your own endpoint) when proposals are generated and deals are won or lost.</p>
+    <form method="post" action="{{ url_for('update_integrations') }}">
+        <div class="form-group">
+            <label for="slack_webhook_url">Slack incoming webhook URL</label>
+            <input type="url" id="slack_webhook_url" name="slack_webhook_url" placeholder="https://hooks.slack.com/services/…" value="{{ org.slack_webhook_url if org else '' }}">
+        </div>
+        <div class="form-group">
+            <label for="outbound_webhook_url">Outbound webhook URL <span class="form-hint">(receives JSON events)</span></label>
+            <input type="url" id="outbound_webhook_url" name="outbound_webhook_url" placeholder="https://your-app.example.com/hooks/proposals" value="{{ org.outbound_webhook_url if org else '' }}">
+        </div>
+        <button type="submit" class="btn btn-secondary">Save integrations</button>
+    </form>
+</div>
+
+<!-- Data & workspace -->
+<div class="card">
+    <h2>Data &amp; Workspace</h2>
+    <p class="card-desc">Export every project and proposal in this workspace as JSON.</p>
+    <a href="{{ url_for('export_org_data') }}" class="btn btn-secondary">Export workspace data (JSON)</a>
+</div>
+
 <!-- Recent Activity Log -->
 <div class="card">
     <div class="activity-header">

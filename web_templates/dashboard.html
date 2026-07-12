@@ -7,6 +7,17 @@
 {% block content %}
 {% include "_setup_banner.html" %}
 
+{% if not active_projects and not past_projects and current_user.is_admin %}
+<div class="card sample-banner">
+    <div>
+        <strong>New here?</strong> Load a sample project and posture to see {{ app_name }} work end-to-end in a couple of minutes.
+    </div>
+    <form method="post" action="{{ url_for('load_sample_data') }}" class="inline-form">
+        <button type="submit" class="btn btn-primary">Load sample data</button>
+    </form>
+</div>
+{% endif %}
+
 <!-- Serif greeting -->
 <section style="padding: 26px 0 4px;">
     <h1 class="greeting">{{ greeting_word }}, {{ first_name }}. <em>Here's where to focus today.</em></h1>

@@ -3068,3 +3068,9 @@ body {
 .ai-import-box strong { display: block; color: var(--sea-800, #0f6b6b); }
 .ai-import-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
 .ingest-block { border: 1px solid var(--gray-200, #dfe3e6); border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+
+/* Phase 6: editor AI assist, sample banner */
+.toolbar-divider { display: inline-block; width: 1px; height: 20px; background: var(--gray-200, #dfe3e6); margin: 0 4px; vertical-align: middle; }
+.ai-assist-group { display: inline-flex; align-items: center; gap: 4px; }
+.ai-assist-label { font-size: 12px; color: var(--sea-800, #0f6b6b); font-weight: 600; }
+.sample-banner { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; background: var(--sea-50, #f0f7f7); border-left: 3px solid var(--sea-800, #0f6b6b); }

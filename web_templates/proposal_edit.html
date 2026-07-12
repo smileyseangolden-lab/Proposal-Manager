@@ -29,6 +29,14 @@
                     <button type="button" class="btn btn-small btn-secondary" onclick="insertHeading()">H2</button>
                     <button type="button" class="btn btn-small btn-secondary" onclick="insertTable()">Table</button>
                     <button type="button" class="btn btn-small btn-secondary" onclick="insertActionItem()">Action Item</button>
+                    <span class="toolbar-divider"></span>
+                    <span class="ai-assist-group" title="Select text, then apply">
+                        <span class="ai-assist-label">AI:</span>
+                        <button type="button" class="btn btn-small btn-secondary" data-ai="tighten">Tighten</button>
+                        <button type="button" class="btn btn-small btn-secondary" data-ai="formal">Formalize</button>
+                        <button type="button" class="btn btn-small btn-secondary" data-ai="expand">Expand</button>
+                        <button type="button" class="btn btn-small btn-secondary" data-ai="grammar">Fix grammar</button>
+                    </span>
                 </div>
                 <div class="toolbar-right">
                     <span class="editor-status" id="editor-status">Ready</span>
@@ -163,26 +171,57 @@
     window.togglePreview = function() {
         showingPreview = !showingPreview;
         if (showingPreview) {
-            // Escape HTML first to prevent XSS, then apply markdown formatting
-            var escaped = escapeHtml(editor.value);
-            var html = escaped
-                .replace(/^### (.+)$/gm, "<h3>$1</h3>")
-                .replace(/^## (.+)$/gm, "<h2>$1</h2>")
-                .replace(/^# (.+)$/gm, "<h1>$1</h1>")
-                .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-                .replace(/\*(.+?)\*/g, "<em>$1</em>")
-                .replace(/\n\n/g, "</p><p>")
-                .replace(/\n/g, "<br>");
-            previewBody.innerHTML = "<p>" + html + "</p>";
+            previewBody.innerHTML = "<p>Rendering…</p>";
             editorContainer.style.display = "none";
             previewContainer.style.display = "block";
             btnPreview.textContent = "Edit";
+            // Accurate server-side markdown rendering (tables, code, etc.)
+            fetch("{{ url_for('preview_markdown', proposal_id=proposal.id) }}", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({markdown: editor.value})
+            })
+            .then(function(r){ return r.json(); })
+            .then(function(d){ previewBody.innerHTML = d.html || ""; })
+            .catch(function(){ previewBody.innerHTML = "<p>Preview unavailable.</p>"; });
         } else {
             editorContainer.style.display = "block";
             previewContainer.style.display = "none";
             btnPreview.textContent = "Preview";
         }
     };
+
+    // AI-assist: rewrite the current selection
+    document.querySelectorAll(".ai-assist-group [data-ai]").forEach(function(btn){
+        btn.addEventListener("click", function(){
+            var start = editor.selectionStart, end = editor.selectionEnd;
+            var selected = editor.value.substring(start, end).trim();
+            if (!selected) { alert("Select the text you want to rewrite first."); return; }
+            var action = btn.getAttribute("data-ai");
+            var orig = btn.textContent;
+            btn.textContent = "…"; btn.disabled = true;
+            status.textContent = "AI working…"; status.style.color = "#0f6b6b";
+            fetch("{{ url_for('ai_assist', proposal_id=proposal.id) }}", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({text: selected, action: action})
+            })
+            .then(function(r){ return r.json().then(function(d){ return {ok: r.ok, d: d}; }); })
+            .then(function(res){
+                if (res.ok && res.d.result) {
+                    editor.value = editor.value.substring(0, start) + res.d.result + editor.value.substring(end);
+                    editor.selectionStart = start;
+                    editor.selectionEnd = start + res.d.result.length;
+                    editor.dispatchEvent(new Event("input"));
+                    status.textContent = "AI applied"; status.style.color = "#1e7d34";
+                } else {
+                    status.textContent = (res.d.error || "AI failed"); status.style.color = "#b3261e";
+                }
+            })
+            .catch(function(){ status.textContent = "AI failed"; status.style.color = "#b3261e"; })
+            .finally(function(){ btn.textContent = orig; btn.disabled = false; editor.focus(); });
+        });
+    });
 
     // Toolbar helpers
     window.insertBold = function() {
