@@ -65,12 +65,56 @@ with app.app_context():
                          ('/platform-admin/accounts', b'Accounts'),
                          ('/platform-admin/revenue', b'Recurring Revenue'),
                          ('/platform-admin/ai-costs', b'AI Costs'),
-                         ('/platform-admin/health', b'Health')]:
+                         ('/platform-admin/growth', b'Growth'),
+                         ('/platform-admin/health', b'Health'),
+                         ('/platform-admin/chatbot', b'Chatbot'),
+                         ('/platform-admin/requests', b'Requests'),
+                         ('/platform-admin/audit', b'Audit'),
+                         ('/platform-admin/controls', b'Controls'),
+                         ('/platform-admin/api', b'API')]:
         r = c.get(path)
         test(f"{path} renders 200", r.status_code == 200 and needle in r.data, f"{r.status_code}")
-    # Overview shows real cross-tenant counts (2 orgs: TenantCo + Ops)
     r = c.get('/platform-admin/')
     test("overview counts all orgs", b'Organizations' in r.data)
+
+    print("\n=== Controls: settings, owner, plan (audited) ===")
+    import platform_config
+    from models import PlatformAuditLog, PlatformSetting, ChatbotMessage
+    # non-secret setting
+    c.post('/platform-admin/controls/settings', data={'group':'llm','llm_model':'claude-opus-4-8','anthropic_api_key':''})
+    test("non-secret setting persisted", platform_config.get('llm_model') == 'claude-opus-4-8')
+    # secret setting is encrypted at rest, decrypts on read, masked for display
+    c.post('/platform-admin/controls/settings', data={'group':'payment','stripe_secret_key':'sk_live_secret123'})
+    row = PlatformSetting.query.filter_by(key='stripe_secret_key').first()
+    test("secret stored encrypted", row is not None and 'sk_live_secret123' not in (row.value or ''))
+    test("secret decrypts on read", platform_config.get('stripe_secret_key') == 'sk_live_secret123')
+    test("secret is masked for display", platform_config.masked('stripe_secret_key') == '•••• set')
+    # blank secret submit keeps the value
+    c.post('/platform-admin/controls/settings', data={'group':'payment','stripe_secret_key':''})
+    test("blank secret submit keeps value", platform_config.get('stripe_secret_key') == 'sk_live_secret123')
+    # grant + revoke platform owner
+    c.post('/platform-admin/controls/owner', data={'email':'tenant@corp.com','action':'grant'})
+    tu = User.query.filter_by(email='tenant@corp.com').first()
+    db.session.refresh(tu)
+    test("owner granted via DB flag", tu.platform_owner is True)
+    c.post('/platform-admin/controls/owner', data={'email':'tenant@corp.com','action':'revoke'})
+    db.session.refresh(tu)
+    test("owner revoked", tu.platform_owner is False)
+    # plan override
+    tenant_org = db.session.get(Organization, tu.org_id)
+    c.post('/platform-admin/controls/plan', data={'org_id':tenant_org.id,'plan':'business'})
+    db.session.refresh(tenant_org)
+    test("plan override applied", tenant_org.plan == 'business')
+    test("actions were audited", PlatformAuditLog.query.count() >= 4)
+
+    print("\n=== Chatbot message storage ===")
+    c.post('/logout')
+    c.post('/login', data={'username':'tenant','password':'password123'})
+    before = ChatbotMessage.query.count()
+    c.post('/api/chat', json={'message':'How do I upload an RFP?'})
+    test("chatbot question stored", ChatbotMessage.query.count() == before + 1)
+    m = ChatbotMessage.query.order_by(ChatbotMessage.created_at.desc()).first()
+    test("stored message text correct", m and 'upload an RFP' in m.message)
 
     print("\n=== Allowlist path ===")
     platform_admin.PLATFORM_OWNER_EMAILS.add('tenant@corp.com')

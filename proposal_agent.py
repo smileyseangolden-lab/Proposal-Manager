@@ -34,9 +34,19 @@ from document_parser import (
 )
 
 
-# Generous defaults so slow networks / large proposals don't look like outages.
-_CLIENT_TIMEOUT_SECONDS = 120.0
+import httpx
+
+# Long read timeout so a full 128K-token proposal / scope generation is never
+# cut off mid-stream, while a short connect timeout still fails fast on a dead
+# network. Streaming keeps the connection alive with frequent chunks, so the
+# long read window only matters if the model genuinely runs for many minutes.
+_CLIENT_TIMEOUT = httpx.Timeout(connect=15.0, read=3600.0, write=120.0, pool=120.0)
 _CLIENT_MAX_RETRIES = 3
+
+# Max output tokens for long-form generation (proposal + scope of work). Claude
+# Opus 4.8 supports up to 128K output tokens; streaming (used below) is required
+# at this size to avoid HTTP timeouts.
+MAX_OUTPUT_TOKENS = 128_000
 
 # Hard cap on RFP/RFQ text sent to the model in a single generation. Uploads can
 # be tens of MB; without a cap one "generation" could cost 10-50x a normal one.
@@ -177,7 +187,7 @@ def _make_client(api_key: str):
     """Create a metered Anthropic client with connection-friendly defaults."""
     inner = anthropic.Anthropic(
         api_key=api_key,
-        timeout=_CLIENT_TIMEOUT_SECONDS,
+        timeout=_CLIENT_TIMEOUT,
         max_retries=_CLIENT_MAX_RETRIES,
     )
     return _MeteredClient(inner)
@@ -605,7 +615,7 @@ Return ONLY a JSON object, no preamble:
     response_text = ""
     with client.messages.stream(
         model=model,
-        max_tokens=4000,
+        max_tokens=MAX_OUTPUT_TOKENS,
         system=system_prompt,
         messages=[{"role": "user", "content": f"---BEGIN RFP/RFQ---\n{rfp_text[:60000]}\n---END RFP/RFQ---"}],
     ) as stream:
@@ -789,7 +799,7 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
     proposal_text = ""
     with client.messages.stream(
         model=model,
-        max_tokens=16000,
+        max_tokens=MAX_OUTPUT_TOKENS,
         system=system_prompt,
         messages=[{"role": "user", "content": user_message}],
     ) as stream:
@@ -970,7 +980,7 @@ Return the revised proposal followed by the =====CHANGE_LOG===== marker and the 
     full_text = ""
     with client.messages.stream(
         model=model,
-        max_tokens=16000,
+        max_tokens=MAX_OUTPUT_TOKENS,
         system=system_prompt,
         messages=[{"role": "user", "content": user_message}],
     ) as stream:

@@ -73,6 +73,7 @@ from document_parser import parse_document
 from models import (
     ActivityLog,
     BackgroundJob,
+    ChatbotMessage,
     ClarificationItem,
     CompanyStandard,
     DocumentTag,
@@ -4091,8 +4092,9 @@ def ai_assist(proposal_id):
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=key, timeout=45, max_retries=1)
+        import platform_config
         resp = client.messages.create(
-            model=current_user.llm_model or "claude-opus-4-6",
+            model=current_user.llm_model or platform_config.get("llm_model", "claude-opus-4-8"),
             max_tokens=1500,
             system=("You are a proposal editor. Return ONLY the rewritten passage in "
                     "Markdown — no preamble, no explanation, no code fences."),
@@ -5884,8 +5886,8 @@ def billing_checkout(plan_key):
 
     try:
         import stripe
-        stripe.api_key = billing.STRIPE_SECRET_KEY
-        price_id = billing.PLANS[plan_key]["price_id"]
+        stripe.api_key = billing.stripe_secret_key()
+        price_id = billing.stripe_price_id(plan_key)
         if not price_id:
             flash("This plan is not configured for checkout.", "error")
             return redirect(url_for("billing_page"))
@@ -5915,7 +5917,7 @@ def billing_portal():
         return redirect(url_for("billing_page"))
     try:
         import stripe
-        stripe.api_key = billing.STRIPE_SECRET_KEY
+        stripe.api_key = billing.stripe_secret_key()
         session = stripe.billing_portal.Session.create(
             customer=org.stripe_customer_id,
             return_url=url_for("billing_page", _external=True),
@@ -5937,13 +5939,14 @@ def billing_webhook():
     # Never trust an unsigned event. Without the webhook secret an attacker could
     # POST a forged checkout.session.completed to upgrade any org for free, so we
     # refuse to process webhooks at all until the secret is configured.
-    if not billing.STRIPE_WEBHOOK_SECRET:
+    webhook_secret = billing.stripe_webhook_secret()
+    if not webhook_secret:
         app.logger.error(
             "Stripe webhook received but STRIPE_WEBHOOK_SECRET is not set; refusing to process."
         )
         return {"ok": False, "error": "webhook signature secret not configured"}, 503
     try:
-        event = stripe.Webhook.construct_event(payload, sig, billing.STRIPE_WEBHOOK_SECRET)
+        event = stripe.Webhook.construct_event(payload, sig, webhook_secret)
     except Exception:
         return {"ok": False}, 400
 
@@ -7721,26 +7724,40 @@ def chat_help():
     if not message:
         return {"reply": "Please type a question and I'll do my best to help!"}
 
+    def _record(reply, answered_by):
+        # Store the Q&A for platform-owner analytics (best-effort).
+        try:
+            db.session.add(ChatbotMessage(
+                user_id=getattr(current_user, "id", None),
+                org_id=getattr(current_user, "org_id", None),
+                message=message[:4000], reply=(reply or "")[:4000], answered_by=answered_by))
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+    import platform_config
     api_key = decrypt_api_key(current_user.api_key_encrypted) or None
-    from config.settings import ANTHROPIC_API_KEY as _GLOBAL_KEY
-    effective_key = api_key or _GLOBAL_KEY
+    effective_key = api_key or platform_config.get("anthropic_api_key")
     if effective_key:
         try:
             import anthropic
             client = anthropic.Anthropic(api_key=effective_key, timeout=30, max_retries=1)
             resp = client.messages.create(
-                model=current_user.llm_model or "claude-opus-4-6",
+                model=current_user.llm_model or platform_config.get("llm_model", "claude-opus-4-8"),
                 max_tokens=400,
                 system=_HELP_KB,
                 messages=[{"role": "user", "content": message[:2000]}],
             )
             text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
             if text:
+                _record(text, "ai")
                 return {"reply": text}
         except Exception:
             pass  # fall through to keyword help
 
-    return {"reply": _fallback_help(message.lower())}
+    reply = _fallback_help(message.lower())
+    _record(reply, "fallback")
+    return {"reply": reply}
 
 
 # ---------------------------------------------------------------------------

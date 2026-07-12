@@ -65,8 +65,43 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE_KEY", "")
 
 
+# Stripe keys can be set from the platform-admin dashboard (DB override) or via
+# env. These getters resolve the effective value at call time; the module
+# constants above remain the env-level fallback.
+def stripe_secret_key() -> str:
+    try:
+        import platform_config
+        return platform_config.get("stripe_secret_key", STRIPE_SECRET_KEY)
+    except Exception:
+        return STRIPE_SECRET_KEY
+
+
+def stripe_webhook_secret() -> str:
+    try:
+        import platform_config
+        return platform_config.get("stripe_webhook_secret", STRIPE_WEBHOOK_SECRET)
+    except Exception:
+        return STRIPE_WEBHOOK_SECRET
+
+
+def stripe_publishable_key() -> str:
+    try:
+        import platform_config
+        return platform_config.get("stripe_publishable_key", STRIPE_PUBLISHABLE_KEY)
+    except Exception:
+        return STRIPE_PUBLISHABLE_KEY
+
+
+def stripe_price_id(plan_key: str) -> str:
+    try:
+        import platform_config
+        return platform_config.get(f"stripe_price_{plan_key}", PLANS.get(plan_key, {}).get("price_id", ""))
+    except Exception:
+        return PLANS.get(plan_key, {}).get("price_id", "")
+
+
 def stripe_enabled() -> bool:
-    return bool(STRIPE_SECRET_KEY)
+    return bool(stripe_secret_key())
 
 
 # Subscription states in which paid limits are revoked until payment recovers.

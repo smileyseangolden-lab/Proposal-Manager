@@ -43,7 +43,7 @@ DEFAULT_VERTICAL = "general"
 
 # Anthropic
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = "claude-opus-4-6"
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-8")
 
 # Database — Postgres in production via DATABASE_URL; SQLite fallback for dev.
 _raw_db_url = os.getenv("DATABASE_URL", "").strip()

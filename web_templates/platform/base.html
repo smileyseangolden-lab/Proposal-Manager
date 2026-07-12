@@ -76,7 +76,13 @@
       <a href="{{ url_for('platform_admin.accounts') }}" class="{{ 'active' if active_tab=='accounts' }}">Accounts</a>
       <a href="{{ url_for('platform_admin.ai_costs') }}" class="{{ 'active' if active_tab=='ai-costs' }}">AI Costs</a>
       <a href="{{ url_for('platform_admin.revenue') }}" class="{{ 'active' if active_tab=='revenue' }}">Revenue</a>
+      <a href="{{ url_for('platform_admin.growth') }}" class="{{ 'active' if active_tab=='growth' }}">Growth</a>
       <a href="{{ url_for('platform_admin.health') }}" class="{{ 'active' if active_tab=='health' }}">Health</a>
+      <a href="{{ url_for('platform_admin.chatbot') }}" class="{{ 'active' if active_tab=='chatbot' }}">Chatbot</a>
+      <a href="{{ url_for('platform_admin.requests_tab') }}" class="{{ 'active' if active_tab=='requests' }}">Requests</a>
+      <a href="{{ url_for('platform_admin.audit') }}" class="{{ 'active' if active_tab=='audit' }}">Audit</a>
+      <a href="{{ url_for('platform_admin.controls') }}" class="{{ 'active' if active_tab=='controls' }}">Controls</a>
+      <a href="{{ url_for('platform_admin.api_tab') }}" class="{{ 'active' if active_tab=='api' }}">API</a>
     </nav>
     <form method="POST" action="{{ url_for('platform_admin.logout') }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

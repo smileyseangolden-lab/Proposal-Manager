@@ -23,8 +23,18 @@ MAIL_FROM = os.getenv("MAIL_FROM", os.getenv("SMTP_USER", "no-reply@proposalmana
 MAIL_FROM_NAME = os.getenv("MAIL_FROM_NAME", "Proposal Manager")
 
 
+def _cfg(key: str, fallback):
+    """Effective SMTP setting: platform-admin override (DB) else env fallback."""
+    try:
+        import platform_config
+        v = platform_config.get(key, "")
+        return v if v != "" else fallback
+    except Exception:
+        return fallback
+
+
 def configured() -> bool:
-    return bool(SMTP_HOST)
+    return bool(_cfg("smtp_host", SMTP_HOST))
 
 
 def send_email(to: str, subject: str, body: str, html: str = "", attachments: list = None) -> bool:
@@ -42,9 +52,17 @@ def send_email(to: str, subject: str, body: str, html: str = "", attachments: li
         logger.info("[mailer:console] email suppressed (SMTP not configured) | subject: %s", subject)
         return False
 
+    host = _cfg("smtp_host", SMTP_HOST)
+    port = int(_cfg("smtp_port", SMTP_PORT) or SMTP_PORT)
+    user = _cfg("smtp_user", SMTP_USER)
+    password = _cfg("smtp_password", SMTP_PASSWORD)
+    use_tls = str(_cfg("smtp_use_tls", SMTP_USE_TLS)).lower() in ("true", "1", "yes")
+    mail_from = _cfg("mail_from", MAIL_FROM) or user or MAIL_FROM
+    mail_from_name = _cfg("mail_from_name", MAIL_FROM_NAME)
+
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = f"{MAIL_FROM_NAME} <{MAIL_FROM}>"
+    msg["From"] = f"{mail_from_name} <{mail_from}>"
     msg["To"] = to
     msg.set_content(body)
     if html:
@@ -66,17 +84,17 @@ def send_email(to: str, subject: str, body: str, html: str = "", attachments: li
             logger.exception("Failed to attach %s", path)
 
     try:
-        if SMTP_USE_TLS:
+        if use_tls:
             context = ssl.create_default_context()
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            with smtplib.SMTP(host, port, timeout=15) as server:
                 server.starttls(context=context)
-                if SMTP_USER:
-                    server.login(SMTP_USER, SMTP_PASSWORD)
+                if user:
+                    server.login(user, password)
                 server.send_message(msg)
         else:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-                if SMTP_USER:
-                    server.login(SMTP_USER, SMTP_PASSWORD)
+            with smtplib.SMTP(host, port, timeout=15) as server:
+                if user:
+                    server.login(user, password)
                 server.send_message(msg)
         return True
     except Exception:

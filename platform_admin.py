@@ -16,14 +16,29 @@ from flask_login import current_user, login_user, logout_user
 from sqlalchemy import func
 
 import billing
+import platform_config
 from config.settings import PLATFORM_OWNER_EMAILS
 from models import (
-    ActivityLog, BackgroundJob, ClarificationItem, CompanyStandard, LlmUsage,
-    Organization, Project, Proposal, ProposalShare, User, UserVerticalTemplate,
-    db,
+    ActivityLog, BackgroundJob, ChatbotMessage, ClarificationItem, CompanyStandard,
+    LlmUsage, Organization, PlatformAuditLog, PlatformSetting, Project, Proposal,
+    ProposalShare, User, UserVerticalTemplate, db,
 )
 
 bp = Blueprint("platform_admin", __name__, url_prefix="/platform-admin")
+
+
+def _audit(action: str, detail: str = "", target: str = ""):
+    """Record a platform-owner action for the Audit tab (best-effort)."""
+    try:
+        db.session.add(PlatformAuditLog(
+            actor_user_id=getattr(current_user, "id", None),
+            actor_email=getattr(current_user, "email", "") or "",
+            action=action, detail=detail[:2000], target=target[:200],
+            ip=(request.headers.get("X-Forwarded-For", request.remote_addr) or "")[:64],
+        ))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
 
 
 def is_platform_owner(user) -> bool:
@@ -240,3 +255,187 @@ def health():
         failure_rate=round(counts.get("failed", 0) / total * 100, 1),
         recent_failed=recent_failed, recent_activity=recent_activity,
     )
+
+
+def _monthly_series(model, date_col, months=6):
+    """Count rows per calendar month for the last `months` months (Python-side
+    bucketing so it works identically on SQLite and Postgres)."""
+    now = datetime.now(timezone.utc)
+    buckets, labels = {}, []
+    y, m = now.year, now.month
+    keys = []
+    for _ in range(months):
+        key = f"{y:04d}-{m:02d}"
+        keys.append(key); labels.append(key); buckets[key] = 0
+        m -= 1
+        if m == 0:
+            m = 12; y -= 1
+    keys.reverse(); labels.reverse()
+    start = datetime(y, m if m else 1, 1, tzinfo=timezone.utc)
+    for (dt,) in db.session.query(date_col).filter(date_col >= start).all():
+        if not dt:
+            continue
+        key = dt.strftime("%Y-%m")
+        if key in buckets:
+            buckets[key] += 1
+    return [{"label": k, "count": buckets[k]} for k in keys]
+
+
+@bp.route("/growth")
+@require_platform_owner
+def growth():
+    orgs = _monthly_series(Organization, Organization.created_at)
+    users = _monthly_series(User, User.created_at)
+    gens = _monthly_series(BackgroundJob, BackgroundJob.created_at)
+    maxv = max([1] + [r["count"] for r in orgs + users + gens])
+    return render_template("platform/growth.html", active_tab="growth",
+                           orgs=orgs, users=users, gens=gens, maxv=maxv)
+
+
+@bp.route("/chatbot")
+@require_platform_owner
+def chatbot():
+    total = ChatbotMessage.query.count()
+    by_answer = dict(
+        db.session.query(ChatbotMessage.answered_by, func.count())
+        .group_by(ChatbotMessage.answered_by).all()
+    )
+    recent = (ChatbotMessage.query.order_by(ChatbotMessage.created_at.desc())
+              .limit(100).all())
+    org_names = {o.id: o.name for o in Organization.query.all()}
+    rows = [{"msg": r, "org": org_names.get(r.org_id, "—")} for r in recent]
+    return render_template("platform/chatbot.html", active_tab="chatbot",
+                           total=total, ai=by_answer.get("ai", 0),
+                           fallback=by_answer.get("fallback", 0), rows=rows)
+
+
+@bp.route("/requests")
+@require_platform_owner
+def requests_tab():
+    # Surfaces chatbot questions that fell through to the keyword fallback — i.e.
+    # things users asked that the assistant couldn't answer well — as a proxy for
+    # feature/support requests worth reviewing.
+    unmet = (ChatbotMessage.query.filter_by(answered_by="fallback")
+             .order_by(ChatbotMessage.created_at.desc()).limit(100).all())
+    return render_template("platform/requests.html", active_tab="requests", rows=unmet)
+
+
+@bp.route("/audit")
+@require_platform_owner
+def audit():
+    logs = (PlatformAuditLog.query.order_by(PlatformAuditLog.created_at.desc())
+            .limit(200).all())
+    return render_template("platform/audit.html", active_tab="audit", logs=logs)
+
+
+@bp.route("/api")
+@require_platform_owner
+def api_tab():
+    # Read-only summary of the platform's API/LLM configuration.
+    active_model = platform_config.get("llm_model", "claude-opus-4-8")
+    model_usage = dict(
+        db.session.query(User.llm_model, func.count()).group_by(User.llm_model).all()
+    )
+    return render_template("platform/api.html", active_tab="api",
+                           active_model=active_model,
+                           anthropic_set=bool(platform_config.get("anthropic_api_key")),
+                           model_usage=model_usage)
+
+
+# ---------------------------------------------------------------------------
+# Controls — the only tab with write actions. Every action is audited.
+# ---------------------------------------------------------------------------
+
+_CONTROL_GROUPS = [
+    ("llm", "LLM / AI", ["llm_model", "anthropic_api_key"]),
+    ("payment", "Payments (Stripe)",
+     ["stripe_secret_key", "stripe_publishable_key", "stripe_webhook_secret",
+      "stripe_price_pro", "stripe_price_business"]),
+    ("email", "Email (SMTP)",
+     ["smtp_host", "smtp_port", "smtp_user", "smtp_password", "smtp_use_tls",
+      "mail_from", "mail_from_name"]),
+]
+
+
+@bp.route("/controls")
+@require_platform_owner
+def controls():
+    groups = []
+    for gid, title, keys in _CONTROL_GROUPS:
+        fields = []
+        for k in keys:
+            spec = platform_config.SETTINGS.get(k, (None, False, k, gid))
+            fields.append({
+                "key": k, "label": spec[2], "secret": spec[1],
+                "value": "" if spec[1] else platform_config.get(k),
+                "is_set": bool(platform_config.get(k)),
+            })
+        groups.append({"id": gid, "title": title, "fields": fields})
+    orgs = Organization.query.order_by(Organization.name).all()
+    owners = User.query.filter_by(platform_owner=True).all()
+    return render_template("platform/controls.html", active_tab="controls",
+                           groups=groups, orgs=orgs, plans=billing.PLANS, owners=owners)
+
+
+@bp.route("/controls/settings", methods=["POST"])
+@require_platform_owner
+def controls_settings():
+    group = request.form.get("group", "")
+    keys = next((ks for gid, _t, ks in _CONTROL_GROUPS if gid == group), [])
+    changed = []
+    for k in keys:
+        if k not in request.form:
+            continue
+        val = request.form.get(k, "").strip()
+        # For secrets, an empty submit means "leave unchanged"; the sentinel
+        # "__clear__" clears it. Non-secrets are set to whatever was submitted.
+        if platform_config.is_secret(k):
+            if val == "":
+                continue
+            if val == "__clear__":
+                val = ""
+            platform_config.set_value(k, val, updated_by=current_user.id)
+            changed.append(k)
+        else:
+            platform_config.set_value(k, val, updated_by=current_user.id)
+            changed.append(k)
+    if changed:
+        _audit("update_settings", f"{group}: {', '.join(changed)}", target=group)
+        flash(f"Saved {group} settings.", "success")
+    else:
+        flash("No changes.", "success")
+    return redirect(url_for("platform_admin.controls"))
+
+
+@bp.route("/controls/owner", methods=["POST"])
+@require_platform_owner
+def controls_owner():
+    email = request.form.get("email", "").strip().lower()
+    action = request.form.get("action", "grant")
+    user = User.query.filter(User.email.ilike(email)).first() if email else None
+    if not user:
+        flash("No user found with that email.", "error")
+        return redirect(url_for("platform_admin.controls"))
+    user.platform_owner = (action == "grant")
+    db.session.commit()
+    _audit("owner_" + action, f"{email}", target=email)
+    flash(f"Platform owner {'granted to' if action == 'grant' else 'revoked from'} {email}.", "success")
+    return redirect(url_for("platform_admin.controls"))
+
+
+@bp.route("/controls/plan", methods=["POST"])
+@require_platform_owner
+def controls_plan():
+    org_id = request.form.get("org_id", "")
+    plan = request.form.get("plan", "")
+    org = db.session.get(Organization, org_id) if org_id else None
+    if not org or plan not in billing.PLANS:
+        flash("Invalid organization or plan.", "error")
+        return redirect(url_for("platform_admin.controls"))
+    old = org.plan
+    org.plan = plan
+    org.billing_status = "active" if plan != "free" else ""
+    db.session.commit()
+    _audit("plan_override", f"{org.name}: {old} -> {plan}", target=org.id)
+    flash(f"{org.name} plan set to {billing.PLANS[plan]['name']}.", "success")
+    return redirect(url_for("platform_admin.controls"))

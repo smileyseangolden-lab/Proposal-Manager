@@ -1,0 +1,23 @@
+{% extends "platform/base.html" %}
+{% block body %}
+<h1 class="page">Requests</h1>
+<p class="page-sub">Questions the assistant couldn't answer well (fell through to keyword help) — a signal for docs or features to add.</p>
+
+{% if rows %}
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>When</th><th>Unmet question</th></tr></thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td class="muted" style="white-space:nowrap">{{ r.created_at.strftime('%Y-%m-%d %H:%M') if r.created_at else '—' }}</td>
+        <td style="white-space:normal;max-width:760px">{{ r.message }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="card empty">No unmet questions — every chatbot query was answered by the assistant. 🎉</div>
+{% endif %}
+{% endblock %}

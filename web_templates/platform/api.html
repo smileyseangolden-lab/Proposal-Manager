@@ -1,0 +1,27 @@
+{% extends "platform/base.html" %}
+{% block body %}
+<h1 class="page">API</h1>
+<p class="page-sub">LLM / API configuration summary. Edit values in the Controls tab.</p>
+
+<div class="grid kpis">
+  <div class="card kpi"><div class="label">Active default model</div>
+    <div class="num c-cyan" style="font-size:1.3rem;font-family:var(--mono)">{{ active_model }}</div></div>
+  <div class="card kpi"><div class="label">Anthropic API key</div>
+    <div class="num {{ 'c-green' if anthropic_set else 'c-amber' }}" style="font-size:1.3rem">
+      {{ 'Configured' if anthropic_set else 'Using env / per-user' }}</div></div>
+</div>
+
+<div class="section-title">Model usage across users</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Model (per-user override)</th><th class="num">Users</th></tr></thead>
+    <tbody>
+      {% for model, n in model_usage.items() %}
+      <tr><td style="font-family:var(--mono);font-size:.85rem">{{ model or '(default)' }}</td><td class="num">{{ n }}</td></tr>
+      {% else %}
+      <tr><td colspan="2" class="empty">No users yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

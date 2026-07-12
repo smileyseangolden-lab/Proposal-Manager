@@ -127,7 +127,7 @@ class User(UserMixin, db.Model):
 
     # LLM settings — per-user overrides
     llm_provider = db.Column(db.String(50), default="anthropic")
-    llm_model = db.Column(db.String(100), default="claude-opus-4-6")
+    llm_model = db.Column(db.String(100), default="claude-opus-4-8")
     api_key_encrypted = db.Column(db.Text, default="")
 
     # Company logo / branding
@@ -905,3 +905,45 @@ class ProcessedWebhookEvent(db.Model):
 
     id = db.Column(db.String(80), primary_key=True)  # e.g. Stripe "evt_..."
     created_at = db.Column(db.DateTime, default=_utcnow)
+
+
+class ChatbotMessage(db.Model):
+    """A help-chatbot question and the reply given, stored so the platform owner
+    can analyze what users ask and improve the product. Cross-tenant view."""
+    __tablename__ = "chatbot_messages"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True, index=True)
+    org_id = db.Column(db.String(32), db.ForeignKey("organizations.id"), nullable=True, index=True)
+    message = db.Column(db.Text, nullable=False)
+    reply = db.Column(db.Text, default="")
+    answered_by = db.Column(db.String(20), default="ai")  # ai, fallback
+    created_at = db.Column(db.DateTime, default=_utcnow, index=True)
+
+
+class PlatformSetting(db.Model):
+    """Platform-wide configuration the owner edits from /platform-admin (LLM
+    model + API key, payment keys, email/SMTP). Secret values are stored
+    encrypted (is_secret=True). Overrides the corresponding environment default."""
+    __tablename__ = "platform_settings"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    key = db.Column(db.String(100), unique=True, nullable=False)
+    value = db.Column(db.Text, default="")  # encrypted when is_secret
+    is_secret = db.Column(db.Boolean, default=False)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow)
+    updated_by = db.Column(db.String(32), nullable=True)
+
+
+class PlatformAuditLog(db.Model):
+    """Audit trail of platform-owner actions taken in /platform-admin."""
+    __tablename__ = "platform_audit_logs"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    actor_user_id = db.Column(db.String(32), nullable=True)
+    actor_email = db.Column(db.String(200), default="")
+    action = db.Column(db.String(100), nullable=False)
+    detail = db.Column(db.Text, default="")
+    target = db.Column(db.String(200), default="")
+    ip = db.Column(db.String(64), default="")
+    created_at = db.Column(db.DateTime, default=_utcnow, index=True)

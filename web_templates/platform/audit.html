@@ -1,0 +1,26 @@
+{% extends "platform/base.html" %}
+{% block body %}
+<h1 class="page">Audit</h1>
+<p class="page-sub">Every action taken in the platform-admin Controls tab.</p>
+
+{% if logs %}
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>When</th><th>Owner</th><th>Action</th><th>Detail</th><th>IP</th></tr></thead>
+    <tbody>
+      {% for l in logs %}
+      <tr>
+        <td class="muted" style="white-space:nowrap">{{ l.created_at.strftime('%Y-%m-%d %H:%M') if l.created_at else '—' }}</td>
+        <td class="muted">{{ l.actor_email or '—' }}</td>
+        <td><span class="pill pro" style="font-family:var(--mono)">{{ l.action }}</span></td>
+        <td style="white-space:normal;max-width:520px">{{ l.detail }}</td>
+        <td class="muted" style="font-family:var(--mono);font-size:.78rem">{{ l.ip or '—' }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="card empty">No owner actions recorded yet.</div>
+{% endif %}
+{% endblock %}
