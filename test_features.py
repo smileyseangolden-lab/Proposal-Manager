@@ -322,7 +322,7 @@ with app.app_context():
 
     # ===== CROSS-USER PROTECTION =====
     print("\n=== Cross-User Protection ===")
-    client.get('/logout')
+    client.post('/logout')
     client.post('/signup', data={
         'username': 'user2', 'email': 'u2@test.com', 'password': 'testpass123',
     })
@@ -405,7 +405,7 @@ with app.app_context():
         os.unlink(f.name)
 
     # ===== PART 2: RE-LOGIN AS ORIGINAL USER =====
-    client.get('/logout')
+    client.post('/logout')
     client.post('/login', data={'username': 'testuser', 'password': 'testpass123'})
 
     # ===== PART 2: DUE DATES & CALENDAR =====
@@ -587,7 +587,7 @@ with app.app_context():
 
     # ===== PART 2: CROSS-USER COMMENT PROTECTION =====
     print("\n=== Part 2: Cross-user Comment Protection ===")
-    client.get('/logout')
+    client.post('/logout')
     client.post('/signup', data={
         'username': 'user3', 'email': 'u3@test.com', 'password': 'testpass123',
     })

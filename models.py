@@ -892,3 +892,12 @@ class LlmUsage(db.Model):
     output_tokens = db.Column(db.Integer, default=0)
     est_cost_usd = db.Column(db.Float, default=0.0)
     created_at = db.Column(db.DateTime, default=_utcnow, index=True)
+
+
+class ProcessedWebhookEvent(db.Model):
+    """Dedupe ledger for external webhook events (Stripe) — idempotency / replay
+    protection. The primary key is the provider's event id."""
+    __tablename__ = "processed_webhook_events"
+
+    id = db.Column(db.String(80), primary_key=True)  # e.g. Stripe "evt_..."
+    created_at = db.Column(db.DateTime, default=_utcnow)

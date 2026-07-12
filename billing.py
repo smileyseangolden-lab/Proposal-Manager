@@ -69,12 +69,26 @@ def stripe_enabled() -> bool:
     return bool(STRIPE_SECRET_KEY)
 
 
+# Subscription states in which paid limits are revoked until payment recovers.
+_DELINQUENT_STATUSES = ("past_due", "unpaid", "canceled", "incomplete_expired")
+
+
 def plan_for(org) -> dict:
+    """The org's nominal plan (for display)."""
     return PLANS.get((org.plan if org else "free") or "free", PLANS["free"])
 
 
+def effective_plan(org) -> dict:
+    """The plan whose LIMITS currently apply. A paid org that is delinquent
+    (past_due / unpaid) is soft-locked to free-tier limits until its payment
+    recovers; plan_for() still reports the nominal plan for the billing page."""
+    if org and (getattr(org, "billing_status", "") or "") in _DELINQUENT_STATUSES:
+        return PLANS["free"]
+    return plan_for(org)
+
+
 def limits_for(org) -> dict:
-    return plan_for(org)["limits"]
+    return effective_plan(org)["limits"]
 
 
 def _month_key(dt=None) -> str:

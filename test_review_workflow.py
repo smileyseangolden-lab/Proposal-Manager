@@ -183,10 +183,14 @@ with app.app_context():
     # =========================================================================
     print("\n=== Users & Setup ===")
     owner = make_user("owner")
-    engineer = make_user("engineer")
-    accountant = make_user("accountant")
-    sales_lead = make_user("saleslead")
-    bystander = make_user("bystander")
+    # Reviewers/teammates belong to the SAME org as the owner — a review workflow
+    # is intra-tenant, and send-for-review now (correctly) rejects foreign-org
+    # reviewers.
+    org = owner.organization
+    engineer = make_user("engineer", org=org)
+    accountant = make_user("accountant", org=org)
+    sales_lead = make_user("saleslead", org=org)
+    bystander = make_user("bystander", org=org)
     test("Users created", User.query.count() == 5)
 
     client = app.test_client()
@@ -272,7 +276,7 @@ with app.app_context():
     # 5. Reviewer files a revision request
     # =========================================================================
     print("\n=== Revision Request filing ===")
-    client.get('/logout')
+    client.post('/logout')
     login_as(client, "engineer")
 
     # Engineer can view the proposal page now
@@ -280,12 +284,12 @@ with app.app_context():
     test("Reviewer can view proposal", resp.status_code == 200)
 
     # Bystander (non-reviewer, non-owner) cannot
-    client.get('/logout')
+    client.post('/logout')
     login_as(client, "bystander")
     resp = client.get(f'/proposal/{prop.id}')
     test("Bystander blocked from viewing", resp.status_code == 404)
 
-    client.get('/logout')
+    client.post('/logout')
     login_as(client, "engineer")
 
     # Engineer files a revision request
@@ -348,7 +352,7 @@ with app.app_context():
     test("Not yet fully approved", not state["all_approved"])
 
     # Owner cannot approve their own proposal
-    client.get('/logout')
+    client.post('/logout')
     login_as(client, "owner")
     # Add the owner as a reviewer first (for this test)
     db.session.add(ProposalReviewer(
@@ -369,7 +373,7 @@ with app.app_context():
     db.session.commit()
 
     # Accountant approves — all required should now be approved
-    client.get('/logout')
+    client.post('/logout')
     login_as(client, "accountant")
     resp = client.post(
         f'/proposal/{prop.id}/approve',
@@ -389,7 +393,7 @@ with app.app_context():
     # =========================================================================
     print("\n=== Apply feedback & AI mock ===")
     # Add a pending revision request from accountant
-    client.get('/logout')
+    client.post('/logout')
     login_as(client, "accountant")
     client.post(
         f'/proposal/{prop.id}/revision-request',
@@ -405,7 +409,7 @@ with app.app_context():
     edit_target = pending_ids[0]
 
     # Switch back to owner and apply feedback (mock AI)
-    client.get('/logout')
+    client.post('/logout')
     login_as(client, "owner")
 
     with patch('app.revise_proposal', side_effect=fake_revise_proposal):
@@ -459,10 +463,10 @@ with app.app_context():
     # 8. Second round of approvals on v2
     # =========================================================================
     print("\n=== v2 approvals ===")
-    client.get('/logout')
+    client.post('/logout')
     login_as(client, "engineer")
     client.post(f'/proposal/{prop.id}/approve', data={'decision': 'approved'})
-    client.get('/logout')
+    client.post('/logout')
     login_as(client, "accountant")
     client.post(f'/proposal/{prop.id}/approve', data={'decision': 'approved'})
     db.session.refresh(prop)
@@ -472,7 +476,7 @@ with app.app_context():
     # 9. Submit to customer
     # =========================================================================
     print("\n=== Submit to customer ===")
-    client.get('/logout')
+    client.post('/logout')
     login_as(client, "owner")
     resp = client.post(f'/proposal/{prop.id}/submit-to-customer', follow_redirects=True)
     db.session.refresh(prop)
@@ -542,14 +546,14 @@ with app.app_context():
     # (current status is in_review after apply_feedback)
     db.session.refresh(prop)
     # Re-approve v3 quickly and submit again
-    client.get('/logout')
+    client.post('/logout')
     login_as(client, "engineer")
     client.post(f'/proposal/{prop.id}/approve', data={'decision': 'approved'})
-    client.get('/logout')
+    client.post('/logout')
     login_as(client, "accountant")
     client.post(f'/proposal/{prop.id}/approve', data={'decision': 'approved'})
     db.session.refresh(prop)
-    client.get('/logout')
+    client.post('/logout')
     login_as(client, "owner")
     client.post(f'/proposal/{prop.id}/submit-to-customer')
     db.session.refresh(prop)
@@ -570,7 +574,7 @@ with app.app_context():
     # 12. Revision templates
     # =========================================================================
     print("\n=== Revision templates (settings) ===")
-    client.get('/logout')
+    client.post('/logout')
     login_as(client, "owner")
     resp = client.post(
         '/settings/add-revision-template',
@@ -603,7 +607,7 @@ with app.app_context():
     )
     db.session.add(t2)
     db.session.commit()
-    client.get('/logout')
+    client.post('/logout')
     login_as(client, "engineer")
     resp = client.post(f'/settings/delete-revision-template/{t2.id}')
     test("Cross-user template delete blocked", resp.status_code == 404)
@@ -614,7 +618,7 @@ with app.app_context():
     print("\n=== Dashboard widgets ===")
 
     # Set up a new proposal for the engineer to review (fresh state)
-    client.get('/logout')
+    client.post('/logout')
     login_as(client, "owner")
     proj2, prop2, v1b = make_project_with_proposal(owner, name="Proj 2")
     client.post(
@@ -633,7 +637,7 @@ with app.app_context():
     test("Owner dashboard shows In review chip", b'In review' in resp.data)
 
     # Engineer dashboard shows "Pending My Review"
-    client.get('/logout')
+    client.post('/logout')
     login_as(client, "engineer")
     resp = client.get('/')
     test("Engineer dashboard shows review request", b'Review requested' in resp.data)
@@ -644,7 +648,7 @@ with app.app_context():
     # 14. Cross-user protection on review routes
     # =========================================================================
     print("\n=== Cross-user protection ===")
-    client.get('/logout')
+    client.post('/logout')
     login_as(client, "bystander")
 
     resp = client.get(f'/proposal/{prop2.id}/send-for-review')

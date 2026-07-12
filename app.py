@@ -95,6 +95,7 @@ from models import (
     ProposalShare,
     ProposalStatusHistory,
     ProposalVersion,
+    ProcessedWebhookEvent,
     ReviewComment,
     ReviewCycle,
     RevisionRequest,
@@ -225,9 +226,16 @@ login_manager.login_message_category = "error"
 
 RATE_SHEET_EXTENSIONS = {"xlsx", "xls"}
 TEMPLATE_EXTENSIONS = {"pdf", "docx", "doc"}
+INGEST_RATE_EXTENSIONS = {"xlsx", "xls", "csv", "pdf", "docx", "doc"}
+INGEST_STANDARDS_EXTENSIONS = {"pdf", "docx", "doc", "txt", "md"}
 LOGO_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "gif", "bmp"}
 LOGO_MAX_DIMENSION = 600  # px — resize so the longest side is at most this
 LOGO_PNG_OPTIMIZE = True
+# Reject images whose decoded pixel count exceeds this — a few-MB "bomb" can
+# otherwise decode to hundreds of MB and exhaust memory. Also lower Pillow's
+# global guard as defense in depth.
+LOGO_MAX_PIXELS = 40_000_000  # 40 MP — far larger than any real logo
+Image.MAX_IMAGE_PIXELS = LOGO_MAX_PIXELS
 
 
 @app.context_processor
@@ -703,6 +711,12 @@ def _process_and_save_logo(file, user_id: str) -> tuple[str, str, int]:
 
     try:
         img = Image.open(file.stream)
+        w, h = img.size  # lazy — no pixel decode yet
+    except Exception as e:
+        raise ValueError(f"Could not read image: {e}")
+    if w * h > LOGO_MAX_PIXELS:
+        raise ValueError("Image is too large to process.")
+    try:
         img.load()
     except Exception as e:
         raise ValueError(f"Could not read image: {e}")
@@ -828,6 +842,7 @@ def signup():
         db.session.add(user)
 
     db.session.commit()
+    session.permanent = True
     login_user(user)
     _log_activity("signup", f"User {username} created account")
 
@@ -888,6 +903,7 @@ def login():
         user.failed_login_count = 0
         user.lockout_until = None
         db.session.commit()
+    session.permanent = True  # apply PERMANENT_SESSION_LIFETIME idle expiry
     login_user(user)
     _log_activity("login")
     return redirect(url_for("dashboard"))
@@ -1013,7 +1029,7 @@ def reset_password(token):
     return redirect(url_for("login"))
 
 
-@app.route("/logout")
+@app.route("/logout", methods=["POST"])
 @login_required
 def logout():
     _log_activity("logout")
@@ -1965,6 +1981,9 @@ def ingest_rates():
     if not file or not file.filename:
         flash("Please choose a file to import.", "error")
         return redirect(url_for("posture"))
+    if not _allowed_file(file.filename, INGEST_RATE_EXTENSIONS):
+        flash("Please upload an Excel, CSV, PDF, or Word file.", "error")
+        return redirect(url_for("posture"))
 
     safe, path, size = _save_upload(file, f"ingest/{current_user.org_id}")
     try:
@@ -2070,6 +2089,9 @@ def ingest_standards():
     file = request.files.get("standards_file")
     if not file or not file.filename:
         flash("Please choose a document to import.", "error")
+        return redirect(url_for("posture") + "#standards")
+    if not _allowed_file(file.filename, INGEST_STANDARDS_EXTENSIONS):
+        flash("Please upload a PDF, Word, or text document.", "error")
         return redirect(url_for("posture") + "#standards")
     safe, path, size = _save_upload(file, f"ingest/{current_user.org_id}")
     try:
@@ -4400,7 +4422,9 @@ def send_for_review(proposal_id):
         if not uid:
             continue
         user = db.session.get(User, uid)
-        if not user:
+        # Only assign reviewers from the same org (a foreign reviewer would gain
+        # access to this proposal via the reviewer branch of _can_view_proposal).
+        if not user or not _same_org(user):
             continue
         role = roles[idx] if idx < len(roles) else "other"
         if role not in {r[0] for r in REVIEW_ROLE_OPTIONS}:
@@ -5035,8 +5059,10 @@ def customer_portal(token):
     version = latest_version(proposal.id)
     md_text = version.markdown_content if version else ""
     # Strip internal-only markers from the customer-facing view
-    md_text = re.sub(r"\[ACTION REQUIRED:.*?\]", "", md_text)
-    md_text = re.sub(r"\[ASSUMED:.*?\]", "", md_text)
+    # DOTALL/IGNORECASE so multi-line internal markers are also stripped and can't
+    # leak onto the public customer portal.
+    md_text = re.sub(r"\[ACTION REQUIRED:.*?\]", "", md_text, flags=re.DOTALL | re.IGNORECASE)
+    md_text = re.sub(r"\[ASSUMED:.*?\]", "", md_text, flags=re.DOTALL | re.IGNORECASE)
     proposal_html = htmlsafe.sanitize(md.markdown(md_text, extensions=["tables", "fenced_code"]))
 
     company_name = (owner.company_name if owner else "") or ""
@@ -5916,6 +5942,11 @@ def billing_webhook():
     except Exception:
         return {"ok": False}, 400
 
+    # Idempotency / replay guard: skip an event we've already processed.
+    event_id = event.get("id")
+    if event_id and db.session.get(ProcessedWebhookEvent, event_id):
+        return {"ok": True, "duplicate": True}
+
     etype = event.get("type", "")
     obj = event.get("data", {}).get("object", {})
 
@@ -5937,6 +5968,14 @@ def billing_webhook():
             if etype == "customer.subscription.deleted" or status in ("canceled", "unpaid"):
                 org.plan = "free"
             db.session.commit()
+
+    # Record the event as processed (best-effort) so replays are ignored.
+    if event_id:
+        db.session.add(ProcessedWebhookEvent(id=event_id))
+        try:
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
 
     return {"ok": True}
 
@@ -5981,7 +6020,8 @@ def delete_company_template(template_id):
         abort(403)
 
     tmpl = db.session.get(UserVerticalTemplate, template_id)
-    if not tmpl or not tmpl.is_company_default:
+    # Scope to the caller's org — an admin must not delete another tenant's template.
+    if not tmpl or not tmpl.is_company_default or not _same_org(tmpl):
         abort(404)
 
     db.session.delete(tmpl)
@@ -6398,7 +6438,9 @@ def assign_project(project_id):
     assignee_id = request.form.get("assigned_to", "").strip()
     if assignee_id:
         assignee = db.session.get(User, assignee_id)
-        if not assignee:
+        # The assignee must be a member of this org — assigning a foreign-org
+        # user would grant them standing access to this project.
+        if not assignee or not _same_org(assignee):
             flash("User not found.", "error")
             return redirect(request.referrer or url_for("dashboard"))
         project.assigned_to = assignee_id
