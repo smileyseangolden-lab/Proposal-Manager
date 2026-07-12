@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}Review Import — {{ app_name }}{% endblock %}
+{% block breadcrumb %}<a href="{{ url_for('posture') }}">Proposal Posture</a> / <span class="crumb-current">Review Import</span>{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <h1>Review before importing</h1>
+    <p class="page-subtitle">From <strong>{{ source_name }}</strong>. Uncheck rows you don't want, edit anything the AI got wrong, then import.</p>
+</section>
+
+{% if mode == "rates" %}
+<form method="post" action="{{ url_for('ingest_rates_confirm') }}">
+    <input type="hidden" name="target_type" value="{{ target }}">
+    <div class="card">
+        <table class="proposals-table">
+            <thead>
+                <tr>
+                    <th style="width:40px;"><input type="checkbox" id="check-all" checked></th>
+                    {% for key, label in meta.cols %}<th>{{ label }}</th>{% endfor %}
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in rows %}
+                <tr>
+                    <td>
+                        <input type="hidden" name="row_marker" value="{{ loop.index0 }}">
+                        <input type="checkbox" name="include" value="{{ loop.index0 }}" checked class="row-check">
+                    </td>
+                    {% for key, label in meta.cols %}
+                    <td><input type="text" name="{{ key }}" value="{{ row.get(key, '') }}" style="width:100%;"></td>
+                    {% endfor %}
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        <div class="form-actions">
+            <button type="submit" class="btn btn-primary">Import {{ meta.label }}</button>
+            <a href="{{ url_for('posture') }}{{ meta.anchor }}" class="btn btn-secondary">Cancel</a>
+        </div>
+    </div>
+</form>
+{% else %}
+<form method="post" action="{{ url_for('ingest_standards_confirm') }}">
+    <div class="card">
+        <p class="card-desc"><label><input type="checkbox" id="check-all" checked> Select all</label></p>
+        {% for b in blocks %}
+        <div class="ingest-block">
+            <label class="check-inline"><input type="checkbox" name="include" value="{{ loop.index0 }}" checked class="row-check"> Include</label>
+            <div class="form-row">
+                <div class="form-group" style="max-width:220px;">
+                    <label>Category</label>
+                    <input type="text" name="category" value="{{ b.category }}">
+                </div>
+                <div class="form-group" style="flex:1;">
+                    <label>Title</label>
+                    <input type="text" name="title" value="{{ b.title }}" style="width:100%;">
+                </div>
+            </div>
+            <div class="form-group">
+                <label>Content</label>
+                <textarea name="content" rows="4" style="width:100%;">{{ b.content }}</textarea>
+            </div>
+        </div>
+        {% endfor %}
+        <div class="form-actions">
+            <button type="submit" class="btn btn-primary">Import standards</button>
+            <a href="{{ url_for('posture') }}#standards" class="btn btn-secondary">Cancel</a>
+        </div>
+    </div>
+</form>
+{% endif %}
+
+<script>
+(function(){
+    var all = document.getElementById("check-all");
+    if (all) all.addEventListener("change", function(){
+        document.querySelectorAll(".row-check").forEach(function(c){ c.checked = all.checked; });
+    });
+})();
+</script>
+{% endblock %}

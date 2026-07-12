@@ -69,6 +69,7 @@ from models import (
     CompanyStandard,
     DocumentTag,
     EquipmentItem,
+    EstimateLineItem,
     Notification,
     Organization,
     OrgInvitation,
@@ -79,6 +80,7 @@ from models import (
     ProposalApproval,
     ProposalComment,
     ProposalCorrection,
+    ProposalEstimate,
     ProposalQuestion,
     ProposalReviewer,
     ProposalRevisionBatch,
@@ -102,7 +104,10 @@ from models import (
 )
 from proposal_agent import (
     analyze_addendum_impact,
+    draft_estimate,
     draft_scope_of_work,
+    extract_rates_from_sheet,
+    extract_standards,
     friendly_api_error,
     generate_proposal,
     parse_customer_email,
@@ -1763,6 +1768,192 @@ def upload_rate_sheet():
     return redirect(url_for("posture") + "#staff-rates")
 
 
+# ---------------------------------------------------------------------------
+# Ingestion review flows (Phase 4): parse → AI-extract → review → import
+# ---------------------------------------------------------------------------
+
+_INGEST_TARGETS = {
+    "labor_rates": {"label": "Staff Rates", "anchor": "#staff-rates",
+                    "cols": [("role_name", "Role"), ("category", "Category"),
+                             ("hourly_rate", "Hourly Rate"), ("overtime_rate", "OT Rate")]},
+    "product_pricing": {"label": "Equipment / Products", "anchor": "#equipment",
+                        "cols": [("item_name", "Item"), ("category", "Category"),
+                                 ("part_number", "Part #"), ("manufacturer", "Manufacturer"),
+                                 ("unit_cost", "Unit Cost"), ("unit", "Unit")]},
+    "travel": {"label": "Travel Rates", "anchor": "#travel",
+               "cols": [("expense_type", "Expense"), ("rate", "Rate"),
+                        ("unit", "Unit"), ("description", "Description")]},
+}
+
+
+@app.route("/posture/ingest-rates", methods=["POST"])
+@login_required
+def ingest_rates():
+    """Parse an uploaded rate sheet and AI-map it into structured rows for review."""
+    file = request.files.get("ingest_file")
+    target = request.form.get("target_type", "labor_rates")
+    if target not in _INGEST_TARGETS:
+        target = "labor_rates"
+    if not file or not file.filename:
+        flash("Please choose a file to import.", "error")
+        return redirect(url_for("posture"))
+
+    safe, path, size = _save_upload(file, f"ingest/{current_user.org_id}")
+    try:
+        if path.lower().endswith((".xlsx", ".xls")):
+            parsed = parse_rate_sheet(path)
+            raw_text = parsed.get("raw_text", "")
+        elif path.lower().endswith(".csv"):
+            raw_text = Path(path).read_text(encoding="utf-8", errors="replace")
+        else:
+            raw_text = parse_document(path)
+    except Exception as e:
+        flash(f"Could not read the file: {e}", "error")
+        return redirect(url_for("posture") + _INGEST_TARGETS[target]["anchor"])
+
+    try:
+        rows = extract_rates_from_sheet(
+            raw_text, target,
+            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
+            user_model=current_user.llm_model or None,
+        )
+    except RuntimeError as e:
+        flash(str(e), "error")
+        return redirect(url_for("posture") + _INGEST_TARGETS[target]["anchor"])
+    except Exception as e:
+        flash(f"Extraction failed: {friendly_api_error(e)}", "error")
+        return redirect(url_for("posture") + _INGEST_TARGETS[target]["anchor"])
+
+    if not rows:
+        flash("The AI couldn't find any rows to import. You can still add rates manually.", "error")
+        return redirect(url_for("posture") + _INGEST_TARGETS[target]["anchor"])
+
+    return render_template(
+        "ingest_review.html",
+        mode="rates", target=target, meta=_INGEST_TARGETS[target],
+        rows=rows, source_name=safe,
+    )
+
+
+@app.route("/posture/ingest-rates/confirm", methods=["POST"])
+@login_required
+def ingest_rates_confirm():
+    target = request.form.get("target_type", "labor_rates")
+    if target not in _INGEST_TARGETS:
+        abort(400)
+    count = 0
+    n = len(request.form.getlist("include"))
+    includes = set(request.form.getlist("include"))
+
+    def _num(name, i):
+        vals = request.form.getlist(name)
+        try:
+            return float((vals[i] if i < len(vals) else "0").replace(",", "").replace("$", "") or 0)
+        except ValueError:
+            return 0.0
+
+    def _str(name, i):
+        vals = request.form.getlist(name)
+        return (vals[i] if i < len(vals) else "").strip()
+
+    total_rows = len(request.form.getlist("row_marker"))
+    for i in range(total_rows):
+        if str(i) not in includes:
+            continue
+        if target == "labor_rates":
+            name = _str("role_name", i)
+            if not name:
+                continue
+            db.session.add(StaffRole(
+                user_id=current_user.id, org_id=current_user.org_id,
+                role_name=name, category=_str("category", i),
+                hourly_rate=_num("hourly_rate", i), overtime_rate=_num("overtime_rate", i),
+            ))
+        elif target == "product_pricing":
+            name = _str("item_name", i)
+            if not name:
+                continue
+            db.session.add(EquipmentItem(
+                user_id=current_user.id, org_id=current_user.org_id,
+                item_name=name, category=_str("category", i),
+                part_number=_str("part_number", i), manufacturer=_str("manufacturer", i),
+                unit_cost=_num("unit_cost", i), unit=_str("unit", i) or "each",
+            ))
+        elif target == "travel":
+            name = _str("expense_type", i)
+            if not name:
+                continue
+            db.session.add(TravelExpenseRate(
+                user_id=current_user.id, org_id=current_user.org_id,
+                expense_type=name, rate=_num("rate", i),
+                unit=_str("unit", i) or "per day", description=_str("description", i),
+            ))
+        count += 1
+    db.session.commit()
+    _log_activity("rates_ingest", f"Imported {count} {target} row(s)")
+    flash(f"Imported {count} row(s) into your posture.", "success")
+    return redirect(url_for("posture") + _INGEST_TARGETS[target]["anchor"])
+
+
+@app.route("/posture/ingest-standards", methods=["POST"])
+@login_required
+def ingest_standards():
+    """Parse a document and propose reusable company standard blocks for review."""
+    file = request.files.get("standards_file")
+    if not file or not file.filename:
+        flash("Please choose a document to import.", "error")
+        return redirect(url_for("posture") + "#standards")
+    safe, path, size = _save_upload(file, f"ingest/{current_user.org_id}")
+    try:
+        text = parse_document(path)
+    except Exception as e:
+        flash(f"Could not read the document: {e}", "error")
+        return redirect(url_for("posture") + "#standards")
+    try:
+        blocks = extract_standards(
+            text,
+            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
+            user_model=current_user.llm_model or None,
+        )
+    except RuntimeError as e:
+        flash(str(e), "error")
+        return redirect(url_for("posture") + "#standards")
+    except Exception as e:
+        flash(f"Extraction failed: {friendly_api_error(e)}", "error")
+        return redirect(url_for("posture") + "#standards")
+    if not blocks:
+        flash("The AI couldn't extract standards from that document.", "error")
+        return redirect(url_for("posture") + "#standards")
+    return render_template("ingest_review.html", mode="standards", blocks=blocks, source_name=safe)
+
+
+@app.route("/posture/ingest-standards/confirm", methods=["POST"])
+@login_required
+def ingest_standards_confirm():
+    includes = set(request.form.getlist("include"))
+    categories = request.form.getlist("category")
+    titles = request.form.getlist("title")
+    contents = request.form.getlist("content")
+    count = 0
+    for i in range(len(titles)):
+        if str(i) not in includes:
+            continue
+        title = (titles[i] or "").strip()
+        content = (contents[i] or "").strip()
+        if not title or not content:
+            continue
+        db.session.add(CompanyStandard(
+            user_id=current_user.id, org_id=current_user.org_id,
+            category=(categories[i] if i < len(categories) else "general").strip() or "general",
+            title=title[:300], content=content,
+        ))
+        count += 1
+    db.session.commit()
+    _log_activity("standards_ingest", f"Imported {count} standard(s)")
+    flash(f"Imported {count} company standard(s).", "success")
+    return redirect(url_for("posture") + "#standards")
+
+
 @app.route("/settings/upload-template", methods=["POST"])
 @login_required
 def upload_user_template():
@@ -3270,6 +3461,273 @@ def _ensure_proposal_pdf(proposal, project):
         proposal.pdf_file = pdf_filename
         db.session.commit()
     return pdf_path
+
+
+# ---------------------------------------------------------------------------
+# Structured pricing estimate (Phase 4)
+# ---------------------------------------------------------------------------
+
+def _estimate_totals(estimate):
+    """Compute subtotal by kind, markup, and grand total for an estimate."""
+    items = estimate.items.order_by(EstimateLineItem.kind, EstimateLineItem.sort_order).all()
+    by_kind = {}
+    subtotal = 0.0
+    for it in items:
+        t = it.total
+        by_kind[it.kind] = by_kind.get(it.kind, 0.0) + t
+        subtotal += t
+    markup = subtotal * (estimate.markup_pct or 0) / 100.0
+    return {
+        "items": items,
+        "by_kind": by_kind,
+        "subtotal": subtotal,
+        "markup": markup,
+        "grand_total": subtotal + markup,
+    }
+
+
+@app.route("/proposal/<proposal_id>/estimate", methods=["GET"])
+@login_required
+def proposal_estimate(proposal_id):
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    estimate = ProposalEstimate.query.filter_by(proposal_id=proposal_id).first()
+    totals = _estimate_totals(estimate) if estimate else None
+    return render_template(
+        "proposal_estimate.html",
+        proposal=proposal, project=project,
+        estimate=estimate, totals=totals,
+    )
+
+
+@app.route("/proposal/<proposal_id>/estimate/draft", methods=["POST"])
+@login_required
+def draft_proposal_estimate(proposal_id):
+    """AI-draft a structured estimate from the RFP + the org's rates."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    org_id = current_user.org_id
+    staff = [{"role_name": r.role_name, "category": r.category, "hourly_rate": r.hourly_rate,
+              "overtime_rate": r.overtime_rate}
+             for r in StaffRole.query.filter_by(org_id=org_id, is_active=True).all()]
+    equip = [{"item_name": e.item_name, "category": e.category, "unit_cost": e.unit_cost, "unit": e.unit}
+             for e in EquipmentItem.query.filter_by(org_id=org_id, is_active=True).all()]
+    travel = [{"expense_type": t.expense_type, "rate": t.rate, "unit": t.unit}
+              for t in TravelExpenseRate.query.filter_by(org_id=org_id, is_active=True).all()]
+
+    scope_items = None
+    scope = ProjectScope.query.filter_by(project_id=project.id).first()
+    if scope:
+        scope_items = [i.item_text for i in ScopeItem.query.filter_by(
+            scope_id=scope.id, status="included").all()]
+
+    rfp_text = _project_rfp_text(project.id)
+    try:
+        result = draft_estimate(
+            rfp_text, staff_roles=staff, equipment=equip, travel=travel,
+            approved_scope=scope_items,
+            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
+            user_model=current_user.llm_model or None,
+        )
+    except RuntimeError as e:
+        flash(str(e), "error")
+        return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
+    except Exception as e:
+        flash(f"Estimate drafting failed: {friendly_api_error(e)}", "error")
+        return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
+
+    existing = ProposalEstimate.query.filter_by(proposal_id=proposal_id).first()
+    if existing:
+        db.session.delete(existing)
+        db.session.flush()
+    estimate = ProposalEstimate(
+        proposal_id=proposal_id, project_id=project.id, org_id=org_id,
+        currency=result.get("currency", "USD"),
+    )
+    db.session.add(estimate)
+    db.session.flush()
+    for idx, it in enumerate(result["items"]):
+        db.session.add(EstimateLineItem(
+            estimate_id=estimate.id, kind=it["kind"], description=it["description"],
+            quantity=it["quantity"], unit=it["unit"], unit_cost=it["unit_cost"], sort_order=idx,
+        ))
+    db.session.commit()
+    _log_activity("estimate_draft", f"AI drafted {len(result['items'])} estimate line(s)", project.id)
+    flash(f"AI drafted {len(result['items'])} line item(s). Review and adjust below.", "success")
+    return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
+
+
+@app.route("/proposal/<proposal_id>/estimate/save", methods=["POST"])
+@login_required
+def save_proposal_estimate(proposal_id):
+    """Persist grid edits: line items (add/edit/delete) + markup."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+
+    estimate = ProposalEstimate.query.filter_by(proposal_id=proposal_id).first()
+    if not estimate:
+        estimate = ProposalEstimate(proposal_id=proposal_id, project_id=project.id, org_id=current_user.org_id)
+        db.session.add(estimate)
+        db.session.flush()
+
+    try:
+        estimate.markup_pct = float(request.form.get("markup_pct", estimate.markup_pct) or 0)
+    except ValueError:
+        pass
+    estimate.currency = (request.form.get("currency", estimate.currency) or "USD")[:10]
+
+    EstimateLineItem.query.filter_by(estimate_id=estimate.id).delete()
+    kinds = request.form.getlist("kind")
+    descs = request.form.getlist("description")
+    qtys = request.form.getlist("quantity")
+    units = request.form.getlist("unit")
+    costs = request.form.getlist("unit_cost")
+    for idx in range(len(descs)):
+        desc = (descs[idx] or "").strip()
+        if not desc:
+            continue
+        kind = (kinds[idx] if idx < len(kinds) else "other").lower()
+        if kind not in ("labor", "equipment", "travel", "other"):
+            kind = "other"
+        def _num(lst, i):
+            try:
+                return float((lst[i] if i < len(lst) else "0").replace(",", "").replace("$", "") or 0)
+            except ValueError:
+                return 0.0
+        db.session.add(EstimateLineItem(
+            estimate_id=estimate.id, kind=kind, description=desc[:400],
+            quantity=_num(qtys, idx), unit=(units[idx] if idx < len(units) else "")[:40],
+            unit_cost=_num(costs, idx), sort_order=idx,
+        ))
+    db.session.commit()
+    _log_activity("estimate_save", "Saved structured estimate", project.id)
+    flash("Estimate saved.", "success")
+    return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
+
+
+def _estimate_markdown(estimate) -> str:
+    """Render an estimate as a Markdown Pricing section."""
+    totals = _estimate_totals(estimate)
+    cur = estimate.currency or "USD"
+    sym = "$" if cur == "USD" else ""
+    lines = ["## Pricing", ""]
+    kind_labels = {"labor": "Labor", "equipment": "Equipment & Materials",
+                   "travel": "Travel & Expenses", "other": "Other"}
+    for kind in ("labor", "equipment", "travel", "other"):
+        rows = [it for it in totals["items"] if it.kind == kind]
+        if not rows:
+            continue
+        lines.append(f"### {kind_labels[kind]}")
+        lines.append("")
+        lines.append("| Item | Qty | Unit | Unit Cost | Total |")
+        lines.append("|------|-----|------|-----------|-------|")
+        for it in rows:
+            lines.append(f"| {it.description} | {it.quantity:g} | {it.unit} | "
+                         f"{sym}{it.unit_cost:,.2f} | {sym}{it.total:,.2f} |")
+        lines.append(f"| **{kind_labels[kind]} subtotal** | | | | **{sym}{totals['by_kind'][kind]:,.2f}** |")
+        lines.append("")
+    lines.append("### Total")
+    lines.append("")
+    lines.append("| | Amount |")
+    lines.append("|--|--------|")
+    lines.append(f"| Subtotal | {sym}{totals['subtotal']:,.2f} |")
+    if estimate.markup_pct:
+        lines.append(f"| Markup ({estimate.markup_pct:g}%) | {sym}{totals['markup']:,.2f} |")
+    lines.append(f"| **Total Estimated Cost** | **{sym}{totals['grand_total']:,.2f}** |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+@app.route("/proposal/<proposal_id>/estimate/export.csv")
+@login_required
+def export_estimate_csv(proposal_id):
+    import csv
+    import io
+    from flask import Response
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+    estimate = ProposalEstimate.query.filter_by(proposal_id=proposal_id).first()
+    if not estimate:
+        flash("No estimate to export.", "error")
+        return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
+    totals = _estimate_totals(estimate)
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["Kind", "Description", "Quantity", "Unit", "Unit Cost", "Total"])
+    for it in totals["items"]:
+        w.writerow([it.kind, it.description, it.quantity, it.unit, f"{it.unit_cost:.2f}", f"{it.total:.2f}"])
+    w.writerow([])
+    w.writerow(["", "", "", "", "Subtotal", f"{totals['subtotal']:.2f}"])
+    w.writerow(["", "", "", "", f"Markup {estimate.markup_pct:g}%", f"{totals['markup']:.2f}"])
+    w.writerow(["", "", "", "", "Grand Total", f"{totals['grand_total']:.2f}"])
+    out.seek(0)
+    return Response(out.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f"attachment; filename=estimate_{proposal.job_id}.csv"})
+
+
+@app.route("/proposal/<proposal_id>/estimate/insert", methods=["POST"])
+@login_required
+def insert_estimate_into_proposal(proposal_id):
+    """Insert/replace the proposal's Pricing section from the structured estimate,
+    saving a new version."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        abort(404)
+    project = db.session.get(Project, proposal.project_id)
+    if not _can_access_project(project):
+        abort(404)
+    estimate = ProposalEstimate.query.filter_by(proposal_id=proposal_id).first()
+    if not estimate or not estimate.items.count():
+        flash("Add estimate line items first.", "error")
+        return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
+
+    version = latest_version(proposal_id)
+    current_md = version.markdown_content if version else ""
+    pricing_md = _estimate_markdown(estimate)
+
+    if re.search(r"^##\s+Pricing\s*$", current_md, re.MULTILINE):
+        updated_md = re.sub(r"##\s+Pricing.*?(?=\n##\s|\Z)", pricing_md + "\n", current_md,
+                            count=1, flags=re.DOTALL)
+    else:
+        updated_md = current_md.rstrip() + "\n\n" + pricing_md
+
+    next_version = (version.version_number + 1) if version else 1
+    db.session.add(ProposalVersion(
+        proposal_id=proposal_id, version_number=next_version, markdown_content=updated_md,
+        edit_source="human_web", editor_id=current_user.id,
+        change_summary="Inserted structured pricing estimate",
+    ))
+    md_path = GENERATED_DIR / proposal.md_file
+    md_path.write_text(updated_md, encoding="utf-8")
+    storage.sync_up(md_path)
+    if proposal.docx_file:
+        docx_path = GENERATED_DIR / proposal.docx_file
+        _brand_user = project.owner or current_user
+        markdown_to_docx(updated_md, str(docx_path), **_logo_docx_kwargs(_brand_user))
+        storage.sync_up(docx_path)
+    project.dollar_amount = _estimate_totals(estimate)["grand_total"]
+    db.session.commit()
+    _log_activity("estimate_insert", f"Inserted pricing into proposal v{next_version}", project.id)
+    flash(f"Pricing inserted as v{next_version}.", "success")
+    return redirect(url_for("view_proposal", proposal_id=proposal_id))
 
 
 # ---------------------------------------------------------------------------

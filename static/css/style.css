@@ -3054,3 +3054,17 @@ body {
 .share-stats li { padding: 2px 0; }
 .check-inline { display: block; font-size: 13px; margin: 4px 0; }
 .rail-sub { font-size: 13px; color: var(--gray-500, #667); margin: 0 0 10px; }
+
+/* Structured estimate grid */
+#estimate-grid input, #estimate-grid select { padding: 5px 6px; border: 1px solid var(--gray-200, #dfe3e6); border-radius: 5px; font-size: 13px; }
+.est-total { text-align: right; font-variant-numeric: tabular-nums; }
+.estimate-summary { margin: 18px 0 6px; margin-left: auto; max-width: 340px; }
+.est-summary-row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--gray-100, #eef1f2); }
+.est-summary-row.grand { border-top: 2px solid var(--sea-800, #0f6b6b); border-bottom: none; font-size: 17px; padding-top: 10px; }
+.form-actions { margin-top: 16px; display: flex; gap: 10px; flex-wrap: wrap; }
+
+/* AI ingestion import box */
+.ai-import-box { display: block; background: var(--sea-50, #f0f7f7); border: 1px dashed var(--sea-300, #9fcece); border-radius: 8px; padding: 12px 14px; margin: 10px 0 16px; }
+.ai-import-box strong { display: block; color: var(--sea-800, #0f6b6b); }
+.ai-import-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+.ingest-block { border: 1px solid var(--gray-200, #dfe3e6); border-radius: 8px; padding: 14px; margin-bottom: 12px; }

@@ -818,3 +818,48 @@ class ShareView(db.Model):
     user_agent = db.Column(db.String(400), default="")
 
     share = db.relationship("ProposalShare", backref="views")
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Structured pricing estimate
+# ---------------------------------------------------------------------------
+
+
+class ProposalEstimate(db.Model):
+    """A structured, editable cost estimate for a proposal. The AI drafts line
+    items from the RFP + the org's rates; humans edit them in a grid with live
+    totals; the estimate renders into the proposal's Pricing section."""
+    __tablename__ = "proposal_estimates"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    proposal_id = db.Column(db.String(32), db.ForeignKey("proposals.id"), nullable=False)
+    project_id = db.Column(db.String(32), db.ForeignKey("projects.id"), nullable=False)
+    org_id = db.Column(db.String(32), db.ForeignKey("organizations.id"), nullable=True)
+    currency = db.Column(db.String(10), default="USD")
+    markup_pct = db.Column(db.Float, default=0.0)  # applied to subtotal
+    status = db.Column(db.String(20), default="draft")  # draft, final
+    created_at = db.Column(db.DateTime, default=_utcnow)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow)
+
+    proposal = db.relationship("Proposal", backref=db.backref("estimate", uselist=False))
+    items = db.relationship("EstimateLineItem", backref="estimate",
+                            lazy="dynamic", cascade="all, delete-orphan")
+
+
+class EstimateLineItem(db.Model):
+    """One line in a ProposalEstimate. total = quantity * unit_cost.
+    For labor, quantity is hours and unit_cost is the hourly rate."""
+    __tablename__ = "estimate_line_items"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    estimate_id = db.Column(db.String(32), db.ForeignKey("proposal_estimates.id"), nullable=False)
+    kind = db.Column(db.String(20), default="labor")  # labor, equipment, travel, other
+    description = db.Column(db.String(400), nullable=False)
+    quantity = db.Column(db.Float, default=0.0)
+    unit = db.Column(db.String(40), default="")  # hrs, each, trip, ...
+    unit_cost = db.Column(db.Float, default=0.0)
+    sort_order = db.Column(db.Integer, default=0)
+
+    @property
+    def total(self) -> float:
+        return (self.quantity or 0) * (self.unit_cost or 0)

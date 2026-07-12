@@ -90,6 +90,7 @@
                         <a href="#" title="Redlines available once the proposal has been edited (2+ versions)" style="opacity:0.4; cursor:not-allowed;" onclick="return false;">&#9776; Redlines</a>
                         {% endif %}
                     </div>
+                    <a href="{{ url_for('proposal_estimate', proposal_id=proposal.id) }}" class="btn btn-small btn-secondary">&#128200; Estimate</a>
                     <a href="{{ url_for('download', proposal_id=proposal.id, fmt='docx') }}" class="btn btn-small btn-secondary">&#8681; Export .docx</a>
                     <a href="{{ url_for('download', proposal_id=proposal.id, fmt='pdf') }}" class="btn btn-small btn-secondary">&#8681; Export .pdf</a>
                     {% if redline_available %}

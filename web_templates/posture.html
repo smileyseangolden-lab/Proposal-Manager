@@ -128,6 +128,15 @@
         <div class="accordion-body">
             <p class="card-desc" style="margin-top:12px;">Define your company's standard content that the AI will automatically include in proposals: mission statement, certifications, past performance, terms &amp; conditions, safety record, quality standards, etc.</p>
 
+            <form method="post" action="{{ url_for('ingest_standards') }}" enctype="multipart/form-data" class="ai-import-box">
+                <strong>AI import &amp; review</strong>
+                <span class="form-hint">Upload a capabilities deck, past proposal, or boilerplate doc — the AI proposes reusable standard blocks you confirm before importing.</span>
+                <div class="ai-import-row">
+                    <input type="file" name="standards_file" accept=".pdf,.docx,.doc,.txt,.md" required>
+                    <button type="submit" class="btn btn-small btn-primary">Extract &amp; review</button>
+                </div>
+            </form>
+
             <form method="post" action="{{ url_for('add_company_standard') }}" enctype="multipart/form-data" class="upload-inline">
                 <div class="form-row">
                     <div class="form-group">
@@ -198,6 +207,16 @@
         </summary>
         <div class="accordion-body">
             <p class="card-desc" style="margin-top:12px;">Define your staff roles and hourly sell rates. The AI uses these to estimate staffing costs when generating proposals. You can enter manually or upload a spreadsheet.</p>
+
+            <form method="post" action="{{ url_for('ingest_rates') }}" enctype="multipart/form-data" class="ai-import-box">
+                <input type="hidden" name="target_type" value="labor_rates">
+                <strong>AI import &amp; review</strong>
+                <span class="form-hint">Upload a rate spreadsheet (.xlsx) or doc — the AI maps it to rows you confirm before importing.</span>
+                <div class="ai-import-row">
+                    <input type="file" name="ingest_file" accept=".xlsx,.xls,.csv,.pdf,.docx" required>
+                    <button type="submit" class="btn btn-small btn-primary">Extract &amp; review</button>
+                </div>
+            </form>
 
             <form method="post" action="{{ url_for('add_staff_role') }}" enctype="multipart/form-data" class="upload-inline">
                 <div class="form-row">
@@ -301,6 +320,16 @@
         <div class="accordion-body">
             <p class="card-desc" style="margin-top:12px;">Define your standard equipment, materials, and product pricing. The AI references this for Bill of Materials estimates in proposals.</p>
 
+            <form method="post" action="{{ url_for('ingest_rates') }}" enctype="multipart/form-data" class="ai-import-box">
+                <input type="hidden" name="target_type" value="product_pricing">
+                <strong>AI import &amp; review</strong>
+                <span class="form-hint">Upload a price list — the AI maps it to items you confirm before importing.</span>
+                <div class="ai-import-row">
+                    <input type="file" name="ingest_file" accept=".xlsx,.xls,.csv,.pdf,.docx" required>
+                    <button type="submit" class="btn btn-small btn-primary">Extract &amp; review</button>
+                </div>
+            </form>
+
             <form method="post" action="{{ url_for('add_equipment_item') }}" enctype="multipart/form-data" class="upload-inline">
                 <div class="form-row">
                     <div class="form-group" style="flex:2">
@@ -399,6 +428,16 @@
         </summary>
         <div class="accordion-body">
             <p class="card-desc" style="margin-top:12px;">Define standard travel and expense rates (per diem, mileage, airfare, hotel, etc.). The AI uses these to estimate travel costs in proposals.</p>
+
+            <form method="post" action="{{ url_for('ingest_rates') }}" enctype="multipart/form-data" class="ai-import-box">
+                <input type="hidden" name="target_type" value="travel">
+                <strong>AI import &amp; review</strong>
+                <span class="form-hint">Upload a travel-rate schedule — the AI maps it to rows you confirm before importing.</span>
+                <div class="ai-import-row">
+                    <input type="file" name="ingest_file" accept=".xlsx,.xls,.csv,.pdf,.docx" required>
+                    <button type="submit" class="btn btn-small btn-primary">Extract &amp; review</button>
+                </div>
+            </form>
 
             <form method="post" action="{{ url_for('add_travel_rate') }}" enctype="multipart/form-data" class="upload-inline">
                 <div class="form-row">

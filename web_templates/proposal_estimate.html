@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+{% block title %}Estimate — {{ project.name }}{% endblock %}
+{% block breadcrumb %}<a href="{{ url_for('view_proposal', proposal_id=proposal.id) }}">Proposal</a> / <span class="crumb-current">Estimate</span>{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <div class="page-header-row">
+        <div>
+            <h1>Cost Estimate</h1>
+            <p class="page-subtitle">{{ project.name }} — structured, editable pricing with live totals.</p>
+        </div>
+        <div class="header-actions">
+            <form method="post" action="{{ url_for('draft_proposal_estimate', proposal_id=proposal.id) }}" class="inline-form">
+                <button type="submit" class="btn btn-secondary">{{ 'Re-draft with AI' if estimate else 'Draft with AI' }}</button>
+            </form>
+            {% if estimate %}
+            <a href="{{ url_for('export_estimate_csv', proposal_id=proposal.id) }}" class="btn btn-small btn-secondary">Export CSV</a>
+            {% endif %}
+        </div>
+    </div>
+</section>
+
+<form method="post" action="{{ url_for('save_proposal_estimate', proposal_id=proposal.id) }}" id="estimate-form">
+    <div class="card">
+        <table class="proposals-table" id="estimate-grid">
+            <thead>
+                <tr>
+                    <th style="width:120px;">Type</th>
+                    <th>Description</th>
+                    <th style="width:90px;">Qty</th>
+                    <th style="width:90px;">Unit</th>
+                    <th style="width:120px;">Unit Cost</th>
+                    <th style="width:130px;">Total</th>
+                    <th style="width:40px;"></th>
+                </tr>
+            </thead>
+            <tbody id="estimate-rows">
+                {% set rows = totals['items'] if totals else [] %}
+                {% for it in rows %}
+                <tr class="est-row">
+                    <td>
+                        <select name="kind" class="role-select">
+                            <option value="labor" {{ 'selected' if it.kind=='labor' }}>Labor</option>
+                            <option value="equipment" {{ 'selected' if it.kind=='equipment' }}>Equipment</option>
+                            <option value="travel" {{ 'selected' if it.kind=='travel' }}>Travel</option>
+                            <option value="other" {{ 'selected' if it.kind=='other' }}>Other</option>
+                        </select>
+                    </td>
+                    <td><input type="text" name="description" value="{{ it.description }}" required style="width:100%;"></td>
+                    <td><input type="number" step="any" name="quantity" value="{{ it.quantity }}" class="est-qty" style="width:100%;"></td>
+                    <td><input type="text" name="unit" value="{{ it.unit }}" style="width:100%;"></td>
+                    <td><input type="number" step="any" name="unit_cost" value="{{ it.unit_cost }}" class="est-cost" style="width:100%;"></td>
+                    <td class="est-total">0.00</td>
+                    <td><button type="button" class="link-button est-del" title="Remove">&times;</button></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        <button type="button" class="btn btn-small btn-secondary" id="add-row">+ Add line</button>
+
+        <div class="estimate-summary">
+            <div class="est-summary-row"><span>Subtotal</span><strong id="sum-subtotal">$0.00</strong></div>
+            <div class="est-summary-row">
+                <span>Markup
+                    <input type="number" step="any" name="markup_pct" value="{{ estimate.markup_pct if estimate else 0 }}" id="markup-pct" style="width:70px;">%
+                </span>
+                <strong id="sum-markup">$0.00</strong>
+            </div>
+            <div class="est-summary-row grand"><span>Total Estimated Cost</span><strong id="sum-grand">$0.00</strong></div>
+        </div>
+
+        <input type="hidden" name="currency" value="{{ estimate.currency if estimate else 'USD' }}">
+        <div class="form-actions">
+            <button type="submit" class="btn btn-primary">Save estimate</button>
+            <button type="submit" class="btn btn-secondary" formaction="{{ url_for('insert_estimate_into_proposal', proposal_id=proposal.id) }}">Save &amp; insert into proposal</button>
+        </div>
+    </div>
+</form>
+
+<template id="row-template">
+    <tr class="est-row">
+        <td>
+            <select name="kind" class="role-select">
+                <option value="labor">Labor</option>
+                <option value="equipment">Equipment</option>
+                <option value="travel">Travel</option>
+                <option value="other">Other</option>
+            </select>
+        </td>
+        <td><input type="text" name="description" required style="width:100%;"></td>
+        <td><input type="number" step="any" name="quantity" value="0" class="est-qty" style="width:100%;"></td>
+        <td><input type="text" name="unit" style="width:100%;"></td>
+        <td><input type="number" step="any" name="unit_cost" value="0" class="est-cost" style="width:100%;"></td>
+        <td class="est-total">0.00</td>
+        <td><button type="button" class="link-button est-del" title="Remove">&times;</button></td>
+    </tr>
+</template>
+
+<script>
+(function(){
+    var rows = document.getElementById("estimate-rows");
+    function money(n){ return "$" + (n||0).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2}); }
+    function recalc(){
+        var subtotal = 0;
+        rows.querySelectorAll(".est-row").forEach(function(tr){
+            var q = parseFloat(tr.querySelector(".est-qty").value) || 0;
+            var c = parseFloat(tr.querySelector(".est-cost").value) || 0;
+            var t = q * c;
+            tr.querySelector(".est-total").textContent = money(t);
+            subtotal += t;
+        });
+        var markup = subtotal * (parseFloat(document.getElementById("markup-pct").value) || 0) / 100;
+        document.getElementById("sum-subtotal").textContent = money(subtotal);
+        document.getElementById("sum-markup").textContent = money(markup);
+        document.getElementById("sum-grand").textContent = money(subtotal + markup);
+    }
+    document.getElementById("add-row").addEventListener("click", function(){
+        var t = document.getElementById("row-template").content.cloneNode(true);
+        rows.appendChild(t);
+        recalc();
+    });
+    document.addEventListener("input", recalc);
+    document.addEventListener("click", function(e){
+        if (e.target.classList.contains("est-del")){
+            e.target.closest(".est-row").remove();
+            recalc();
+        }
+    });
+    recalc();
+})();
+</script>
+{% endblock %}
