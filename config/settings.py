@@ -45,6 +45,25 @@ DEFAULT_VERTICAL = "general"
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = "claude-opus-4-6"
 
+# Database — Postgres in production via DATABASE_URL; SQLite fallback for dev.
+_raw_db_url = os.getenv("DATABASE_URL", "").strip()
+if _raw_db_url.startswith("postgres://"):
+    # Heroku/DO-style URLs use the deprecated scheme SQLAlchemy rejects
+    _raw_db_url = _raw_db_url.replace("postgres://", "postgresql://", 1)
+DATABASE_URL = _raw_db_url or f"sqlite:///{BASE_DIR / 'data' / 'proposal_manager.db'}"
+
+# Object storage (S3-compatible: AWS S3, DigitalOcean Spaces, MinIO…).
+# When configured, uploads and generated files are mirrored to the bucket so
+# they survive ephemeral disks; unset = local filesystem only.
+S3_BUCKET = os.getenv("S3_BUCKET", "")
+S3_REGION = os.getenv("S3_REGION", "")
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "")  # for Spaces/MinIO
+S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID", os.getenv("AWS_ACCESS_KEY_ID", ""))
+S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY", os.getenv("AWS_SECRET_ACCESS_KEY", ""))
+
+# Background jobs: set JOBS_INLINE=true to run jobs synchronously (tests/dev)
+JOBS_INLINE = os.getenv("JOBS_INLINE", "false").lower() == "true"
+
 # Flask
 FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me")
 FLASK_HOST = os.getenv("FLASK_HOST", "0.0.0.0")

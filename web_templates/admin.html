@@ -4,9 +4,60 @@
 
 {% block content %}
 <section class="page-header">
-    <h1>Admin Panel</h1>
-    <p class="page-subtitle">Rep management dashboard &mdash; Company-wide tracking and metrics</p>
+    <h1>People &amp; Roles</h1>
+    <p class="page-subtitle">{{ org.name if org else 'Workspace' }} &mdash; team, invitations, and company-wide metrics</p>
 </section>
+
+<!-- Workspace + Team invitations -->
+<div class="card">
+    <h2>Workspace</h2>
+    <form method="post" action="{{ url_for('update_org_name') }}" class="inline-form" style="margin-bottom:18px; gap:8px; display:flex; flex-wrap:wrap; align-items:flex-end;">
+        <div class="form-group" style="margin:0; min-width:260px;">
+            <label for="org_name">Workspace name</label>
+            <input type="text" id="org_name" name="org_name" value="{{ org.name if org else '' }}" required>
+        </div>
+        <button type="submit" class="btn btn-secondary">Save</button>
+        <span class="form-hint" style="margin-left:auto;">Plan: <strong>{{ (org.plan or 'free')|title }}</strong> &middot; <a href="{{ url_for('billing_page') }}">Manage billing</a></span>
+    </form>
+
+    <h3 style="margin-top:8px;">Invite a teammate</h3>
+    <p class="card-desc">They'll get a link to create an account inside this workspace with the role you choose.</p>
+    <form method="post" action="{{ url_for('create_invitation') }}" class="inline-form" style="gap:8px; display:flex; flex-wrap:wrap; align-items:flex-end;">
+        <div class="form-group" style="margin:0; min-width:240px;">
+            <label for="invite_email">Email address</label>
+            <input type="email" id="invite_email" name="invite_email" placeholder="teammate@company.com" required>
+        </div>
+        <div class="form-group" style="margin:0;">
+            <label for="invite_role">Role</label>
+            <select id="invite_role" name="invite_role">
+                <option value="proposal">Proposal</option>
+                <option value="sales">Sales</option>
+                <option value="admin">Admin</option>
+            </select>
+        </div>
+        <button type="submit" class="btn btn-primary">Send invite</button>
+    </form>
+
+    {% if pending_invitations %}
+    <table class="mini-table" style="margin-top:16px;">
+        <thead><tr><th>Pending invitation</th><th>Role</th><th>Invited</th><th></th></tr></thead>
+        <tbody>
+        {% for inv in pending_invitations %}
+        <tr>
+            <td>{{ inv.email }}</td>
+            <td><span class="role-badge role-{{ inv.role }}">{{ inv.role|title }}</span></td>
+            <td style="white-space:nowrap;">{{ inv.created_at.strftime('%Y-%m-%d') }}</td>
+            <td>
+                <form method="post" action="{{ url_for('revoke_invitation', invite_id=inv.id) }}" class="inline-form">
+                    <button type="submit" class="btn btn-small btn-secondary">Revoke</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+</div>
 
 <!-- Company-wide stats -->
 <section class="stats-grid">

@@ -14,7 +14,13 @@
             <p class="auth-tagline">AI-Powered Proposal Platform</p>
         </div>
         <div class="auth-card">
+            {% if invitation and invite_org %}
+            <h2 class="auth-heading">Join {{ invite_org.name }}</h2>
+            <p class="auth-sub">You've been invited as a <strong>{{ invitation.role|title }}</strong> user. Create your account to join the workspace.</p>
+            {% else %}
             <h2 class="auth-heading">Create your account</h2>
+            <p class="auth-sub">This creates a new company workspace — you'll be its admin and can invite your team.</p>
+            {% endif %}
 
             {% with messages = get_flashed_messages(with_categories=true) %}
             {% if messages %}
@@ -25,6 +31,7 @@
             {% endwith %}
 
             <form method="post" action="{{ url_for('signup') }}">
+                {% if invitation %}<input type="hidden" name="invite_token" value="{{ invitation.token }}">{% endif %}
                 <div class="form-row">
                     <div class="form-group">
                         <label for="username">Username *</label>
@@ -37,11 +44,12 @@
                 </div>
                 <div class="form-group">
                     <label for="email">Email Address *</label>
-                    <input type="email" id="email" name="email" required autocomplete="email">
+                    <input type="email" id="email" name="email" required autocomplete="email" value="{{ invitation.email if invitation else '' }}">
                 </div>
                 <div class="form-group">
-                    <label for="company_name">Company Name</label>
-                    <input type="text" id="company_name" name="company_name" autocomplete="organization">
+                    <label for="company_name">{% if invitation %}Workspace{% else %}Company Name{% endif %}</label>
+                    <input type="text" id="company_name" name="company_name" autocomplete="organization"
+                           value="{{ invite_org.name if invite_org else '' }}"{% if invitation %} readonly{% endif %}>
                 </div>
                 <div class="form-group">
                     <label for="password">Password * <span class="form-hint">(min 8 characters)</span></label>

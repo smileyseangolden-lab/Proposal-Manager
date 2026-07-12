@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}Working… — {{ app_name }}{% endblock %}
+{% block breadcrumb %}<span class="crumb-current">Generating proposal</span>{% endblock %}
+
+{% block content %}
+<div class="page-narrow">
+  <div class="card job-card" id="job-card" data-job-id="{{ job.id }}">
+    <div class="job-spinner" id="job-spinner"></div>
+    <h1 class="job-title" id="job-title">Working on it…</h1>
+    <p class="job-phase" id="job-phase">{{ job.message or "Queued — starting shortly." }}</p>
+    <div class="job-steps" id="job-steps">
+      <span class="job-step" data-phase="reading">Read documents</span>
+      <span class="job-step" data-phase="drafting">Draft with AI</span>
+      <span class="job-step" data-phase="saving">Format &amp; save</span>
+    </div>
+    <div class="job-error" id="job-error" style="display:none"></div>
+    <div class="job-actions" id="job-actions" style="display:none">
+      <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Back to dashboard</a>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var card = document.getElementById("job-card");
+  var jobId = card.getAttribute("data-job-id");
+  var phaseEl = document.getElementById("job-phase");
+  var titleEl = document.getElementById("job-title");
+  var errorEl = document.getElementById("job-error");
+  var actionsEl = document.getElementById("job-actions");
+  var spinner = document.getElementById("job-spinner");
+  var order = ["reading", "drafting", "saving"];
+
+  function markSteps(phase){
+    var idx = order.indexOf(phase);
+    document.querySelectorAll(".job-step").forEach(function(el){
+      var p = el.getAttribute("data-phase");
+      var i = order.indexOf(p);
+      el.classList.toggle("done", idx > i && idx >= 0);
+      el.classList.toggle("active", p === phase);
+    });
+  }
+
+  function poll(){
+    fetch("/jobs/" + jobId + "/status.json")
+      .then(function(r){ return r.json(); })
+      .then(function(d){
+        if (d.message) phaseEl.textContent = d.message;
+        if (d.phase) markSteps(d.phase);
+        if (d.status === "done"){
+          titleEl.textContent = "Done!";
+          phaseEl.textContent = "Redirecting to your proposal…";
+          window.location.href = d.redirect;
+          return;
+        }
+        if (d.status === "failed"){
+          spinner.style.display = "none";
+          titleEl.textContent = "Something went wrong";
+          phaseEl.style.display = "none";
+          errorEl.textContent = d.error || "The job failed. Please try again.";
+          errorEl.style.display = "block";
+          actionsEl.style.display = "block";
+          return;
+        }
+        setTimeout(poll, 1500);
+      })
+      .catch(function(){ setTimeout(poll, 2500); });
+  }
+  poll();
+})();
+</script>
+{% endblock %}

@@ -49,13 +49,22 @@ def test(name, condition, detail=""):
         print(f"  FAIL: {name} - {detail}")
 
 
-def make_user(username, email=None, admin=False):
-    """Create a user directly without going through signup (signup is routed)."""
+def make_user(username, email=None, admin=False, org=None):
+    """Create a user directly without going through signup (signup is routed).
+
+    Each user gets its own organization unless an existing `org` is passed,
+    mirroring production where every account belongs to a tenant."""
+    from models import Organization
+    if org is None:
+        org = Organization(name=f"{username.title()} Corp")
+        db.session.add(org)
+        db.session.flush()
     u = User(
+        org_id=org.id,
         username=username,
         email=email or f"{username}@test.com",
         display_name=username.title(),
-        company_name="Test Corp",
+        company_name=org.name,
         is_admin=admin,
         role="admin" if admin else "proposal",
     )
@@ -74,7 +83,7 @@ def make_project_with_proposal(owner, name="Test Proj", md="# Test Proposal\n\n#
     gen_dir = Path(__file__).resolve().parent / 'generated_proposals'
     gen_dir.mkdir(exist_ok=True)
 
-    proj = Project(user_id=owner.id, name=name, client_name="ACME")
+    proj = Project(user_id=owner.id, org_id=owner.org_id, name=name, client_name="ACME")
     db.session.add(proj)
     db.session.flush()
 
