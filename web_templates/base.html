@@ -89,10 +89,13 @@
                 <span class="sidebar-user-name">{{ current_user.display_name or current_user.username }}</span>
                 <span class="sidebar-user-company">{{ current_user.company_name or '' }}</span>
             </div>
-            <a href="{{ url_for('logout') }}" class="sidebar-link sidebar-logout">
-                <span class="sidebar-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg></span>
-                <span>Log out</span>
-            </a>
+            <form method="POST" action="{{ url_for('logout') }}" style="margin:0">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button type="submit" class="sidebar-link sidebar-logout" style="background:none;border:0;width:100%;cursor:pointer;text-align:left;font:inherit">
+                    <span class="sidebar-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg></span>
+                    <span>Log out</span>
+                </button>
+            </form>
         </div>
     </aside>
 
@@ -133,7 +136,10 @@
                         <a href="{{ url_for('admin_panel') }}">Admin Panel</a>
                         {% endif %}
                         <div class="menu-divider"></div>
-                        <a href="{{ url_for('logout') }}" class="menu-danger">Log out</a>
+                        <form method="POST" action="{{ url_for('logout') }}" style="margin:0">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <button type="submit" class="menu-danger" style="background:none;border:0;width:100%;text-align:left;cursor:pointer;font:inherit">Log out</button>
+                        </form>
                     </div>
                 </div>
             </div>

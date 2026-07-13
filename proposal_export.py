@@ -150,7 +150,9 @@ def markdown_to_pdf(
     import markdown as _md
     from xhtml2pdf import pisa
 
-    body_html = _md.markdown(markdown_text, extensions=["tables", "fenced_code"])
+    import htmlsafe
+
+    body_html = htmlsafe.sanitize(_md.markdown(markdown_text, extensions=["tables", "fenced_code"]))
 
     logo_tag = ""
     if logo_path and Path(logo_path).exists():
@@ -181,8 +183,16 @@ def markdown_to_pdf(
         code {{ background: #f0f0f0; padding: 1px 3px; }}
     </style></head><body>{header}{body_html}</body></html>"""
 
+    def _link_callback(uri, rel):
+        # Only allow inline data: URIs (our embedded logo). Block http(s)/file/
+        # etc. so a crafted proposal can't SSRF the server or read local files
+        # while the PDF is rendered.
+        if (uri or "").lower().startswith("data:"):
+            return uri
+        return ""
+
     with open(output_path, "wb") as f:
-        result = pisa.CreatePDF(html, dest=f)
+        result = pisa.CreatePDF(html, dest=f, link_callback=_link_callback)
     if result.err:
         raise RuntimeError("PDF generation failed.")
     return output_path

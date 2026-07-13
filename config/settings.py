@@ -43,7 +43,7 @@ DEFAULT_VERTICAL = "general"
 
 # Anthropic
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = "claude-opus-4-6"
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-8")
 
 # Database — Postgres in production via DATABASE_URL; SQLite fallback for dev.
 _raw_db_url = os.getenv("DATABASE_URL", "").strip()
@@ -63,6 +63,38 @@ S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY", os.getenv("AWS_SECRET_A
 
 # Background jobs: set JOBS_INLINE=true to run jobs synchronously (tests/dev)
 JOBS_INLINE = os.getenv("JOBS_INLINE", "false").lower() == "true"
+
+# Deployment environment. Set APP_ENV=production to enable strict, fail-closed
+# secret checks (see _verify_production_secrets in app.py).
+APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+IS_PRODUCTION = APP_ENV == "production"
+
+# Self-hosted mode: allow switching plans directly without Stripe (single-tenant
+# install). In hosted/SaaS mode this stays false so a missing Stripe key can't
+# turn the paywall off (any admin could otherwise self-upgrade for free).
+SELF_HOSTED = os.getenv("SELF_HOSTED", "false").lower() == "true"
+
+# Number of trusted reverse-proxy hops in front of the app (e.g. nginx = 1).
+# Enables ProxyFix so request.remote_addr is the real client IP for rate
+# limiting. Keep 0 unless the app is actually behind a proxy (otherwise clients
+# could spoof X-Forwarded-For).
+TRUST_PROXY_HOPS = int(os.getenv("TRUST_PROXY_HOPS", "0"))
+
+# Platform-owner allowlist for the cross-tenant /platform-admin dashboard.
+# Comma-separated emails. This is the bootstrap path (no owner exists in the DB
+# at first deploy) and a break-glass backstop; the User.platform_owner column is
+# the durable grant. Either one grants access.
+PLATFORM_OWNER_EMAILS = {
+    e.strip().lower() for e in os.getenv("PLATFORM_OWNER_EMAILS", "").split(",") if e.strip()
+}
+
+# Secrets known to be insecure defaults — refused in production.
+INSECURE_SECRETS = {
+    "",
+    "dev-secret-change-me",
+    "change-this-to-a-random-secret-key",
+    "your-api-key-here",
+}
 
 # Flask
 FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "dev-secret-change-me")

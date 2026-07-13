@@ -116,9 +116,18 @@ class User(UserMixin, db.Model):
     email_verified = db.Column(db.Boolean, default=False)
     created_at = db.Column(db.DateTime, default=_utcnow)
 
+    # Platform ownership — the SaaS operator, NOT a tenant admin. Grants access
+    # to the cross-tenant /platform-admin dashboard. Default False for everyone.
+    platform_owner = db.Column(db.Boolean, default=False, nullable=False)
+
+    # Login throttling — cross-worker, per-account (complements the in-process
+    # per-IP limiter, which doesn't survive multiple gunicorn workers).
+    failed_login_count = db.Column(db.Integer, default=0)
+    lockout_until = db.Column(db.DateTime, nullable=True)
+
     # LLM settings — per-user overrides
     llm_provider = db.Column(db.String(50), default="anthropic")
-    llm_model = db.Column(db.String(100), default="claude-opus-4-6")
+    llm_model = db.Column(db.String(100), default="claude-opus-4-8")
     api_key_encrypted = db.Column(db.Text, default="")
 
     # Company logo / branding
@@ -863,3 +872,78 @@ class EstimateLineItem(db.Model):
     @property
     def total(self) -> float:
         return (self.quantity or 0) * (self.unit_cost or 0)
+
+
+# ---------------------------------------------------------------------------
+# AI cost metering
+# ---------------------------------------------------------------------------
+
+
+class LlmUsage(db.Model):
+    """One row per LLM API call: token counts + estimated cost. Written after
+    each generation/revision/etc. so AI spend can be metered per org (monthly
+    budget enforcement) and reported platform-wide. Deliberately cross-tenant."""
+    __tablename__ = "llm_usage"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    org_id = db.Column(db.String(32), db.ForeignKey("organizations.id"), nullable=True, index=True)
+    user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True)
+    job_id = db.Column(db.String(32), nullable=True)
+    kind = db.Column(db.String(50), default="")  # generate_proposal, revise_proposal, ...
+    provider = db.Column(db.String(50), default="anthropic")
+    model = db.Column(db.String(100), default="")
+    input_tokens = db.Column(db.Integer, default=0)
+    output_tokens = db.Column(db.Integer, default=0)
+    est_cost_usd = db.Column(db.Float, default=0.0)
+    created_at = db.Column(db.DateTime, default=_utcnow, index=True)
+
+
+class ProcessedWebhookEvent(db.Model):
+    """Dedupe ledger for external webhook events (Stripe) — idempotency / replay
+    protection. The primary key is the provider's event id."""
+    __tablename__ = "processed_webhook_events"
+
+    id = db.Column(db.String(80), primary_key=True)  # e.g. Stripe "evt_..."
+    created_at = db.Column(db.DateTime, default=_utcnow)
+
+
+class ChatbotMessage(db.Model):
+    """A help-chatbot question and the reply given, stored so the platform owner
+    can analyze what users ask and improve the product. Cross-tenant view."""
+    __tablename__ = "chatbot_messages"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    user_id = db.Column(db.String(32), db.ForeignKey("users.id"), nullable=True, index=True)
+    org_id = db.Column(db.String(32), db.ForeignKey("organizations.id"), nullable=True, index=True)
+    message = db.Column(db.Text, nullable=False)
+    reply = db.Column(db.Text, default="")
+    answered_by = db.Column(db.String(20), default="ai")  # ai, fallback
+    created_at = db.Column(db.DateTime, default=_utcnow, index=True)
+
+
+class PlatformSetting(db.Model):
+    """Platform-wide configuration the owner edits from /platform-admin (LLM
+    model + API key, payment keys, email/SMTP). Secret values are stored
+    encrypted (is_secret=True). Overrides the corresponding environment default."""
+    __tablename__ = "platform_settings"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    key = db.Column(db.String(100), unique=True, nullable=False)
+    value = db.Column(db.Text, default="")  # encrypted when is_secret
+    is_secret = db.Column(db.Boolean, default=False)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow)
+    updated_by = db.Column(db.String(32), nullable=True)
+
+
+class PlatformAuditLog(db.Model):
+    """Audit trail of platform-owner actions taken in /platform-admin."""
+    __tablename__ = "platform_audit_logs"
+
+    id = db.Column(db.String(32), primary_key=True, default=_uuid)
+    actor_user_id = db.Column(db.String(32), nullable=True)
+    actor_email = db.Column(db.String(200), default="")
+    action = db.Column(db.String(100), nullable=False)
+    detail = db.Column(db.Text, default="")
+    target = db.Column(db.String(200), default="")
+    ip = db.Column(db.String(64), default="")
+    created_at = db.Column(db.DateTime, default=_utcnow, index=True)

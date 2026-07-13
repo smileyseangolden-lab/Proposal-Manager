@@ -16,17 +16,18 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application
 COPY . .
 
-# Create runtime directories
-RUN mkdir -p uploads generated_proposals
+# Create runtime directories and run as a non-root user (defense in depth: a
+# code-exec bug in gunicorn no longer runs as uid 0). If host directories are
+# bind-mounted (see docker-compose.yml) they must be writable by uid 10001.
+RUN mkdir -p uploads generated_proposals data \
+    && useradd --create-home --uid 10001 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
 
 EXPOSE 5000
 
-# Proposal generation with Claude Opus on a big RFP can legitimately take
-# 5-10 minutes of streaming. Set gunicorn --timeout to 900s (15 min) so
-# long-running jobs finish cleanly. The host nginx proxy_read_timeout
-# MUST be >= this value or nginx will cut the connection first.
-# --graceful-timeout lets an in-flight request finish during worker reload.
-#
-# Binds to $PORT when the platform injects one (DigitalOcean App Platform,
-# Heroku-style hosts) and falls back to 5000 for local/VPS Docker runs.
-CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT:-5000} --workers 2 --timeout 900 --graceful-timeout 900 --keep-alive 75 app:app"]
+# Threaded workers (gthread) so a long inline AI call doesn't block other
+# requests; gthread heartbeats independently so long streaming requests still
+# complete within --timeout. Tune with WEB_WORKERS / WEB_THREADS.
+# Binds to $PORT when the platform injects one and falls back to 5000.
+CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT:-5000} --worker-class gthread --workers ${WEB_WORKERS:-2} --threads ${WEB_THREADS:-8} --timeout 600 --graceful-timeout 30 --keep-alive 75 app:app"]

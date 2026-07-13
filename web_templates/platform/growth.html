@@ -1,0 +1,25 @@
+{% extends "platform/base.html" %}
+{% block body %}
+<h1 class="page">Growth</h1>
+<p class="page-sub">New organizations, users, and AI generations per month (last 6 months).</p>
+
+{% macro chart(title, series, color) %}
+<div class="card" style="margin-bottom:15px">
+  <div class="label" style="color:var(--ink-2);font-weight:600;margin-bottom:14px">{{ title }}</div>
+  <div style="display:flex;align-items:flex-end;gap:14px;height:160px">
+    {% for pt in series %}
+    <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;height:100%;justify-content:flex-end">
+      <div style="font-size:.8rem;font-weight:700;color:{{ color }}">{{ pt.count }}</div>
+      <div style="width:100%;max-width:46px;border-radius:6px 6px 0 0;background:{{ color }};
+                  height:{{ ((pt.count / maxv) * 130)|round(0,'floor') }}px;min-height:3px"></div>
+      <div class="muted" style="font-size:.7rem;font-family:var(--mono)">{{ pt.label[5:] }}/{{ pt.label[2:4] }}</div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endmacro %}
+
+{{ chart("Organizations", orgs, "var(--blue)") }}
+{{ chart("Users", users, "var(--purple)") }}
+{{ chart("AI Generations", gens, "var(--pink)") }}
+{% endblock %}

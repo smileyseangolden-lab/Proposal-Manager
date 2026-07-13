@@ -1,0 +1,49 @@
+{% extends "platform/base.html" %}
+{% block body %}
+<h1 class="page">Health</h1>
+<p class="page-sub">Background job pipeline and recent platform activity.</p>
+
+<div class="grid kpis">
+  <div class="card kpi"><div class="label">Queued</div><div class="num c-blue">{{ counts.get('queued', 0) }}</div></div>
+  <div class="card kpi"><div class="label">Running</div><div class="num c-cyan">{{ counts.get('running', 0) }}</div></div>
+  <div class="card kpi"><div class="label">Done</div><div class="num c-green">{{ counts.get('done', 0) }}</div></div>
+  <div class="card kpi"><div class="label">Failed</div><div class="num c-pink">{{ counts.get('failed', 0) }}</div></div>
+  <div class="card kpi"><div class="label">Failure Rate</div><div class="num c-amber">{{ failure_rate }}%</div></div>
+</div>
+
+<div class="section-title">Recent failed jobs</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Kind</th><th>Error</th><th>When</th></tr></thead>
+    <tbody>
+      {% for j in recent_failed %}
+      <tr>
+        <td class="muted" style="font-family:var(--mono);font-size:.82rem">{{ j.kind }}</td>
+        <td>{{ (j.error or '')[:120] }}</td>
+        <td class="muted">{{ j.finished_at.strftime('%Y-%m-%d %H:%M') if j.finished_at else '—' }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="3" class="empty">No failed jobs. 🎉</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="section-title">Recent activity (all tenants)</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>Action</th><th>Detail</th><th>When</th></tr></thead>
+    <tbody>
+      {% for a in recent_activity %}
+      <tr>
+        <td class="muted" style="font-family:var(--mono);font-size:.82rem">{{ a.action }}</td>
+        <td>{{ (a.detail or '')[:100] }}</td>
+        <td class="muted">{{ a.created_at.strftime('%Y-%m-%d %H:%M') if a.created_at else '—' }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="3" class="empty">No activity yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

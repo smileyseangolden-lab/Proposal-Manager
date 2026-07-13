@@ -14,12 +14,13 @@ Full-featured intranet application with:
 import difflib
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import markdown as md
@@ -51,20 +52,28 @@ from config.settings import (
     APP_NAME,
     APP_SHORT_NAME,
     DATABASE_URL,
+    FLASK_DEBUG,
     FLASK_SECRET_KEY,
     GENERATED_DIR,
+    INSECURE_SECRETS,
+    IS_PRODUCTION,
     MAX_UPLOAD_SIZE_MB,
+    SELF_HOSTED,
+    TRUST_PROXY_HOPS,
     UPLOADS_DIR,
     VERTICALS,
 )
 import billing
 import crypto_util
+import htmlsafe
 import jobs
+import proposal_agent
 import storage
 from document_parser import parse_document
 from models import (
     ActivityLog,
     BackgroundJob,
+    ChatbotMessage,
     ClarificationItem,
     CompanyStandard,
     DocumentTag,
@@ -87,6 +96,7 @@ from models import (
     ProposalShare,
     ProposalStatusHistory,
     ProposalVersion,
+    ProcessedWebhookEvent,
     ReviewComment,
     ReviewCycle,
     RevisionRequest,
@@ -137,6 +147,49 @@ from rate_sheet_parser import parse_rate_sheet
 # App factory
 # ---------------------------------------------------------------------------
 
+def _verify_production_secrets():
+    """Fail closed in production (APP_ENV=production) when security-critical
+    secrets are unset or left at a known public default.
+
+    Prevents two audited blockers:
+      - a forgeable session-signing key (FLASK_SECRET_KEY) → auth bypass, and
+      - tenant API keys encrypted under a guessable key (APP_ENCRYPTION_KEY),
+        which must be a DISTINCT random value, never derived from the session key.
+    Dev/test (APP_ENV unset) keep working with the built-in fallbacks.
+    """
+    if not IS_PRODUCTION:
+        return
+    problems = []
+    if (FLASK_SECRET_KEY or "").strip() in INSECURE_SECRETS:
+        problems.append("FLASK_SECRET_KEY is unset or a known default")
+    enc = os.getenv("APP_ENCRYPTION_KEY", "").strip()
+    if enc in INSECURE_SECRETS:
+        problems.append(
+            "APP_ENCRYPTION_KEY is unset or weak (set a distinct random key; "
+            "it must not fall back to FLASK_SECRET_KEY)"
+        )
+    if problems:
+        raise RuntimeError(
+            "Refusing to start in production with insecure secrets: "
+            + "; ".join(problems)
+            + '. Generate strong values, e.g. '
+            + '`python -c "import secrets; print(secrets.token_urlsafe(48))"`.'
+        )
+
+
+_verify_production_secrets()
+
+# Structured logging to stdout (captured by the platform's log aggregation).
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+
+# Whether to surface reset/verification links in the UI when email is
+# unconfigured. NEVER true in production — otherwise /forgot-password would hand
+# a valid reset token to any unauthenticated requester (account takeover).
+_EXPOSE_DEV_LINKS = FLASK_DEBUG and not IS_PRODUCTION
+
 app = Flask(__name__, template_folder="web_templates", static_folder="static")
 app.secret_key = FLASK_SECRET_KEY
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_SIZE_MB * 1024 * 1024
@@ -152,6 +205,14 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = os.getenv("SESSION_COOKIE_SECURE", "true").lower() == "true"
 app.config["PERMANENT_SESSION_LIFETIME"] = 60 * 60 * 24 * 14  # 14 days
 
+# Behind a reverse proxy, trust its forwarding headers so request.remote_addr is
+# the real client IP (used for login rate limiting), not the proxy's.
+if TRUST_PROXY_HOPS > 0:
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(
+        app.wsgi_app, x_for=TRUST_PROXY_HOPS, x_proto=TRUST_PROXY_HOPS, x_host=TRUST_PROXY_HOPS
+    )
+
 # Ensure data directory exists
 (Path(__file__).resolve().parent / "data").mkdir(exist_ok=True)
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
@@ -166,9 +227,16 @@ login_manager.login_message_category = "error"
 
 RATE_SHEET_EXTENSIONS = {"xlsx", "xls"}
 TEMPLATE_EXTENSIONS = {"pdf", "docx", "doc"}
+INGEST_RATE_EXTENSIONS = {"xlsx", "xls", "csv", "pdf", "docx", "doc"}
+INGEST_STANDARDS_EXTENSIONS = {"pdf", "docx", "doc", "txt", "md"}
 LOGO_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "gif", "bmp"}
 LOGO_MAX_DIMENSION = 600  # px — resize so the longest side is at most this
 LOGO_PNG_OPTIMIZE = True
+# Reject images whose decoded pixel count exceeds this — a few-MB "bomb" can
+# otherwise decode to hundreds of MB and exhaust memory. Also lower Pillow's
+# global guard as defense in depth.
+LOGO_MAX_PIXELS = 40_000_000  # 40 MP — far larger than any real logo
+Image.MAX_IMAGE_PIXELS = LOGO_MAX_PIXELS
 
 
 @app.context_processor
@@ -184,6 +252,24 @@ def inject_branding():
 @login_manager.user_loader
 def load_user(user_id):
     return db.session.get(User, user_id)
+
+
+@app.route("/healthz")
+def healthz():
+    """Readiness probe for load balancers: verifies the DB is reachable."""
+    from sqlalchemy import text as _sql_text
+    try:
+        db.session.execute(_sql_text("SELECT 1"))
+        return {"status": "ok"}, 200
+    except Exception:
+        app.logger.exception("healthz DB check failed")
+        return {"status": "error"}, 503
+
+
+@app.route("/livez")
+def livez():
+    """Liveness probe: the process is up (no dependencies checked)."""
+    return {"status": "ok"}, 200
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +308,24 @@ def _csrf_protect():
         abort(400, description="Invalid or missing CSRF token. Please reload and try again.")
 
 
+@app.before_request
+def _tag_ai_usage():
+    """Attribute any LLM calls made while serving this request to the current
+    org/user, so token usage is metered and the monthly AI budget is enforced.
+    Background jobs set their own attribution in the job runner."""
+    try:
+        if getattr(current_user, "is_authenticated", False):
+            proposal_agent.set_call_attribution(
+                org_id=getattr(current_user, "org_id", None),
+                user_id=current_user.id,
+                kind=(request.endpoint or ""),
+            )
+        else:
+            proposal_agent.set_call_attribution()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Login rate limiting (in-process sliding window per IP+username)
 # ---------------------------------------------------------------------------
@@ -229,6 +333,18 @@ def _csrf_protect():
 _LOGIN_ATTEMPTS: dict[str, list[float]] = {}
 _LOGIN_MAX_ATTEMPTS = 8
 _LOGIN_WINDOW_SECONDS = 300
+
+# Cross-worker, per-account lockout (DB-backed): after this many consecutive
+# failures the account is locked for this long.
+_ACCOUNT_LOCK_THRESHOLD = 10
+_ACCOUNT_LOCK_SECONDS = 15 * 60
+
+
+def _aware(dt):
+    """Treat a naive datetime (as SQLite returns) as UTC for safe comparison."""
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _login_rate_limited(key: str) -> bool:
@@ -262,6 +378,26 @@ with app.app_context():
 
 # Background job runner (AI generation/revision run out-of-request)
 jobs.init_app(app)
+
+# AI cost metering + budget enforcement. Every LLM call flows through the metered
+# client in proposal_agent, which records token usage here and blocks calls once
+# an org exceeds its monthly AI budget. See security audit (LLM spend control).
+proposal_agent.set_usage_sink(billing.record_llm_usage)
+proposal_agent.set_budget_checker(billing.check_ai_budget)
+
+# Reap any jobs orphaned by a previous process (e.g. a deploy mid-generation)
+# so they stop polling forever. Workers themselves start lazily on first enqueue
+# and re-run the reaper each poll.
+with app.app_context():
+    try:
+        jobs.reap_stale_jobs()
+    except Exception:
+        app.logger.warning("Startup job reap failed", exc_info=True)
+
+# Platform-Admin owner dashboard (cross-tenant, owner-gated) — a separate area
+# from the tenant app, mounted at /platform-admin.
+from platform_admin import bp as platform_admin_bp
+app.register_blueprint(platform_admin_bp)
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +510,10 @@ def decrypt_api_key(stored: str) -> str:
 
 def billing_check_generation(org_id):
     return billing.check_generation(org_id)
+
+
+def billing_check_ai_budget(org_id):
+    return billing.check_ai_budget(org_id)
 
 
 def billing_record_generation(org_id):
@@ -577,6 +717,12 @@ def _process_and_save_logo(file, user_id: str) -> tuple[str, str, int]:
 
     try:
         img = Image.open(file.stream)
+        w, h = img.size  # lazy — no pixel decode yet
+    except Exception as e:
+        raise ValueError(f"Could not read image: {e}")
+    if w * h > LOGO_MAX_PIXELS:
+        raise ValueError("Image is too large to process.")
+    try:
         img.load()
     except Exception as e:
         raise ValueError(f"Could not read image: {e}")
@@ -672,8 +818,12 @@ def signup():
     user.set_password(password)
 
     if invitation:
-        # Join the inviting organization with the invited role
+        # Join the inviting organization with the invited role.
+        # Bind the account to the INVITED email, not whatever was typed in the
+        # form — otherwise a forwarded invite link could be claimed under an
+        # arbitrary address (and marked verified below).
         org = db.session.get(Organization, invitation.org_id)
+        user.email = invitation.email
         user.org_id = org.id
         user.company_name = org.name
         user.role = invitation.role if invitation.role in ("admin", "sales", "proposal") else "proposal"
@@ -698,6 +848,7 @@ def signup():
         db.session.add(user)
 
     db.session.commit()
+    session.permanent = True
     login_user(user)
     _log_activity("signup", f"User {username} created account")
 
@@ -734,12 +885,31 @@ def login():
 
     user = User.query.filter_by(username=username).first()
 
+    # Cross-worker, per-account lockout (survives multiple gunicorn workers and
+    # catches password spraying against one account regardless of source IP).
+    now = datetime.now(timezone.utc)
+    if user and user.lockout_until and _aware(user.lockout_until) > now:
+        flash("This account is temporarily locked after too many failed attempts. "
+              "Please wait a few minutes and try again.", "error")
+        return redirect(url_for("login"))
+
     if not user or not user.check_password(password):
         _record_login_attempt(rl_key)
+        if user:
+            user.failed_login_count = (user.failed_login_count or 0) + 1
+            if user.failed_login_count >= _ACCOUNT_LOCK_THRESHOLD:
+                user.lockout_until = now + timedelta(seconds=_ACCOUNT_LOCK_SECONDS)
+                user.failed_login_count = 0
+            db.session.commit()
         flash("Invalid username or password.", "error")
         return redirect(url_for("login"))
 
     _LOGIN_ATTEMPTS.pop(rl_key, None)
+    if user.failed_login_count or user.lockout_until:
+        user.failed_login_count = 0
+        user.lockout_until = None
+        db.session.commit()
+    session.permanent = True  # apply PERMANENT_SESSION_LIFETIME idle expiry
     login_user(user)
     _log_activity("login")
     return redirect(url_for("dashboard"))
@@ -832,9 +1002,11 @@ def forgot_password():
                   f"Reset your password:\n{link}\n\nThis link expires in 2 hours. "
                   f"If you didn't request this, you can ignore this email."),
         )
-        if not sent:
-            # Dev fallback: surface the link so the flow is testable without SMTP
-            flash(f"Password reset link: {link}", "success")
+        if not sent and _EXPOSE_DEV_LINKS:
+            # Local-dev only: surface the link so the flow is testable without
+            # SMTP. Gated so production never discloses a reset token to an
+            # unauthenticated requester.
+            flash(f"[dev] Password reset link: {link}", "success")
     flash(generic, "success")
     return redirect(url_for("login"))
 
@@ -863,7 +1035,7 @@ def reset_password(token):
     return redirect(url_for("login"))
 
 
-@app.route("/logout")
+@app.route("/logout", methods=["POST"])
 @login_required
 def logout():
     _log_activity("logout")
@@ -1815,6 +1987,9 @@ def ingest_rates():
     if not file or not file.filename:
         flash("Please choose a file to import.", "error")
         return redirect(url_for("posture"))
+    if not _allowed_file(file.filename, INGEST_RATE_EXTENSIONS):
+        flash("Please upload an Excel, CSV, PDF, or Word file.", "error")
+        return redirect(url_for("posture"))
 
     safe, path, size = _save_upload(file, f"ingest/{current_user.org_id}")
     try:
@@ -1920,6 +2095,9 @@ def ingest_standards():
     file = request.files.get("standards_file")
     if not file or not file.filename:
         flash("Please choose a document to import.", "error")
+        return redirect(url_for("posture") + "#standards")
+    if not _allowed_file(file.filename, INGEST_STANDARDS_EXTENSIONS):
+        flash("Please upload a PDF, Word, or text document.", "error")
         return redirect(url_for("posture") + "#standards")
     safe, path, size = _save_upload(file, f"ingest/{current_user.org_id}")
     try:
@@ -2562,6 +2740,13 @@ def project_generate(project_id):
     allowed, limit_msg = billing_check_generation(current_user.org_id)
     if not allowed:
         flash(limit_msg, "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    # AI cost gate: enforce the monthly token budget so a single org can't run up
+    # unbounded pay-per-use LLM spend (a large upload can cost 10-50x a normal run).
+    budget_ok, budget_msg = billing_check_ai_budget(current_user.org_id)
+    if not budget_ok:
+        flash(budget_msg, "error")
         return redirect(url_for("project_upload", project_id=project_id))
 
     vertical = request.form.get("vertical", "auto")
@@ -3387,7 +3572,7 @@ def view_proposal(proposal_id):
         view_mode = "clean"
         proposal_md_render = proposal_md
 
-    proposal_html = md.markdown(proposal_md_render, extensions=["tables", "fenced_code"])
+    proposal_html = htmlsafe.sanitize(md.markdown(proposal_md_render, extensions=["tables", "fenced_code"]))
 
     meta = {
         "source_file": project.name,
@@ -3907,8 +4092,9 @@ def ai_assist(proposal_id):
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=key, timeout=45, max_retries=1)
+        import platform_config
         resp = client.messages.create(
-            model=current_user.llm_model or "claude-opus-4-6",
+            model=current_user.llm_model or platform_config.get("llm_model", "claude-opus-4-8"),
             max_tokens=1500,
             system=("You are a proposal editor. Return ONLY the rewritten passage in "
                     "Markdown — no preamble, no explanation, no code fences."),
@@ -3934,7 +4120,7 @@ def view_version(proposal_id, version_id):
     if not version or version.proposal_id != proposal_id:
         abort(404)
 
-    proposal_html = md.markdown(version.markdown_content, extensions=["tables", "fenced_code"])
+    proposal_html = htmlsafe.sanitize(md.markdown(version.markdown_content, extensions=["tables", "fenced_code"]))
 
     return render_template(
         "proposal_version.html",
@@ -4139,11 +4325,12 @@ def _can_view_proposal(proposal: Proposal) -> bool:
     project = db.session.get(Project, proposal.project_id)
     if not project:
         return False
-    if (
-        project.user_id == current_user.id
-        or project.assigned_to == current_user.id
-        or current_user.is_admin
-    ):
+    if project.user_id == current_user.id or project.assigned_to == current_user.id:
+        return True
+    # Admins can view — but only within their OWN organization. `is_admin` is a
+    # tenant admin, not a platform super-admin, so it must be org-scoped or any
+    # workspace owner could read every other tenant's proposals.
+    if current_user.is_admin and _same_org(project.org_id or _owner_org_id(project)):
         return True
     # Assigned reviewer?
     reviewer = ProposalReviewer.query.filter_by(
@@ -4160,11 +4347,10 @@ def _is_proposal_owner(proposal: Proposal) -> bool:
     project = db.session.get(Project, proposal.project_id)
     if not project:
         return False
-    return (
-        project.user_id == current_user.id
-        or project.assigned_to == current_user.id
-        or current_user.is_admin
-    )
+    if project.user_id == current_user.id or project.assigned_to == current_user.id:
+        return True
+    # Org-scoped admin only — never a cross-tenant super-admin (see _can_view_proposal).
+    return bool(current_user.is_admin and _same_org(project.org_id or _owner_org_id(project)))
 
 
 def _source_for_review_role(review_role: str) -> str:
@@ -4243,7 +4429,9 @@ def send_for_review(proposal_id):
         if not uid:
             continue
         user = db.session.get(User, uid)
-        if not user:
+        # Only assign reviewers from the same org (a foreign reviewer would gain
+        # access to this proposal via the reviewer branch of _can_view_proposal).
+        if not user or not _same_org(user):
             continue
         role = roles[idx] if idx < len(roles) else "other"
         if role not in {r[0] for r in REVIEW_ROLE_OPTIONS}:
@@ -4312,7 +4500,7 @@ def proposal_review_page(proposal_id):
     version = latest_version(proposal_id)
     md_path = GENERATED_DIR / proposal.md_file
     proposal_md = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
-    proposal_html = md.markdown(proposal_md, extensions=["tables", "fenced_code"])
+    proposal_html = htmlsafe.sanitize(md.markdown(proposal_md, extensions=["tables", "fenced_code"]))
 
     # My pending/existing revision requests on this proposal
     my_requests = RevisionRequest.query.filter_by(
@@ -4878,9 +5066,11 @@ def customer_portal(token):
     version = latest_version(proposal.id)
     md_text = version.markdown_content if version else ""
     # Strip internal-only markers from the customer-facing view
-    md_text = re.sub(r"\[ACTION REQUIRED:.*?\]", "", md_text)
-    md_text = re.sub(r"\[ASSUMED:.*?\]", "", md_text)
-    proposal_html = md.markdown(md_text, extensions=["tables", "fenced_code"])
+    # DOTALL/IGNORECASE so multi-line internal markers are also stripped and can't
+    # leak onto the public customer portal.
+    md_text = re.sub(r"\[ACTION REQUIRED:.*?\]", "", md_text, flags=re.DOTALL | re.IGNORECASE)
+    md_text = re.sub(r"\[ASSUMED:.*?\]", "", md_text, flags=re.DOTALL | re.IGNORECASE)
+    proposal_html = htmlsafe.sanitize(md.markdown(md_text, extensions=["tables", "fenced_code"]))
 
     company_name = (owner.company_name if owner else "") or ""
     logo_url = url_for("portal_logo", token=token) if (
@@ -5516,15 +5706,29 @@ def update_integrations():
     """Save the org's Slack incoming webhook and generic outbound webhook URLs."""
     if not current_user.is_admin or not current_user.org_id:
         abort(403)
+    import integrations
     org = db.session.get(Organization, current_user.org_id)
     slack = request.form.get("slack_webhook_url", "").strip()
     webhook = request.form.get("outbound_webhook_url", "").strip()
-    # Basic sanity: only accept https URLs (or empty to clear)
-    org.slack_webhook_url = slack if (slack.startswith("https://") or not slack) else org.slack_webhook_url
-    org.outbound_webhook_url = webhook if (webhook.startswith("https://") or not webhook) else org.outbound_webhook_url
+    # Validate against SSRF: must be a public host (no internal/metadata targets),
+    # Slack pinned to slack.com. Empty clears the value; an invalid URL is rejected.
+    errors = []
+    if not slack:
+        org.slack_webhook_url = ""
+    elif integrations.is_safe_webhook_url(slack, require_https=True, host_suffix="slack.com"):
+        org.slack_webhook_url = slack
+    else:
+        errors.append("Slack webhook must be a valid https://hooks.slack.com URL.")
+    if not webhook:
+        org.outbound_webhook_url = ""
+    elif integrations.is_safe_webhook_url(webhook):
+        org.outbound_webhook_url = webhook
+    else:
+        errors.append("Outbound webhook must be a valid public http(s) URL.")
     db.session.commit()
     _log_activity("integrations_update", "Updated integrations")
-    flash("Integrations saved.", "success")
+    flash("Integrations saved." if not errors else " ".join(errors),
+          "success" if not errors else "error")
     return redirect(url_for("admin_panel") + "#integrations")
 
 
@@ -5666,9 +5870,15 @@ def billing_checkout(plan_key):
     org = db.session.get(Organization, current_user.org_id)
 
     if not billing.stripe_enabled():
-        # No Stripe configured — switch plan directly (self-hosted / trial mode)
+        # No Stripe configured. Direct plan switching is only for self-hosted
+        # single-tenant installs (SELF_HOSTED=true). In hosted/SaaS mode a
+        # missing Stripe key must NOT let an admin self-upgrade to a paid plan
+        # for free — allow only downgrades to the free plan.
+        if not SELF_HOSTED and plan_key != "free":
+            flash("Online payments aren't available right now. Please try again later.", "error")
+            return redirect(url_for("billing_page"))
         org.plan = plan_key
-        org.billing_status = "active"
+        org.billing_status = "active" if plan_key != "free" else ""
         db.session.commit()
         _log_activity("plan_change", f"Switched to {plan_key} plan (no Stripe)")
         flash(f"Plan changed to {billing.PLANS[plan_key]['name']}.", "success")
@@ -5676,8 +5886,8 @@ def billing_checkout(plan_key):
 
     try:
         import stripe
-        stripe.api_key = billing.STRIPE_SECRET_KEY
-        price_id = billing.PLANS[plan_key]["price_id"]
+        stripe.api_key = billing.stripe_secret_key()
+        price_id = billing.stripe_price_id(plan_key)
         if not price_id:
             flash("This plan is not configured for checkout.", "error")
             return redirect(url_for("billing_page"))
@@ -5707,7 +5917,7 @@ def billing_portal():
         return redirect(url_for("billing_page"))
     try:
         import stripe
-        stripe.api_key = billing.STRIPE_SECRET_KEY
+        stripe.api_key = billing.stripe_secret_key()
         session = stripe.billing_portal.Session.create(
             customer=org.stripe_customer_id,
             return_url=url_for("billing_page", _external=True),
@@ -5726,13 +5936,24 @@ def billing_webhook():
     import stripe
     payload = request.get_data()
     sig = request.headers.get("Stripe-Signature", "")
+    # Never trust an unsigned event. Without the webhook secret an attacker could
+    # POST a forged checkout.session.completed to upgrade any org for free, so we
+    # refuse to process webhooks at all until the secret is configured.
+    webhook_secret = billing.stripe_webhook_secret()
+    if not webhook_secret:
+        app.logger.error(
+            "Stripe webhook received but STRIPE_WEBHOOK_SECRET is not set; refusing to process."
+        )
+        return {"ok": False, "error": "webhook signature secret not configured"}, 503
     try:
-        if billing.STRIPE_WEBHOOK_SECRET:
-            event = stripe.Webhook.construct_event(payload, sig, billing.STRIPE_WEBHOOK_SECRET)
-        else:
-            event = json.loads(payload)
+        event = stripe.Webhook.construct_event(payload, sig, webhook_secret)
     except Exception:
         return {"ok": False}, 400
+
+    # Idempotency / replay guard: skip an event we've already processed.
+    event_id = event.get("id")
+    if event_id and db.session.get(ProcessedWebhookEvent, event_id):
+        return {"ok": True, "duplicate": True}
 
     etype = event.get("type", "")
     obj = event.get("data", {}).get("object", {})
@@ -5755,6 +5976,14 @@ def billing_webhook():
             if etype == "customer.subscription.deleted" or status in ("canceled", "unpaid"):
                 org.plan = "free"
             db.session.commit()
+
+    # Record the event as processed (best-effort) so replays are ignored.
+    if event_id:
+        db.session.add(ProcessedWebhookEvent(id=event_id))
+        try:
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
 
     return {"ok": True}
 
@@ -5799,7 +6028,8 @@ def delete_company_template(template_id):
         abort(403)
 
     tmpl = db.session.get(UserVerticalTemplate, template_id)
-    if not tmpl or not tmpl.is_company_default:
+    # Scope to the caller's org — an admin must not delete another tenant's template.
+    if not tmpl or not tmpl.is_company_default or not _same_org(tmpl):
         abort(404)
 
     db.session.delete(tmpl)
@@ -5818,7 +6048,9 @@ def toggle_admin(user_id):
         flash("You cannot change your own role.", "error")
         return redirect(url_for("admin_panel"))
     user = db.session.get(User, user_id)
-    if not user:
+    # Scope to the caller's own organization — is_admin is a tenant admin, so an
+    # admin must not be able to flip roles of users in another org.
+    if not user or not _same_org(user):
         abort(404)
     user.is_admin = not user.is_admin
     user.role = "admin" if user.is_admin else "proposal"
@@ -5838,7 +6070,8 @@ def update_user_role(user_id):
         return redirect(url_for("admin_panel"))
 
     user = db.session.get(User, user_id)
-    if not user:
+    # Scope to the caller's own organization (see toggle_admin).
+    if not user or not _same_org(user):
         abort(404)
 
     new_role = request.form.get("role", "").strip().lower()
@@ -6213,7 +6446,9 @@ def assign_project(project_id):
     assignee_id = request.form.get("assigned_to", "").strip()
     if assignee_id:
         assignee = db.session.get(User, assignee_id)
-        if not assignee:
+        # The assignee must be a member of this org — assigning a foreign-org
+        # user would grant them standing access to this project.
+        if not assignee or not _same_org(assignee):
             flash("User not found.", "error")
             return redirect(request.referrer or url_for("dashboard"))
         project.assigned_to = assignee_id
@@ -6644,6 +6879,12 @@ def delete_proposal_comment(proposal_id, comment_id):
     """Delete a comment (author or admin only)."""
     comment = db.session.get(ProposalComment, comment_id)
     if not comment or comment.proposal_id != proposal_id:
+        abort(404)
+    # Enforce tenant isolation first: the caller must be able to access the
+    # parent proposal's project (org-scoped) before any author/admin check.
+    proposal = db.session.get(Proposal, proposal_id)
+    project = db.session.get(Project, proposal.project_id) if proposal else None
+    if not _can_access_project(project):
         abort(404)
     if comment.author_id != current_user.id and not current_user.is_admin:
         abort(403)
@@ -7483,26 +7724,40 @@ def chat_help():
     if not message:
         return {"reply": "Please type a question and I'll do my best to help!"}
 
+    def _record(reply, answered_by):
+        # Store the Q&A for platform-owner analytics (best-effort).
+        try:
+            db.session.add(ChatbotMessage(
+                user_id=getattr(current_user, "id", None),
+                org_id=getattr(current_user, "org_id", None),
+                message=message[:4000], reply=(reply or "")[:4000], answered_by=answered_by))
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+
+    import platform_config
     api_key = decrypt_api_key(current_user.api_key_encrypted) or None
-    from config.settings import ANTHROPIC_API_KEY as _GLOBAL_KEY
-    effective_key = api_key or _GLOBAL_KEY
+    effective_key = api_key or platform_config.get("anthropic_api_key")
     if effective_key:
         try:
             import anthropic
             client = anthropic.Anthropic(api_key=effective_key, timeout=30, max_retries=1)
             resp = client.messages.create(
-                model=current_user.llm_model or "claude-opus-4-6",
+                model=current_user.llm_model or platform_config.get("llm_model", "claude-opus-4-8"),
                 max_tokens=400,
                 system=_HELP_KB,
                 messages=[{"role": "user", "content": message[:2000]}],
             )
             text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text").strip()
             if text:
+                _record(text, "ai")
                 return {"reply": text}
         except Exception:
             pass  # fall through to keyword help
 
-    return {"reply": _fallback_help(message.lower())}
+    reply = _fallback_help(message.lower())
+    _record(reply, "fallback")
+    return {"reply": reply}
 
 
 # ---------------------------------------------------------------------------

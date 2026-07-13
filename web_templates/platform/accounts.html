@@ -1,0 +1,35 @@
+{% extends "platform/base.html" %}
+{% block body %}
+<h1 class="page">Accounts</h1>
+<p class="page-sub">Every tenant organization. Read-only.</p>
+
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Organization</th><th>Plan</th><th>Status</th>
+        <th class="num">Seats</th><th class="num">Projects</th>
+        <th class="num">Generations</th><th class="num">AI Cost</th>
+        <th class="num">MRR</th><th>Created</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td>{{ r.org.name }}</td>
+        <td><span class="pill {{ r.org.plan or 'free' }}">{{ r.plan_name }}</span></td>
+        <td><span class="pill {{ r.org.billing_status or 'status-' }}">{{ r.org.billing_status or '—' }}</span></td>
+        <td class="num">{{ r.seats }}</td>
+        <td class="num">{{ r.projects }}</td>
+        <td class="num">{{ r.generations }}</td>
+        <td class="num">${{ '{:,.2f}'.format(r.ai_cost) }}</td>
+        <td class="num">${{ '{:,.0f}'.format(r.mrr) }}</td>
+        <td class="muted">{{ r.org.created_at.strftime('%Y-%m-%d') if r.org.created_at else '—' }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="9" class="empty">No organizations yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

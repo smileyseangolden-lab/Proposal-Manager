@@ -2,8 +2,9 @@ services:
   proposal-manager:
     build: .
     restart: unless-stopped
-    security_opt:
-      - apparmor:unconfined
+    # Note: the container runs as non-root (uid 10001, see Dockerfile). The
+    # bind-mounted host directories below must be writable by that uid, e.g.
+    #   sudo chown -R 10001:10001 uploads generated_proposals data
     # Use the host's network stack directly. This bypasses the Docker bridge
     # NAT/MASQUERADE pipeline entirely — outbound API calls (Anthropic, etc.)
     # go out exactly as they would from the host itself. Chosen because the
@@ -15,9 +16,11 @@ services:
     command: >
       gunicorn
       --bind 127.0.0.1:${HOST_PORT:-15010}
-      --workers 2
-      --timeout 900
-      --graceful-timeout 900
+      --worker-class gthread
+      --workers ${WEB_WORKERS:-2}
+      --threads ${WEB_THREADS:-8}
+      --timeout 600
+      --graceful-timeout 30
       --keep-alive 75
       app:app
     env_file:

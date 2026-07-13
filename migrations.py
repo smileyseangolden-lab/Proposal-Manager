@@ -10,15 +10,20 @@ Works on both SQLite (dev) and PostgreSQL (production). Strategy:
      is stamped onto their projects and posture rows.
 """
 
+import logging
+
 from sqlalchemy import inspect, text
 
 from models import Organization, Project, User, db
 
+logger = logging.getLogger(__name__)
+
 # Columns added after initial schema. ALTER TABLE ... ADD COLUMN with these
-# types is valid on both SQLite and PostgreSQL.
+# types must be valid on BOTH SQLite and PostgreSQL — booleans use the TRUE/FALSE
+# keywords because PostgreSQL rejects integer literals (0/1) for a boolean default.
 _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # Legacy (pre-Phase-1) migrations, preserved from the old SQLite-only block
-    ("project_documents", "is_reference", "BOOLEAN DEFAULT 0"),
+    ("project_documents", "is_reference", "BOOLEAN DEFAULT FALSE"),
     ("project_documents", "notes", "TEXT DEFAULT ''"),
     ("project_documents", "version_group", "VARCHAR(32) DEFAULT ''"),
     ("project_documents", "version_label", "VARCHAR(100) DEFAULT ''"),
@@ -31,9 +36,9 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("users", "role", "VARCHAR(20) DEFAULT 'proposal'"),
     ("users", "company_logo_path", "VARCHAR(1000) DEFAULT ''"),
     ("users", "company_logo_original_name", "VARCHAR(500) DEFAULT ''"),
-    ("users", "company_logo_use_in_proposals", "BOOLEAN DEFAULT 1"),
+    ("users", "company_logo_use_in_proposals", "BOOLEAN DEFAULT TRUE"),
     ("users", "company_logo_placement", "VARCHAR(20) DEFAULT 'top_left'"),
-    ("users", "company_logo_show_on_cover", "BOOLEAN DEFAULT 1"),
+    ("users", "company_logo_show_on_cover", "BOOLEAN DEFAULT TRUE"),
     ("proposals", "review_status", "VARCHAR(40) DEFAULT 'draft'"),
     ("proposals", "review_deadline", "TIMESTAMP"),
     ("projects", "clarification_sub_status", "VARCHAR(30) DEFAULT 'none'"),
@@ -50,12 +55,11 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("proposal_corrections", "org_id", "VARCHAR(32)"),
     ("revision_templates", "org_id", "VARCHAR(32)"),
     # Phase 2: auth hardening
-    ("users", "email_verified", "BOOLEAN DEFAULT 0"),
+    ("users", "email_verified", "BOOLEAN DEFAULT FALSE"),
     # Phase 3: customer send + ROM
     ("projects", "request_type", "VARCHAR(10) DEFAULT ''"),
     ("projects", "client_email", "VARCHAR(200) DEFAULT ''"),
     ("proposals", "pdf_file", "VARCHAR(500) DEFAULT ''"),
-    ("users", "email_verified", "BOOLEAN DEFAULT 0"),
     # Phase 5: billing
     ("organizations", "plan", "VARCHAR(30) DEFAULT 'free'"),
     ("organizations", "stripe_customer_id", "VARCHAR(100) DEFAULT ''"),
@@ -65,6 +69,31 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # Phase 6: integrations
     ("organizations", "slack_webhook_url", "VARCHAR(1000) DEFAULT ''"),
     ("organizations", "outbound_webhook_url", "VARCHAR(1000) DEFAULT ''"),
+    # Hardening: cross-worker login throttling
+    ("users", "failed_login_count", "INTEGER DEFAULT 0"),
+    ("users", "lockout_until", "TIMESTAMP"),
+    # Platform-admin dashboard
+    ("users", "platform_owner", "BOOLEAN DEFAULT FALSE"),
+]
+
+# Indexes on hot filter / foreign-key columns. CREATE INDEX IF NOT EXISTS is
+# valid on SQLite and PostgreSQL and idempotent, so this runs safely every boot.
+# (name, table, column)
+_INDEX_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("ix_projects_org_id", "projects", "org_id"),
+    ("ix_projects_user_id", "projects", "user_id"),
+    ("ix_projects_assigned_to", "projects", "assigned_to"),
+    ("ix_projects_status", "projects", "status"),
+    ("ix_users_org_id", "users", "org_id"),
+    ("ix_proposals_project_id", "proposals", "project_id"),
+    ("ix_project_documents_project_id", "project_documents", "project_id"),
+    ("ix_proposal_versions_proposal_id", "proposal_versions", "proposal_id"),
+    ("ix_clarification_items_project_id", "clarification_items", "project_id"),
+    ("ix_notifications_user_id", "notifications", "user_id"),
+    ("ix_activity_logs_user_id", "activity_logs", "user_id"),
+    ("ix_background_jobs_org_id", "background_jobs", "org_id"),
+    ("ix_background_jobs_status", "background_jobs", "status"),
+    ("ix_background_jobs_created_at", "background_jobs", "created_at"),
 ]
 
 # Tables that carry a per-user org_id needing backfill from the owning user.
@@ -100,9 +129,30 @@ def _add_missing_columns():
             cols_cache[table] = _existing_columns(table)
         if column in cols_cache[table]:
             continue
-        db.session.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"))
-        cols_cache[table].add(column)
-    db.session.commit()
+        # Each ALTER runs in its own transaction so a single failed/legacy
+        # migration can't abort the whole schema bootstrap and brick startup
+        # for a live paid database.
+        try:
+            db.session.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"))
+            db.session.commit()
+            cols_cache[table].add(column)
+        except Exception:
+            db.session.rollback()
+            logger.exception("Migration: failed to add column %s.%s", table, column)
+
+
+def _add_indexes():
+    inspector = inspect(db.engine)
+    tables = set(inspector.get_table_names())
+    for name, table, column in _INDEX_MIGRATIONS:
+        if table not in tables:
+            continue
+        try:
+            db.session.execute(text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({column})"))
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            logger.exception("Migration: failed to create index %s", name)
 
 
 def _backfill_organizations():
@@ -155,4 +205,5 @@ def ensure_schema():
             raise
         db.session.rollback()
     _add_missing_columns()
+    _add_indexes()
     _backfill_organizations()

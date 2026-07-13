@@ -1,0 +1,32 @@
+{% extends "platform/base.html" %}
+{% block body %}
+<h1 class="page">Chatbot</h1>
+<p class="page-sub">Every help-assistant question users asked — analyze demand and address feedback.</p>
+
+<div class="grid kpis">
+  <div class="card kpi"><div class="label">Total Questions</div><div class="num c-blue">{{ '{:,}'.format(total) }}</div></div>
+  <div class="card kpi"><div class="label">AI-answered</div><div class="num c-green">{{ '{:,}'.format(ai) }}</div></div>
+  <div class="card kpi"><div class="label">Fallback (unmet)</div><div class="num c-amber">{{ '{:,}'.format(fallback) }}</div></div>
+</div>
+
+<div class="section-title">Recent questions</div>
+{% if rows %}
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>When</th><th>Org</th><th>Question</th><th>Answered by</th></tr></thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td class="muted" style="white-space:nowrap">{{ r.msg.created_at.strftime('%m-%d %H:%M') if r.msg.created_at else '—' }}</td>
+        <td class="muted">{{ r.org }}</td>
+        <td style="white-space:normal;max-width:640px">{{ r.msg.message }}</td>
+        <td><span class="pill {{ 'active' if r.msg.answered_by=='ai' else 'past_due' }}">{{ r.msg.answered_by }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<div class="card empty">No chatbot questions recorded yet.</div>
+{% endif %}
+{% endblock %}

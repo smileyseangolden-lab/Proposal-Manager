@@ -1,0 +1,74 @@
+{% extends "platform/base.html" %}
+{% block body %}
+<style>
+  .form-card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px 22px;box-shadow:var(--shadow);margin-bottom:15px}
+  .form-card h3{margin:0 0 4px;font-size:1.05rem}
+  .form-card .hint{color:var(--ink-3);font-size:.82rem;margin:0 0 16px}
+  .fld{margin-bottom:13px}
+  .fld label{display:block;font-size:.76rem;font-weight:700;color:var(--ink-2);text-transform:uppercase;letter-spacing:.04em;margin-bottom:5px}
+  .fld input,.fld select{width:100%;padding:9px 12px;border-radius:9px;border:1px solid var(--line);background:#0e1424;color:var(--ink);font-size:.92rem;font-family:var(--sans)}
+  .fld input:focus,.fld select:focus{outline:2px solid var(--amber);border-color:var(--amber)}
+  .fld .set{font-family:var(--mono);font-size:.7rem;color:var(--green);margin-left:8px}
+  .fld .unset{font-family:var(--mono);font-size:.7rem;color:var(--ink-3);margin-left:8px}
+  .btn{background:var(--amber);color:#1a1205;border:0;border-radius:9px;padding:10px 18px;font-weight:800;font-size:.9rem;cursor:pointer;font-family:var(--sans)}
+  .btn:hover{filter:brightness(1.05)}
+  .btn.ghost{background:none;border:1px solid var(--line);color:var(--ink-2);font-weight:700}
+  .btn.ghost:hover{border-color:var(--amber);color:var(--ink)}
+  .inline{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+  .inline .fld{margin-bottom:0;flex:1;min-width:180px}
+</style>
+
+<h1 class="page">Controls</h1>
+<p class="page-sub">Manage platform configuration. Secret values are stored encrypted and never displayed. Every change is recorded in the Audit tab.</p>
+
+{% for g in groups %}
+<form class="form-card" method="POST" action="{{ url_for('platform_admin.controls_settings') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <input type="hidden" name="group" value="{{ g.id }}">
+  <h3>{{ g.title }}</h3>
+  <p class="hint">A value entered here overrides the environment variable. For secrets, leave blank to keep the current value.</p>
+  {% for f in g.fields %}
+  <div class="fld">
+    <label>{{ f.label }}
+      {% if f.secret %}{% if f.is_set %}<span class="set">•••• configured</span>{% else %}<span class="unset">not set</span>{% endif %}{% endif %}
+    </label>
+    {% if f.secret %}
+      <input type="password" name="{{ f.key }}" autocomplete="new-password" placeholder="{{ '•••• leave blank to keep' if f.is_set else 'not set' }}">
+    {% else %}
+      <input type="text" name="{{ f.key }}" value="{{ f.value }}">
+    {% endif %}
+  </div>
+  {% endfor %}
+  <button class="btn" type="submit">Save {{ g.title }}</button>
+</form>
+{% endfor %}
+
+<div class="section-title">Platform owners</div>
+<form class="form-card" method="POST" action="{{ url_for('platform_admin.controls_owner') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <p class="hint" style="margin-top:0">
+    {% if owners %}Current owners (DB flag): {% for o in owners %}<b>{{ o.email }}</b>{{ ", " if not loop.last }}{% endfor %}.{% else %}No owners set via the DB flag yet — access is via the email allowlist.{% endif %}
+  </p>
+  <div class="inline">
+    <div class="fld"><label>User email</label><input type="text" name="email" placeholder="person@company.com"></div>
+    <div class="fld" style="flex:0 0 auto;min-width:140px"><label>Action</label>
+      <select name="action"><option value="grant">Grant owner</option><option value="revoke">Revoke owner</option></select></div>
+    <button class="btn" type="submit">Apply</button>
+  </div>
+</form>
+
+<div class="section-title">Override an organization's plan</div>
+<form class="form-card" method="POST" action="{{ url_for('platform_admin.controls_plan') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <p class="hint" style="margin-top:0">Directly set a tenant's plan (e.g. comp an account or fix a billing issue). Recorded in Audit.</p>
+  <div class="inline">
+    <div class="fld"><label>Organization</label>
+      <select name="org_id">
+        {% for o in orgs %}<option value="{{ o.id }}">{{ o.name }} — {{ (o.plan or 'free') }}</option>{% endfor %}
+      </select></div>
+    <div class="fld" style="flex:0 0 auto;min-width:160px"><label>New plan</label>
+      <select name="plan">{% for k, p in plans.items() %}<option value="{{ k }}">{{ p.name }}</option>{% endfor %}</select></div>
+    <button class="btn" type="submit">Set plan</button>
+  </div>
+</form>
+{% endblock %}
