@@ -8,6 +8,18 @@
     <p class="page-subtitle">{{ org.name if org else 'Workspace' }} — you're on the <strong>{{ current_plan.name }}</strong> plan.</p>
 </section>
 
+{% if trial_active %}
+<div class="flash flash-info">
+    <strong>Pro trial active — {{ trial_days }} day{{ 's' if trial_days != 1 }} left.</strong>
+    You have Pro limits ({{ plans['pro'].limits.generations_per_month }} AI proposals/mo,
+    {{ plans['pro'].limits.seats }} seats) until
+    {{ trial_ends.strftime('%B %d, %Y') if trial_ends else 'the trial ends' }},
+    then your workspace returns to Free limits. Upgrade below to keep them.
+</div>
+{% elif current_plan_key == 'free' and org and org.trial_ends_at %}
+<div class="flash flash-info">Your Pro trial has ended — you're on Free limits. Upgrade below to restore Pro capacity.</div>
+{% endif %}
+
 {% if not stripe_enabled %}
 <div class="flash flash-info">Payments aren't configured on this deployment, so plan changes apply immediately without checkout.</div>
 {% endif %}

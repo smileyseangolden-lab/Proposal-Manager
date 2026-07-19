@@ -134,7 +134,7 @@
 <!-- Documents Table -->
 {% if documents %}
 <div class="card">
-    <h2>Documents ({{ documents | length }})</h2>
+    <h2>Documents ({{ filtered_count if filtered_count is defined else documents | length }})</h2>
     <div class="doc-table-wrap">
         <table class="doc-table">
             <thead>
@@ -214,6 +214,10 @@
             </tbody>
         </table>
     </div>
+    {% set pg_args = {'q': q, 'type': filter_type, 'project': filter_project,
+                      'tag': filter_tag, 'status': filter_status,
+                      'sort': sort_by, 'reference': show_reference} %}
+    {% include "_pagination.html" %}
 </div>
 {% else %}
 <div class="empty-state">
@@ -260,7 +264,7 @@
                     <span>{{ prop.confidence_score }}%</span>
                 </div>
             </td>
-            <td class="doc-date">{{ prop.generated_at.strftime('%Y-%m-%d %H:%M') if prop.generated_at else 'N/A' }}</td>
+            <td class="doc-date">{% if prop.generated_at %}{{ prop.generated_at | localtime('full') }}{% else %}N/A{% endif %}</td>
             <td>
                 <div class="doc-actions">
                     <a href="{{ url_for('view_proposal', proposal_id=prop.id) }}" class="btn btn-small btn-primary">View</a>

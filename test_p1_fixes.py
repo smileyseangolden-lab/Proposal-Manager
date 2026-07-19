@@ -146,7 +146,9 @@ with app.app_context():
     # (Re-login: the interleaved c2 requests poisoned the shared-context user
     # cache — same reason _fresh_request_state exists.)
     login(c, 'ana')
-    org.plan = 'free'; db.session.commit()  # ana + zed already fill 2 free seats
+    # ana + zed already fill 2 free seats; end the signup trial so FREE limits
+    # (not trial-Pro limits) apply to the seat check.
+    org.plan = 'free'; org.trial_ends_at = None; db.session.commit()
     c.post(f'/admin/reactivate-user/{bob.id}')
     db.session.refresh(bob)
     test("reactivation blocked at seat limit", bob.is_active is False)

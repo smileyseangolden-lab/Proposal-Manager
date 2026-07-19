@@ -43,6 +43,14 @@
                 </div>
             </div>
 
+            <input type="hidden" name="base_version" value="{{ base_version }}">
+
+            <div id="draft-restore-bar" style="display:none; padding:8px 12px; margin-bottom:8px; background: var(--gold-bg); border: 1px solid var(--gold-line); border-radius: 8px; font-size: 13px; align-items:center; gap:10px;">
+                <span>&#128190; An unsaved local draft from <strong id="draft-restore-when"></strong> was found.</span>
+                <button type="button" class="btn btn-small btn-primary" id="draft-restore-btn">Restore draft</button>
+                <button type="button" class="btn btn-small btn-secondary" id="draft-discard-btn">Discard</button>
+            </div>
+
             <div id="editor-container">
                 <textarea name="markdown_content" id="markdown-editor" spellcheck="true">{{ current_content }}</textarea>
             </div>
@@ -74,7 +82,7 @@
                     </span>
                 </div>
                 <p class="version-summary">{{ v.change_summary or 'No description' }}</p>
-                <p class="version-date">{{ v.created_at.strftime('%Y-%m-%d %H:%M') }}</p>
+                <p class="version-date">{{ v.created_at | localtime('full') }}</p>
                 {% if v.editor %}
                 <p class="version-editor">by {{ v.editor.display_name or v.editor.username }}</p>
                 {% endif %}
@@ -144,8 +152,29 @@
     editor.addEventListener("input", autoResize);
     autoResize();
 
-    // Track unsaved changes
+    // Track unsaved changes + autosave a local draft so navigation, crashes,
+    // or session expiry never lose work.
     var originalContent = editor.value;
+    var draftKey = "pm-editor-draft-{{ proposal.id }}";
+    var draftTimer = null;
+
+    function saveDraft() {
+        if (!window.localStorage) return;
+        try {
+            if (editor.value === originalContent) {
+                localStorage.removeItem(draftKey);
+                return;
+            }
+            localStorage.setItem(draftKey, JSON.stringify({
+                content: editor.value,
+                savedAt: new Date().toISOString()
+            }));
+            var t = new Date().toLocaleTimeString(undefined, {hour: "2-digit", minute: "2-digit"});
+            status.textContent = "Unsaved changes — draft kept locally at " + t;
+            status.style.color = "#d97706";
+        } catch (e) { /* storage full/unavailable — degrade silently */ }
+    }
+
     editor.addEventListener("input", function() {
         if (editor.value !== originalContent) {
             status.textContent = "Unsaved changes";
@@ -154,11 +183,42 @@
             status.textContent = "Ready";
             status.style.color = "";
         }
+        clearTimeout(draftTimer);
+        draftTimer = setTimeout(saveDraft, 800);
     });
+
+    // Offer to restore a leftover draft (only when it differs from the server copy)
+    (function(){
+        if (!window.localStorage) return;
+        var raw = null;
+        try { raw = localStorage.getItem(draftKey); } catch (e) { return; }
+        if (!raw) return;
+        var draft;
+        try { draft = JSON.parse(raw); } catch (e) { localStorage.removeItem(draftKey); return; }
+        if (!draft || !draft.content || draft.content === editor.value) {
+            localStorage.removeItem(draftKey);
+            return;
+        }
+        var bar = document.getElementById("draft-restore-bar");
+        var when = document.getElementById("draft-restore-when");
+        when.textContent = draft.savedAt ? new Date(draft.savedAt).toLocaleString() : "earlier";
+        bar.style.display = "flex";
+        document.getElementById("draft-restore-btn").addEventListener("click", function(){
+            editor.value = draft.content;
+            editor.dispatchEvent(new Event("input"));
+            bar.style.display = "none";
+        });
+        document.getElementById("draft-discard-btn").addEventListener("click", function(){
+            try { localStorage.removeItem(draftKey); } catch (e) {}
+            bar.style.display = "none";
+        });
+    })();
 
     form.addEventListener("submit", function() {
         status.textContent = "Saving...";
         originalContent = editor.value;
+        clearTimeout(draftTimer);
+        try { if (window.localStorage) localStorage.removeItem(draftKey); } catch (e) {}
     });
 
     // Preview toggle

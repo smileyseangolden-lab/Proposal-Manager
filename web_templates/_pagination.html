@@ -1,0 +1,13 @@
+{# Pagination nav. Expects: page, total_pages, and pg_args (dict of extra query
+   params to preserve). Renders nothing when there's a single page. #}
+{% if total_pages and total_pages > 1 %}
+<nav class="pagination" aria-label="Pagination">
+    {% if page > 1 %}
+    <a class="btn btn-small btn-secondary" href="{{ url_for(request.endpoint, page=page-1, **pg_args) }}">&larr; Previous</a>
+    {% endif %}
+    <span class="pagination-status">Page {{ page }} of {{ total_pages }}</span>
+    {% if page < total_pages %}
+    <a class="btn btn-small btn-secondary" href="{{ url_for(request.endpoint, page=page+1, **pg_args) }}">Next &rarr;</a>
+    {% endif %}
+</nav>
+{% endif %}

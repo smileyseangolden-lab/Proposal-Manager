@@ -113,12 +113,42 @@ def plan_for(org) -> dict:
     return PLANS.get((org.plan if org else "free") or "free", PLANS["free"])
 
 
+def trial_active(org) -> bool:
+    """True while a free-plan org's signup trial window is still open.
+    trial_ends_at is stamped at workspace creation (14 days); orgs that
+    predate trials (NULL) and paid orgs never count as trialing."""
+    if not org or not getattr(org, "trial_ends_at", None):
+        return False
+    if (org.plan or "free") != "free":
+        return False
+    end = org.trial_ends_at
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    return end > datetime.now(timezone.utc)
+
+
+def trial_days_left(org) -> int:
+    """Whole days remaining in the trial (0 when inactive/expired)."""
+    if not trial_active(org):
+        return 0
+    end = org.trial_ends_at
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    return max(int((end - datetime.now(timezone.utc)).total_seconds() // 86400), 0)
+
+
 def effective_plan(org) -> dict:
-    """The plan whose LIMITS currently apply. A paid org that is delinquent
-    (past_due / unpaid) is soft-locked to free-tier limits until its payment
-    recovers; plan_for() still reports the nominal plan for the billing page."""
+    """The plan whose LIMITS currently apply.
+
+    - A paid org that is delinquent (past_due / unpaid) is soft-locked to
+      free-tier limits until its payment recovers.
+    - A free org inside its 14-day signup trial gets PRO limits — the trial
+      field was previously stamped but never enforced anywhere.
+    plan_for() still reports the nominal plan for the billing page."""
     if org and (getattr(org, "billing_status", "") or "") in _DELINQUENT_STATUSES:
         return PLANS["free"]
+    if trial_active(org):
+        return PLANS["pro"]
     return plan_for(org)
 
 

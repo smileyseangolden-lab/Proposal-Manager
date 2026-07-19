@@ -3074,3 +3074,61 @@ body {
 .ai-assist-group { display: inline-flex; align-items: center; gap: 4px; }
 .ai-assist-label { font-size: 12px; color: var(--sea-800, #0f6b6b); font-weight: 600; }
 .sample-banner { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; background: var(--sea-50, #f0f7f7); border-left: 3px solid var(--sea-800, #0f6b6b); }
+
+/* ============================================================
+   P2 Accessibility & pagination
+   ============================================================ */
+
+/* Keyboard focus: a clearly visible ring wherever focus lands. Overrides the
+   scattered `outline: none` on inputs (their border/box-shadow focus styles
+   remain for mouse focus; keyboard users always get the ring). */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+summary:focus-visible,
+[tabindex]:focus-visible {
+    outline: 2px solid var(--sea-500) !important;
+    outline-offset: 2px;
+}
+
+/* Skip link — first tab stop; visible only when focused */
+.skip-link {
+    position: absolute;
+    left: -9999px;
+    top: 0;
+    z-index: 2000;
+    padding: 10px 16px;
+    background: var(--sea-800);
+    color: #fff;
+    border-radius: 0 0 8px 0;
+    font-weight: 600;
+    text-decoration: none;
+}
+.skip-link:focus {
+    left: 0;
+}
+
+/* Honor reduced-motion preferences: stop spinners/transitions from animating */
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+}
+
+/* Pagination nav (proposals table, document library) */
+.pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    margin-top: 14px;
+}
+.pagination-status {
+    font-size: 13px;
+    color: var(--ink-500);
+}

@@ -240,6 +240,28 @@ LOGO_MAX_PIXELS = 40_000_000  # 40 MP — far larger than any real logo
 Image.MAX_IMAGE_PIXELS = LOGO_MAX_PIXELS
 
 
+@app.template_filter("localtime")
+def localtime_filter(dt, style="dt"):
+    """Render a stored-UTC datetime as a <time> element that base.html's
+    localizer converts to the VIEWER'S timezone. Falls back to a UTC-labeled
+    string when JS is unavailable. Styles: 'dt' (Jan 5, 14:32),
+    'date' (Jan 5, 2026), 'full' (Jan 5, 2026, 14:32)."""
+    from markupsafe import Markup, escape
+    if not dt:
+        return ""
+    aware = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    iso = aware.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if style == "date":
+        fallback = aware.strftime("%b %d, %Y")
+    elif style == "full":
+        fallback = aware.strftime("%b %d, %Y %H:%M UTC")
+    else:
+        fallback = aware.strftime("%b %d, %H:%M UTC")
+    return Markup(
+        f'<time datetime="{iso}" data-utc="{iso}" data-style="{escape(style)}">{escape(fallback)}</time>'
+    )
+
+
 @app.context_processor
 def inject_branding():
     return dict(
@@ -710,6 +732,7 @@ def inject_nav_context():
         setup_progress=_setup_progress(current_user),
         nav_active_projects=active_count,
         nav_org_name=(nav_org.name if nav_org else "") or "",
+        nav_trial_days=billing.trial_days_left(nav_org) if nav_org else 0,
     )
 
 
@@ -1295,21 +1318,40 @@ def _inline_redline_markdown(old_md: str, new_md: str) -> str:
 # Dashboard
 # ---------------------------------------------------------------------------
 
-def _project_focus_entry(p, now_naive):
+def _focus_context(active_projects) -> dict:
+    """Bulk-load everything _project_focus_entry needs for the dashboard focus
+    list in a fixed number of queries (previously 4+ queries per project)."""
+    ids = [p.id for p in active_projects]
+    latest = _latest_proposals_for(ids)
+    latest_ids = [prop.id for prop in latest.values()]
+    return {
+        "latest": latest,
+        "docs": _counts_by(
+            ProjectDocument.project_id, ProjectDocument.id,
+            ProjectDocument.project_id.in_(ids)) if ids else {},
+        "pending_q": _counts_by(
+            ProposalQuestion.project_id, ProposalQuestion.id,
+            ProposalQuestion.project_id.in_(ids),
+            ProposalQuestion.status == "pending") if ids else {},
+        "scopes": {s.project_id: s for s in ProjectScope.query.filter(
+            ProjectScope.project_id.in_(ids)).all()} if ids else {},
+        "pending_req": _counts_by(
+            RevisionRequest.proposal_id, RevisionRequest.id,
+            RevisionRequest.proposal_id.in_(latest_ids),
+            RevisionRequest.status == "pending") if latest_ids else {},
+    }
+
+
+def _project_focus_entry(p, now_naive, ctx):
     """Build a 'pick up where you left off' entry for an active project.
 
     Determines the single next action based on the latest proposal's
-    lifecycle state (or the pre-generation state of the project).
+    lifecycle state (or the pre-generation state of the project). All lookups
+    come from the prefetched `ctx` (see _focus_context) — no per-row queries.
     """
-    latest_prop = (
-        Proposal.query.filter_by(project_id=p.id)
-        .order_by(Proposal.generated_at.desc())
-        .first()
-    )
-    doc_count = ProjectDocument.query.filter_by(project_id=p.id).count()
-    pending_questions = ProposalQuestion.query.filter_by(
-        project_id=p.id, status="pending"
-    ).count()
+    latest_prop = ctx["latest"].get(p.id)
+    doc_count = ctx["docs"].get(p.id, 0)
+    pending_questions = ctx["pending_q"].get(p.id, 0)
 
     action_label = "Open"
     action_url = url_for("project_upload", project_id=p.id)
@@ -1322,7 +1364,7 @@ def _project_focus_entry(p, now_naive):
         chip = ("Your move", "chip-gold")
         sub = f"{pending_questions} clarification question(s) awaiting answers"
     elif latest_prop is None:
-        scope = ProjectScope.query.filter_by(project_id=p.id).first()
+        scope = ctx["scopes"].get(p.id)
         if doc_count == 0:
             action_label = "Upload documents"
             chip = ("Needs documents", "chip-neutral")
@@ -1342,9 +1384,7 @@ def _project_focus_entry(p, now_naive):
             sub = "Scope approved · awaiting AI draft"
     else:
         rs = latest_prop.review_status or "draft"
-        pending_req = RevisionRequest.query.filter_by(
-            proposal_id=latest_prop.id, status="pending"
-        ).count()
+        pending_req = ctx["pending_req"].get(latest_prop.id, 0)
         if rs == "draft":
             action_label = "Send for review"
             action_url = url_for("view_proposal", proposal_id=latest_prop.id)
@@ -1526,16 +1566,16 @@ def dashboard():
             ).scalar() or 0
             pipeline_by_status[status] = {"count": cnt, "value": val}
 
+    # Bulk context for the focus list + role widgets (fixed query count)
+    focus_ctx = _focus_context(active_projects)
+
     # Proposal-focused extras: docs needing proposals, recent generations
     pending_docs_projects = []
     recent_proposals = []
     if user_role == "proposal":
-        # Projects with docs but no proposals
-        my_projects = Project.query.filter(my_project_filter, Project.status == "active").all()
-        for p in my_projects:
-            doc_count = ProjectDocument.query.filter_by(project_id=p.id).count()
-            prop_count = Proposal.query.filter_by(project_id=p.id).count()
-            if doc_count > 0 and prop_count == 0:
+        for p in active_projects:
+            doc_count = focus_ctx["docs"].get(p.id, 0)
+            if doc_count > 0 and p.id not in focus_ctx["latest"]:
                 pending_docs_projects.append({"project": p, "doc_count": doc_count})
         recent_proposals = Proposal.query.join(Project).filter(
             my_project_filter
@@ -1667,7 +1707,7 @@ def dashboard():
         })
 
     for p in active_projects:
-        entry = _project_focus_entry(p, now_naive)
+        entry = _project_focus_entry(p, now_naive, focus_ctx)
         if entry:
             focus_items.append(entry)
 
@@ -1743,8 +1783,29 @@ PROPOSAL_FILTERS = [
 ]
 
 
+def _latest_proposals_for(project_ids) -> dict:
+    """{project_id: newest Proposal} in ONE query (newest-first, first wins)."""
+    latest = {}
+    if not project_ids:
+        return latest
+    for prop in (Proposal.query.filter(Proposal.project_id.in_(project_ids))
+                 .order_by(Proposal.generated_at.desc()).all()):
+        latest.setdefault(prop.project_id, prop)
+    return latest
+
+
+def _counts_by(column, count_of, *filters) -> dict:
+    """Generic bulk counter: {key_column_value: count}."""
+    q = db.session.query(column, db.func.count(count_of)).filter(*filters).group_by(column)
+    return dict(q.all())
+
+
 def _build_proposal_rows():
-    """Load all accessible projects enriched with their latest proposal state."""
+    """Load all accessible projects enriched with their latest proposal state.
+
+    Bulk-loads in a FIXED number of queries — previously this ran 3 extra
+    queries per project, so the proposals page degraded linearly with
+    pipeline size."""
     if current_user.is_admin:
         projects = Project.query.filter_by(org_id=current_user.org_id).order_by(
             Project.updated_at.desc()
@@ -1754,20 +1815,25 @@ def _build_proposal_rows():
             Project.updated_at.desc()
         ).all()
 
+    project_ids = [p.id for p in projects]
+    latest_by_project = _latest_proposals_for(project_ids)
+    doc_counts = _counts_by(
+        ProjectDocument.project_id, ProjectDocument.id,
+        ProjectDocument.project_id.in_(project_ids),
+    ) if project_ids else {}
+    latest_ids = [prop.id for prop in latest_by_project.values()]
+    pending_by_proposal = _counts_by(
+        RevisionRequest.proposal_id, RevisionRequest.id,
+        RevisionRequest.proposal_id.in_(latest_ids),
+        RevisionRequest.status == "pending",
+    ) if latest_ids else {}
+
     now_naive = datetime.utcnow()
     rows = []
     for p in projects:
-        latest = (
-            Proposal.query.filter_by(project_id=p.id)
-            .order_by(Proposal.generated_at.desc())
-            .first()
-        )
-        doc_count = ProjectDocument.query.filter_by(project_id=p.id).count()
-        pending_req = 0
-        if latest:
-            pending_req = RevisionRequest.query.filter_by(
-                proposal_id=latest.id, status="pending"
-            ).count()
+        latest = latest_by_project.get(p.id)
+        doc_count = doc_counts.get(p.id, 0)
+        pending_req = pending_by_proposal.get(latest.id, 0) if latest else 0
 
         overdue = False
         if p.due_date and p.status == "active":
@@ -1881,6 +1947,9 @@ def _apply_row_query_filters(rows):
     return rows
 
 
+PROPOSALS_PER_PAGE = 50
+
+
 @app.route("/proposals")
 @login_required
 def proposals_list():
@@ -1891,6 +1960,19 @@ def proposals_list():
     all_rows = _build_proposal_rows()
     counts = {key: len(_filter_proposal_rows(all_rows, key)) for key, _, _ in PROPOSAL_FILTERS}
     rows = _apply_row_query_filters(_filter_proposal_rows(all_rows, flt))
+
+    # Paginate the table view (the board stays whole — a paged kanban would
+    # misrepresent column totals; it's cheap now that loading is bulk).
+    view = request.args.get("view", "table")
+    try:
+        page = max(int(request.args.get("page", 1)), 1)
+    except (TypeError, ValueError):
+        page = 1
+    total_rows = len(rows)
+    total_pages = max((total_rows + PROPOSALS_PER_PAGE - 1) // PROPOSALS_PER_PAGE, 1)
+    page = min(page, total_pages)
+    if view != "board":
+        rows = rows[(page - 1) * PROPOSALS_PER_PAGE: page * PROPOSALS_PER_PAGE]
 
     proposal_users = _org_proposal_users()
 
@@ -1915,7 +1997,11 @@ def proposals_list():
         f_vertical=request.args.get("vertical", ""),
         sort=request.args.get("sort", "updated"),
         direction=request.args.get("dir", "desc"),
-        view=request.args.get("view", "table"),
+        view=view,
+        page=page,
+        total_pages=total_pages,
+        total_rows=total_rows,
+        per_page=PROPOSALS_PER_PAGE,
     )
 
 
@@ -4387,11 +4473,34 @@ def edit_proposal(proposal_id):
             flash("Proposal content cannot be empty.", "error")
             return redirect(url_for("edit_proposal", proposal_id=proposal_id))
 
-        # Get current version number
         latest = ProposalVersion.query.filter_by(proposal_id=proposal_id).order_by(
             ProposalVersion.version_number.desc()
         ).first()
-        next_version = (latest.version_number + 1) if latest else 1
+        current_num = latest.version_number if latest else 0
+
+        # Edit-conflict guard: if someone saved a newer version while this
+        # editor was open, refuse the silent last-write-wins clobber and
+        # re-render with the submitted text preserved (never discard work).
+        base_version = request.form.get("base_version", "").strip()
+        if base_version and base_version != str(current_num):
+            flash(
+                f"Save blocked: v{current_num} was saved by someone else while you "
+                "were editing. Your text is preserved below — review and save again.",
+                "error",
+            )
+            versions = ProposalVersion.query.filter_by(proposal_id=proposal_id).order_by(
+                ProposalVersion.version_number.desc()
+            ).all()
+            return render_template(
+                "proposal_edit.html",
+                proposal=proposal,
+                project=project,
+                current_content=new_content,
+                versions=versions,
+                base_version=current_num,
+            )
+
+        next_version = current_num + 1
 
         # Save new version
         version = ProposalVersion(
@@ -4444,6 +4553,7 @@ def edit_proposal(proposal_id):
         project=project,
         current_content=current_content,
         versions=versions,
+        base_version=(versions[0].version_number if versions else 0),
     )
 
 
@@ -5958,31 +6068,45 @@ def admin_panel():
 
     from sqlalchemy import func
 
-    # Per-user stats
+    # Per-user stats — bulk group-bys (previously 6 queries per member)
+    user_ids = [u.id for u in users]
+    proj_counts = _counts_by(Project.user_id, Project.id,
+                             Project.user_id.in_(user_ids)) if user_ids else {}
+    won_counts = _counts_by(Project.user_id, Project.id,
+                            Project.user_id.in_(user_ids),
+                            Project.status == "won") if user_ids else {}
+    lost_counts = _counts_by(Project.user_id, Project.id,
+                             Project.user_id.in_(user_ids),
+                             Project.status == "lost") if user_ids else {}
+    dollar_sums = dict(db.session.query(
+        Project.user_id, func.sum(Project.dollar_amount)
+    ).filter(Project.user_id.in_(user_ids), Project.dollar_amount > 0)
+     .group_by(Project.user_id).all()) if user_ids else {}
+    prop_counts = dict(db.session.query(
+        Project.user_id, func.count(Proposal.id)
+    ).join(Proposal, Proposal.project_id == Project.id)
+     .filter(Project.user_id.in_(user_ids))
+     .group_by(Project.user_id).all()) if user_ids else {}
+    last_activity = dict(db.session.query(
+        ActivityLog.user_id, func.max(ActivityLog.created_at)
+    ).filter(ActivityLog.user_id.in_(user_ids))
+     .group_by(ActivityLog.user_id).all()) if user_ids else {}
+
     user_stats = []
     for user in users:
-        total = Project.query.filter_by(user_id=user.id).count()
-        won = Project.query.filter_by(user_id=user.id, status="won").count()
-        lost = Project.query.filter_by(user_id=user.id, status="lost").count()
+        won = won_counts.get(user.id, 0)
+        lost = lost_counts.get(user.id, 0)
         decided = won + lost
-        total_dollar = db.session.query(func.sum(Project.dollar_amount)).filter(
-            Project.user_id == user.id, Project.dollar_amount > 0
-        ).scalar() or 0
-        proposal_count = Proposal.query.join(Project).filter(Project.user_id == user.id).count()
-
-        # Last activity timestamp
-        last_log = ActivityLog.query.filter_by(user_id=user.id).order_by(ActivityLog.created_at.desc()).first()
-        last_active = last_log.created_at.strftime('%Y-%m-%d') if last_log else None
-
+        last_ts = last_activity.get(user.id)
         user_stats.append({
             "user": user,
-            "total_projects": total,
-            "proposal_count": proposal_count,
+            "total_projects": proj_counts.get(user.id, 0),
+            "proposal_count": prop_counts.get(user.id, 0),
             "won": won,
             "lost": lost,
             "win_rate": round((won / decided) * 100) if decided > 0 else 0,
-            "total_dollar": total_dollar,
-            "last_active": last_active,
+            "total_dollar": dollar_sums.get(user.id, 0) or 0,
+            "last_active": last_ts.strftime('%Y-%m-%d') if last_ts else None,
         })
 
     # Organization-wide totals
@@ -6317,6 +6441,9 @@ def billing_page():
         usage=usage,
         stripe_enabled=billing.stripe_enabled(),
         is_admin=current_user.is_admin,
+        trial_active=billing.trial_active(org),
+        trial_days=billing.trial_days_left(org),
+        trial_ends=(org.trial_ends_at if org else None),
     )
 
 
@@ -6656,7 +6783,16 @@ def document_library():
     else:
         doc_query = doc_query.order_by(ProjectDocument.uploaded_at.desc())
 
-    documents = doc_query.all()
+    # SQL-side pagination — the library previously loaded every document row
+    try:
+        page = max(int(request.args.get("page", 1)), 1)
+    except (TypeError, ValueError):
+        page = 1
+    per_page = 50
+    filtered_count = doc_query.count()
+    total_pages = max((filtered_count + per_page - 1) // per_page, 1)
+    page = min(page, total_pages)
+    documents = doc_query.offset((page - 1) * per_page).limit(per_page).all()
 
     # Build project lookup
     project_map = {p.id: p for p in all_projects}
@@ -6673,15 +6809,20 @@ def document_library():
     ).scalar() or 0
     total_docs = ProjectDocument.query.filter(ProjectDocument.project_id.in_(project_ids)).count()
 
-    # Per-project stats
-    project_stats = []
-    for p in all_projects:
-        p_docs = ProjectDocument.query.filter_by(project_id=p.id).count()
-        p_size = db.session.query(func.sum(ProjectDocument.file_size)).filter(
-            ProjectDocument.project_id == p.id
-        ).scalar() or 0
-        if p_docs > 0:
-            project_stats.append({"project": p, "doc_count": p_docs, "total_size": p_size})
+    # Per-project stats in one group-by (was 2 queries per project)
+    per_project = {
+        pid: (cnt, size or 0)
+        for pid, cnt, size in db.session.query(
+            ProjectDocument.project_id,
+            func.count(ProjectDocument.id),
+            func.sum(ProjectDocument.file_size),
+        ).filter(ProjectDocument.project_id.in_(project_ids))
+         .group_by(ProjectDocument.project_id).all()
+    } if project_ids else {}
+    project_stats = [
+        {"project": p, "doc_count": per_project[p.id][0], "total_size": per_project[p.id][1]}
+        for p in all_projects if p.id in per_project
+    ]
 
     # Generated proposals
     proposals = Proposal.query.filter(
@@ -6712,6 +6853,9 @@ def document_library():
         filter_status=filter_status,
         sort_by=sort_by,
         show_reference=show_reference,
+        page=page,
+        total_pages=total_pages,
+        filtered_count=filtered_count,
     )
 
 
@@ -7347,27 +7491,40 @@ def search():
     )
     results["documents"] = doc_query.order_by(ProjectDocument.uploaded_at.desc()).limit(25).all()
 
-    # Proposals — search within markdown content of their latest version
-    prop_query = Proposal.query.filter(Proposal.project_id.in_(accessible_project_ids))
+    # Proposals — match within the LATEST version's markdown, SQL-side.
+    # (Previously loaded up to 200 proposals' full content into Python per
+    # search request.)
+    from sqlalchemy import func as _f
+    latest_v = db.session.query(
+        ProposalVersion.proposal_id,
+        _f.max(ProposalVersion.version_number).label("maxv"),
+    ).group_by(ProposalVersion.proposal_id).subquery()
+    version_hits = (
+        db.session.query(ProposalVersion, Proposal)
+        .join(latest_v, db.and_(
+            ProposalVersion.proposal_id == latest_v.c.proposal_id,
+            ProposalVersion.version_number == latest_v.c.maxv,
+        ))
+        .join(Proposal, Proposal.id == ProposalVersion.proposal_id)
+        .filter(Proposal.project_id.in_(accessible_project_ids),
+                ProposalVersion.markdown_content.ilike(like))
+        .limit(25)
+        .all()
+    )
     proposal_matches = []
-    for prop in prop_query.limit(200).all():
-        latest = ProposalVersion.query.filter_by(proposal_id=prop.id).order_by(
-            ProposalVersion.version_number.desc()
-        ).first()
-        if latest and q.lower() in (latest.markdown_content or "").lower():
-            # Extract a small snippet around the match
-            content = latest.markdown_content
-            lower = content.lower()
-            idx = lower.find(q.lower())
-            start = max(0, idx - 60)
-            end = min(len(content), idx + len(q) + 60)
-            snippet = content[start:end].replace("\n", " ")
-            if start > 0:
-                snippet = "…" + snippet
-            if end < len(content):
-                snippet = snippet + "…"
-            proposal_matches.append({"proposal": prop, "snippet": snippet})
-    results["proposals"] = proposal_matches[:25]
+    for version, prop in version_hits:
+        content = version.markdown_content or ""
+        idx = content.lower().find(q.lower())
+        idx = max(idx, 0)
+        start = max(0, idx - 60)
+        end = min(len(content), idx + len(q) + 60)
+        snippet = content[start:end].replace("\n", " ")
+        if start > 0:
+            snippet = "…" + snippet
+        if end < len(content):
+            snippet = snippet + "…"
+        proposal_matches.append({"proposal": prop, "snippet": snippet})
+    results["proposals"] = proposal_matches
 
     # Comments — always scoped to accessible (org) proposals
     if True:

@@ -19,7 +19,7 @@
             <h1>Scope of Work</h1>
             <p class="page-subtitle">
                 {{ project.name }} &middot; {{ scope.vertical_label }}
-                &middot; AI drafted {{ scope.generated_at.strftime('%b %d, %Y %H:%M') }}
+                &middot; AI drafted {{ scope.generated_at | localtime('full') }}
             </p>
         </div>
         <div class="header-actions">
@@ -38,7 +38,7 @@
 {% if scope.status == 'approved' %}
 <div class="scope-approved-banner">
     <span>&#10003;</span>
-    <span>Scope approved{% if scope.approved_at %} on {{ scope.approved_at.strftime('%b %d, %Y %H:%M') }}{% endif %}
+    <span>Scope approved{% if scope.approved_at %} on {{ scope.approved_at | localtime('full') }}{% endif %}
         — the AI will draft the proposal against exactly these {{ included_count }} item(s).</span>
     <form method="post" action="{{ url_for('reopen_scope', project_id=project.id) }}" class="inline-form" style="margin-left:auto;">
         <button type="submit" class="btn btn-small btn-secondary">Reopen for edits</button>

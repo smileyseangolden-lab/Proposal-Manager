@@ -239,7 +239,7 @@
             <td><span class="role-badge role-{{ log.user.role or 'proposal' }}">{{ (log.user.role or 'proposal') | title }}</span></td>
             <td><span class="badge badge-activity">{{ log.action }}</span></td>
             <td class="td-desc">{{ log.detail[:100] }}{{ '...' if log.detail|length > 100 }}</td>
-            <td style="white-space:nowrap;">{{ log.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+            <td style="white-space:nowrap;">{{ log.created_at | localtime('full') }}</td>
         </tr>
         {% endfor %}
         </tbody>

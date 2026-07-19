@@ -104,6 +104,19 @@ _INDEX_MIGRATIONS: list[tuple[str, str, str]] = [
     ("ix_background_jobs_org_id", "background_jobs", "org_id"),
     ("ix_background_jobs_status", "background_jobs", "status"),
     ("ix_background_jobs_created_at", "background_jobs", "created_at"),
+    # P2 hot-path indexes (list pages, dashboard focus list, generation context)
+    ("ix_revision_requests_proposal_id", "revision_requests", "proposal_id, status"),
+    ("ix_proposal_questions_project_status", "proposal_questions", "project_id, status"),
+    ("ix_scope_items_scope_id", "scope_items", "scope_id"),
+    ("ix_proposal_reviewers_user_id", "proposal_reviewers", "user_id"),
+    ("ix_proposal_shares_proposal_id", "proposal_shares", "proposal_id"),
+    ("ix_notifications_user_read", "notifications", "user_id, is_read"),
+    ("ix_user_rate_sheets_org_id", "user_rate_sheets", "org_id"),
+    ("ix_user_vertical_templates_org_id", "user_vertical_templates", "org_id"),
+    ("ix_staff_roles_org_id", "staff_roles", "org_id"),
+    ("ix_equipment_items_org_id", "equipment_items", "org_id"),
+    ("ix_travel_expense_rates_org_id", "travel_expense_rates", "org_id"),
+    ("ix_company_standards_org_id", "company_standards", "org_id"),
 ]
 
 # Tables that carry a per-user org_id needing backfill from the owning user.
