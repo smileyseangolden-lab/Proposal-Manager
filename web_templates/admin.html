@@ -188,6 +188,27 @@
     </table>
 </div>
 
+<!-- Single sign-on -->
+<div class="card" id="sso">
+    <h2>Single Sign-On (SSO)</h2>
+    {% if sso_configured %}
+    <p class="card-desc">Claim your company's email domain so teammates sign in through your identity provider. With auto-provisioning on, a first-time user at that domain is added to this workspace automatically.</p>
+    <form method="post" action="{{ url_for('update_sso_domain') }}" style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end;">
+        <div class="form-group" style="margin:0; min-width:240px;">
+            <label for="sso_domain">Email domain</label>
+            <input type="text" id="sso_domain" name="sso_domain" placeholder="acme.com" value="{{ org.sso_domain if org else '' }}">
+        </div>
+        <div class="form-group" style="margin:0;">
+            <label class="checkbox-label"><input type="checkbox" name="sso_jit" value="1" {{ 'checked' if org and org.sso_jit }}> Auto-provision new members (JIT)</label>
+        </div>
+        <button type="submit" class="btn btn-secondary">Save SSO settings</button>
+    </form>
+    <p class="form-hint" style="margin-top:8px;">Users still need to exist here (or be auto-provisioned) — SSO never creates a brand-new workspace. Deactivated accounts are refused.</p>
+    {% else %}
+    <p class="card-desc">Single sign-on isn't configured on this deployment yet. The platform operator sets up the identity provider (OIDC) in Platform-Admin, after which you can claim your email domain here.</p>
+    {% endif %}
+</div>
+
 <!-- Integrations -->
 <div class="card" id="integrations">
     <h2>Integrations</h2>

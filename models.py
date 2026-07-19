@@ -38,6 +38,12 @@ class Organization(db.Model):
     slack_webhook_url = db.Column(db.String(1000), default="")
     outbound_webhook_url = db.Column(db.String(1000), default="")
 
+    # SSO: the email domain this workspace claims (e.g. "acme.com"). Users at
+    # that domain sign in via the configured OIDC IdP; sso_jit auto-provisions
+    # first-time members into this org.
+    sso_domain = db.Column(db.String(200), default="")
+    sso_jit = db.Column(db.Boolean, default=False, nullable=False)
+
     # Workspace branding (org-level — proposals are branded per ORG, not per
     # user, so every member's generations carry the same identity)
     logo_path = db.Column(db.String(1000), default="")

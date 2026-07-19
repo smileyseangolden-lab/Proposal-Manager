@@ -399,6 +399,9 @@ _CONTROL_GROUPS = [
     ("email", "Email (SMTP)",
      ["smtp_host", "smtp_port", "smtp_user", "smtp_password", "smtp_use_tls",
       "mail_from", "mail_from_name"]),
+    ("sso", "Single sign-on (OIDC)",
+     ["oidc_client_id", "oidc_client_secret", "oidc_auth_url", "oidc_token_url",
+      "oidc_userinfo_url", "oidc_scopes", "oidc_button_label"]),
 ]
 
 

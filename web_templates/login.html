@@ -42,6 +42,10 @@
                 </div>
                 <button type="submit" class="btn btn-primary btn-large" style="background: var(--sea-800);">Sign in</button>
             </form>
+            {% if sso_enabled %}
+            <div class="auth-divider"><span>or</span></div>
+            <a href="{{ url_for('sso_login') }}" class="btn btn-secondary btn-large" style="width:100%; text-align:center;">{{ sso_label }}</a>
+            {% endif %}
             <p class="auth-footer"><a href="{{ url_for('forgot_password') }}">Forgot your password?</a></p>
             <p class="auth-footer">Don't have an account? <a href="{{ url_for('signup') }}">Register</a></p>
         </div>

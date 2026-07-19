@@ -3149,3 +3149,19 @@ summary:focus-visible,
     padding: 4px;
 }
 .flash-close:hover { opacity: 1; }
+
+/* Auth "or" divider (SSO on the login page) */
+.auth-divider {
+    display: flex;
+    align-items: center;
+    text-align: center;
+    color: var(--ink-300);
+    font-size: 12px;
+    margin: 16px 0;
+}
+.auth-divider::before, .auth-divider::after {
+    content: "";
+    flex: 1;
+    border-bottom: 1px solid var(--line);
+}
+.auth-divider span { padding: 0 12px; }

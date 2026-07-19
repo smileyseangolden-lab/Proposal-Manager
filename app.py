@@ -70,6 +70,7 @@ import htmlsafe
 import jobs
 import ocr
 import proposal_agent
+import sso
 import storage
 import twofa
 from document_parser import parse_document
@@ -1085,14 +1086,16 @@ def login():
     if current_user.is_authenticated:
         return redirect(url_for("dashboard"))
     if request.method == "GET":
-        return render_template("login.html", ident="")
+        return render_template("login.html", ident="",
+                               sso_enabled=sso.configured(), sso_label=sso.button_label())
 
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "")
 
     def _login_again(message):
         flash(message, "error")
-        return render_template("login.html", ident=username)
+        return render_template("login.html", ident=username,
+                               sso_enabled=sso.configured(), sso_label=sso.button_label())
 
     rl_key = f"{request.remote_addr}:{username.lower()}"
     if _login_rate_limited(rl_key):
@@ -1201,6 +1204,104 @@ def login_2fa():
     _record_login_attempt(rl_key)
     flash("Invalid code. Try again, or use one of your backup codes.", "error")
     return render_template("login_2fa.html")
+
+
+# ---------------------------------------------------------------------------
+# Single sign-on (OIDC)
+# ---------------------------------------------------------------------------
+
+def _unique_username_from_email(email: str) -> str:
+    base = re.sub(r"[^a-z0-9._-]", "", (email.split("@")[0] or "").lower()) or "user"
+    candidate, i = base, 1
+    while User.query.filter_by(username=candidate).first():
+        i += 1
+        candidate = f"{base}{i}"
+    return candidate[:80]
+
+
+@app.route("/sso/login")
+def sso_login():
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+    if not sso.configured():
+        flash("Single sign-on isn't configured on this deployment.", "error")
+        return redirect(url_for("login"))
+    state = secrets.token_urlsafe(24)
+    session["sso_state"] = state
+    return redirect(sso.authorize_url(url_for("sso_callback", _external=True), state))
+
+
+@app.route("/sso/callback")
+def sso_callback():
+    """OIDC redirect target. Verifies state, exchanges the code, reads the
+    verified email from userinfo, and links / JIT-provisions the account.
+
+    Note: SSO is treated as strong authentication (the IdP performs its own
+    MFA), so it does not additionally trigger the app-level TOTP step."""
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+    if not sso.configured():
+        abort(404)
+
+    expected = session.pop("sso_state", None)
+    if not expected or not hmac.compare_digest(request.args.get("state", ""), expected):
+        flash("Sign-in could not be verified. Please try again.", "error")
+        return redirect(url_for("login"))
+    if request.args.get("error"):
+        flash("Single sign-on was canceled or denied.", "error")
+        return redirect(url_for("login"))
+    code = request.args.get("code", "")
+    if not code:
+        return redirect(url_for("login"))
+
+    try:
+        token = sso.exchange_code(code, url_for("sso_callback", _external=True))
+        access = token.get("access_token")
+        if not access:
+            raise RuntimeError("no access token in IdP response")
+        info = sso.fetch_userinfo(access)
+    except Exception:
+        app.logger.warning("SSO code exchange / userinfo failed", exc_info=True)
+        flash("Single sign-on failed. Please try again or use your password.", "error")
+        return redirect(url_for("login"))
+
+    email = (info.get("email") or "").strip()
+    res = sso.resolve(email, info.get("email_verified"))
+
+    if res.status == "unverified":
+        flash("Your identity provider hasn't verified that email address, so we can't sign you in.", "error")
+        return redirect(url_for("login"))
+    if res.status == "deactivated":
+        flash("This account has been deactivated. Contact your workspace admin.", "error")
+        return redirect(url_for("login"))
+    if res.status == "no_account":
+        flash("No workspace is set up for your email domain. Ask a workspace admin to invite you first.", "error")
+        return redirect(url_for("login"))
+
+    if res.status == "jit":
+        ok, _msg = billing.can_add_seat(res.org.id)
+        if not ok:
+            flash("Your team has reached its seat limit — ask an admin to upgrade or free a seat.", "error")
+            return redirect(url_for("login"))
+        user = User(
+            username=_unique_username_from_email(email),
+            email=email,
+            display_name=(info.get("name") or "").strip(),
+            org_id=res.org.id,
+            role="proposal",
+            email_verified=True,
+        )
+        user.set_password(secrets.token_urlsafe(32))  # unusable password — SSO only
+        db.session.add(user)
+        db.session.commit()
+        _log_activity_for(user, "sso_provision", f"Provisioned via SSO into {res.org.name}")
+    else:
+        user = res.user
+
+    session.permanent = True
+    login_user(user)
+    _log_activity_for(user, "login", "Signed in via SSO")
+    return redirect(url_for("dashboard"))
 
 
 # ---------------------------------------------------------------------------
@@ -6633,6 +6734,7 @@ def admin_panel():
         "admin.html",
         users=users,
         org=org,
+        sso_configured=sso.configured(),
         pending_invitations=pending_invitations,
         user_stats=user_stats,
         company_stats=company_stats,
@@ -6741,6 +6843,36 @@ def revoke_invitation(invite_id):
     db.session.commit()
     flash(f"Invitation for {inv.email} revoked.", "success")
     return redirect(url_for("admin_panel"))
+
+
+@app.route("/admin/sso", methods=["POST"])
+@login_required
+def update_sso_domain():
+    """Claim an email domain for this workspace so its users sign in via the
+    org's IdP, optionally auto-provisioning first-time members (JIT)."""
+    if not current_user.is_admin or not current_user.org_id:
+        abort(403)
+    org = db.session.get(Organization, current_user.org_id)
+    domain = request.form.get("sso_domain", "").strip().lower().lstrip("@")
+    if domain and (
+        "." not in domain or "@" in domain or "/" in domain or " " in domain
+    ):
+        flash("Enter a bare domain like acme.com.", "error")
+        return redirect(url_for("admin_panel") + "#sso")
+    if domain:
+        clash = Organization.query.filter(
+            db.func.lower(Organization.sso_domain) == domain,
+            Organization.id != org.id,
+        ).first()
+        if clash:
+            flash("That domain is already claimed by another workspace.", "error")
+            return redirect(url_for("admin_panel") + "#sso")
+    org.sso_domain = domain
+    org.sso_jit = bool(request.form.get("sso_jit"))
+    db.session.commit()
+    _log_activity("sso_config", f"Set SSO domain to {domain or '(none)'}")
+    flash("Single sign-on settings saved.", "success")
+    return redirect(url_for("admin_panel") + "#sso")
 
 
 @app.route("/admin/integrations", methods=["POST"])

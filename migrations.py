@@ -91,6 +91,9 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("users", "totp_secret_encrypted", "TEXT DEFAULT ''"),
     ("users", "totp_enabled", "BOOLEAN DEFAULT FALSE"),
     ("users", "totp_backup_codes", "TEXT DEFAULT ''"),
+    # SSO: per-org domain claim + JIT provisioning
+    ("organizations", "sso_domain", "VARCHAR(200) DEFAULT ''"),
+    ("organizations", "sso_jit", "BOOLEAN DEFAULT FALSE"),
 ]
 
 # Indexes on hot filter / foreign-key columns. CREATE INDEX IF NOT EXISTS is
@@ -124,6 +127,7 @@ _INDEX_MIGRATIONS: list[tuple[str, str, str]] = [
     ("ix_equipment_items_org_id", "equipment_items", "org_id"),
     ("ix_travel_expense_rates_org_id", "travel_expense_rates", "org_id"),
     ("ix_company_standards_org_id", "company_standards", "org_id"),
+    ("ix_organizations_sso_domain", "organizations", "sso_domain"),
 ]
 
 # Tables that carry a per-user org_id needing backfill from the owning user.
