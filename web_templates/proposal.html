@@ -257,6 +257,7 @@
             <ul class="share-stats">
                 <li><strong>{{ share.view_count or 0 }}</strong> view(s){% if share.last_viewed_at %} · last {{ share.last_viewed_at.strftime('%b %d, %H:%M') }}{% endif %}</li>
                 {% if share.version_number %}<li>Customer sees <strong>v{{ share.version_number }}</strong>{% if versions and share.version_number < versions[0].version_number %} · you're on v{{ versions[0].version_number }}{% endif %}</li>{% endif %}
+                {% if share.expires_at %}<li>Link expires {{ share.expires_at.strftime('%b %d, %Y') }}</li>{% endif %}
                 {% if share.decision %}<li>Customer <strong>{{ share.decision }}</strong>{{ ' on ' + share.decided_at.strftime('%b %d') if share.decided_at }}</li>{% endif %}
             </ul>
             {% if versions and share.version_number and share.version_number < versions[0].version_number and not share.decision %}

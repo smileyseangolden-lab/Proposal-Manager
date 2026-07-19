@@ -137,12 +137,15 @@
                 <th>Win Rate</th>
                 <th>Pipeline Value</th>
                 <th>Last Active</th>
+                <th></th>
             </tr>
         </thead>
         <tbody>
             {% for us in user_stats %}
-            <tr>
-                <td><strong>{{ us.user.display_name or us.user.username }}</strong></td>
+            <tr{% if us.user.is_active is sameas false %} style="opacity:0.55;"{% endif %}>
+                <td><strong>{{ us.user.display_name or us.user.username }}</strong>
+                    {% if us.user.is_active is sameas false %}<span class="chip chip-red" style="margin-left:6px;">Deactivated</span>{% endif %}
+                </td>
                 <td>{{ us.user.email }}</td>
                 <td>
                     {% if us.user.id == current_user.id %}
@@ -165,6 +168,20 @@
                 <td>{{ us.win_rate }}%</td>
                 <td>${{ "{:,.0f}".format(us.total_dollar) }}</td>
                 <td>{{ us.last_active or '&mdash;' }}</td>
+                <td>
+                    {% if us.user.id != current_user.id %}
+                    {% if us.user.is_active is sameas false %}
+                    <form method="post" action="{{ url_for('reactivate_user', user_id=us.user.id) }}" class="inline-form">
+                        <button type="submit" class="btn btn-small btn-secondary">Reactivate</button>
+                    </form>
+                    {% else %}
+                    <form method="post" action="{{ url_for('deactivate_user', user_id=us.user.id) }}" class="inline-form"
+                          onsubmit="return confirm('Deactivate {{ us.user.display_name or us.user.username }}? They will be signed out and can no longer access this workspace. Their seat is freed.');">
+                        <button type="submit" class="btn btn-small btn-danger">Deactivate</button>
+                    </form>
+                    {% endif %}
+                    {% endif %}
+                </td>
             </tr>
             {% endfor %}
         </tbody>

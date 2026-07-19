@@ -14,6 +14,9 @@ _ALLOWED_TAGS = {
     "p", "br", "hr", "div", "span", "blockquote", "pre", "code",
     "h1", "h2", "h3", "h4", "h5", "h6",
     "strong", "em", "b", "i", "u", "s", "sub", "sup", "mark", "small",
+    # Redline view wraps diffs in <ins>/<del>; stripping them silently mashed
+    # old and new text together with no visual distinction.
+    "ins", "del",
     "ul", "ol", "li", "dl", "dt", "dd",
     "table", "thead", "tbody", "tfoot", "tr", "th", "td", "caption",
     "colgroup", "col",

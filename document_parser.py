@@ -11,7 +11,9 @@ from config.settings import VERTICALS
 def parse_document(file_path: str) -> str:
     """Parse a document file and return its text content.
 
-    Supports PDF, DOCX, and plain text formats.
+    Supports PDF, DOCX, plain text, and Excel formats. (Excel matters because
+    RFQs frequently arrive as bid forms / pricing schedules in .xlsx — the
+    upload UI advertises it, so silently skipping it would drop scope.)
     """
     path = Path(file_path)
     suffix = path.suffix.lower()
@@ -20,8 +22,11 @@ def parse_document(file_path: str) -> str:
         return _parse_pdf(path)
     elif suffix in (".docx", ".doc"):
         return _parse_docx(path)
-    elif suffix in (".txt", ".md"):
-        return path.read_text(encoding="utf-8")
+    elif suffix in (".txt", ".md", ".csv"):
+        return path.read_text(encoding="utf-8", errors="replace")
+    elif suffix in (".xlsx", ".xls"):
+        from rate_sheet_parser import parse_rate_sheet
+        return parse_rate_sheet(str(path)).get("raw_text", "")
     else:
         raise ValueError(f"Unsupported file format: {suffix}")
 

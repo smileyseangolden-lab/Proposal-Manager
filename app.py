@@ -12,6 +12,7 @@ Full-featured intranet application with:
 """
 
 import difflib
+import hashlib
 import hmac
 import json
 import logging
@@ -251,7 +252,12 @@ def inject_branding():
 
 @login_manager.user_loader
 def load_user(user_id):
-    return db.session.get(User, user_id)
+    user = db.session.get(User, user_id)
+    # Deactivated (offboarded) members are logged out everywhere immediately —
+    # returning None invalidates any session they still hold.
+    if user is not None and user.is_active is False:
+        return None
+    return user
 
 
 @app.route("/healthz")
@@ -309,6 +315,15 @@ def _csrf_protect():
 
 
 @app.before_request
+def _ensure_job_workers():
+    """Start the background job pollers in every web process (idempotent,
+    no-op in inline/test mode). Previously workers only started in the process
+    that enqueued a job — if that process died on deploy, queued jobs sat
+    stranded until some other user happened to enqueue."""
+    jobs.start_workers()
+
+
+@app.before_request
 def _tag_ai_usage():
     """Attribute any LLM calls made while serving this request to the current
     org/user, so token usage is metered and the monthly AI budget is enforced.
@@ -356,6 +371,39 @@ def _login_rate_limited(key: str) -> bool:
 
 def _record_login_attempt(key: str):
     _LOGIN_ATTEMPTS.setdefault(key, []).append(time.time())
+
+
+# Signup throttle: each free workspace gets platform-funded AI budget, so
+# unlimited signups from one network is a scriptable spend attack.
+_SIGNUP_ATTEMPTS: dict[str, list[float]] = {}
+_SIGNUP_MAX_PER_WINDOW = 5
+_SIGNUP_WINDOW_SECONDS = 3600
+
+
+def _signup_rate_limited(ip: str) -> bool:
+    now = time.time()
+    attempts = [t for t in _SIGNUP_ATTEMPTS.get(ip, []) if now - t < _SIGNUP_WINDOW_SECONDS]
+    _SIGNUP_ATTEMPTS[ip] = attempts
+    return len(attempts) >= _SIGNUP_MAX_PER_WINDOW
+
+
+def _record_signup(ip: str):
+    _SIGNUP_ATTEMPTS.setdefault(ip, []).append(time.time())
+
+
+# In-process AI-endpoint throttle (chat / editor assist) per user.
+_AI_CALLS: dict[str, list[float]] = {}
+
+
+def _ai_rate_limited(key: str, max_calls: int, window: int = 60) -> bool:
+    now = time.time()
+    calls = [t for t in _AI_CALLS.get(key, []) if now - t < window]
+    if len(calls) >= max_calls:
+        _AI_CALLS[key] = calls
+        return True
+    calls.append(now)
+    _AI_CALLS[key] = calls
+    return False
 
 
 with app.app_context():
@@ -476,12 +524,27 @@ def _org_users_query():
 
 
 def _org_proposal_users():
-    """Org members who can be assigned proposals (proposal + admin roles)."""
+    """Active org members who can be assigned proposals (proposal + admin roles)."""
     return (
         _org_users_query()
-        .filter(User.role.in_(["proposal", "admin"]))
+        .filter(User.role.in_(["proposal", "admin"]), User.is_active.isnot(False))
         .order_by(User.display_name)
         .all()
+    )
+
+
+def _platform_ai_gate() -> tuple[bool, str]:
+    """Using the platform's built-in API key requires a verified email — curbs
+    throwaway-signup abuse of platform-funded AI. Users generating with their
+    OWN key (and invited members, who are auto-verified) are unaffected."""
+    if current_user.email_verified:
+        return True, ""
+    if decrypt_api_key(current_user.api_key_encrypted):
+        return True, ""
+    return False, (
+        "Please verify your email address before using the built-in AI "
+        "(check your inbox, or use 'Resend verification email' in the banner "
+        "above). Alternatively, add your own Anthropic API key in Settings."
     )
 
 
@@ -542,14 +605,17 @@ def _setup_progress(user) -> dict:
     Returns dict with 'steps' (list of {key,title,desc,done,url_endpoint,anchor}),
     'done' count, 'total' count, and 'complete' bool.
     """
+    org = db.session.get(Organization, user.org_id) if user.org_id else None
+    org_named = bool(org and (org.name or "").strip()
+                     and not org.name.endswith("'s Workspace"))
     steps = [
         {
             "key": "company",
-            "title": "Add your company profile",
+            "title": "Name your company workspace",
             "desc": "Company name used to brand generated proposals.",
             "endpoint": "settings",
             "anchor": "",
-            "done": bool((user.company_name or "").strip()),
+            "done": org_named,
         },
         {
             "key": "logo",
@@ -557,7 +623,7 @@ def _setup_progress(user) -> dict:
             "desc": "Placed on proposal cover pages and headers.",
             "endpoint": "posture",
             "anchor": "#branding",
-            "done": bool(user.company_logo_path),
+            "done": bool(org and org.logo_path),
         },
         {
             "key": "template",
@@ -631,7 +697,7 @@ def _setup_progress(user) -> dict:
 def inject_nav_context():
     """Sidebar counts + setup wizard progress for the app shell."""
     if not (hasattr(current_user, "id") and current_user.is_authenticated):
-        return dict(setup_progress=None, nav_active_projects=0)
+        return dict(setup_progress=None, nav_active_projects=0, nav_org_name="")
     active_count = Project.query.filter(
         db.or_(
             Project.user_id == current_user.id,
@@ -639,9 +705,11 @@ def inject_nav_context():
         ),
         Project.status == "active",
     ).count()
+    nav_org = db.session.get(Organization, current_user.org_id) if current_user.org_id else None
     return dict(
         setup_progress=_setup_progress(current_user),
         nav_active_projects=active_count,
+        nav_org_name=(nav_org.name if nav_org else "") or "",
     )
 
 
@@ -676,6 +744,17 @@ def _save_upload(file, subdir: str = "") -> tuple[str, str, int]:
     return safe, str(dest), size
 
 
+def _extract_text_chars(path: str):
+    """Parse receipt for an uploaded document: how many characters of
+    machine-readable text it yields. 0 = parsed but empty (e.g. a scanned
+    image PDF the AI can't read); None = format we couldn't check. Lets the
+    UI warn at UPLOAD time instead of failing minutes later at generation."""
+    try:
+        return len(parse_document(path).strip())
+    except Exception:
+        return None
+
+
 def _send_stored_file(path, **kwargs):
     """send_file wrapper that fetches the file from object storage first if the
     local copy is missing (ephemeral disk / multi-instance safety)."""
@@ -701,26 +780,38 @@ def _proposal_markdown(proposal) -> str:
     return ""
 
 
-def _logo_docx_kwargs(user, company_name_override: str = "") -> dict:
-    """Build the logo-related kwargs passed into markdown_to_docx so they
-    respect the user's branding preferences."""
-    if not getattr(user, "company_logo_path", None):
-        return {"font_name": user.font_preference or "Calibri"}
-    if not getattr(user, "company_logo_use_in_proposals", False):
-        return {"font_name": user.font_preference or "Calibri"}
-    logo_path = user.company_logo_path
-    if not Path(logo_path).exists():
-        return {"font_name": user.font_preference or "Calibri"}
+def _org_for_project(project):
+    """The organization that owns a project (branding source of truth)."""
+    org_id = _owner_org_id(project) if project else None
+    return db.session.get(Organization, org_id) if org_id else None
+
+
+def _logo_docx_kwargs(org, font_user=None) -> dict:
+    """Logo/branding kwargs for markdown_to_docx. Branding is ORG-level so
+    every member's generations carry the same workspace identity; only the
+    body font follows the acting user's preference."""
+    font = (getattr(font_user, "font_preference", "") or "Calibri")
+    if org is None or not (org.logo_path or "") or not org.logo_use_in_proposals:
+        return {"font_name": font}
+    storage.ensure_local(org.logo_path)
+    if not Path(org.logo_path).exists():
+        return {"font_name": font}
     return {
-        "logo_path": logo_path,
-        "logo_placement": user.company_logo_placement or "top_left",
-        "logo_on_cover": bool(getattr(user, "company_logo_show_on_cover", False)),
-        "company_name": company_name_override or (user.company_name or ""),
-        "font_name": user.font_preference or "Calibri",
+        "logo_path": org.logo_path,
+        "logo_placement": org.logo_placement or "top_left",
+        "logo_on_cover": bool(org.logo_show_on_cover),
+        "company_name": org.name or "",
+        "font_name": font,
     }
 
 
-def _process_and_save_logo(file, user_id: str) -> tuple[str, str, int]:
+def _project_brand_kwargs(project, font_user) -> dict:
+    """DOCX branding kwargs for a project: the owning ORG's logo/identity with
+    the acting user's font preference."""
+    return _logo_docx_kwargs(_org_for_project(project), font_user=font_user)
+
+
+def _process_and_save_logo(file, owner_id: str) -> tuple[str, str, int]:
     """Load an uploaded image, auto-orient, resize to a reasonable size,
     and save as an optimized PNG. Transparency is preserved where possible.
 
@@ -728,7 +819,7 @@ def _process_and_save_logo(file, user_id: str) -> tuple[str, str, int]:
     Raises ValueError on an unreadable/invalid image.
     """
     original_name = secure_filename(file.filename or "logo")
-    dest_dir = UPLOADS_DIR / f"logos/{user_id}"
+    dest_dir = UPLOADS_DIR / f"logos/{owner_id}"
     dest_dir.mkdir(parents=True, exist_ok=True)
     unique = f"logo_{uuid.uuid4().hex[:8]}.png"
     dest = dest_dir / unique
@@ -803,6 +894,10 @@ def signup():
     if request.method == "GET":
         return render_template("signup.html", invitation=None, invite_org=None)
 
+    if not app.testing and _signup_rate_limited(request.remote_addr or "?"):
+        flash("Too many new accounts from this network. Please try again later.", "error")
+        return redirect(url_for("signup"))
+
     username = request.form.get("username", "").strip()
     email = request.form.get("email", "").strip()
     password = request.form.get("password", "")
@@ -826,6 +921,15 @@ def signup():
     if User.query.filter_by(username=username).first():
         flash("Username already taken.", "error")
         return redirect(url_for("signup"))
+
+    # Email must be globally unique (case-insensitive) — duplicates break
+    # password reset and verification. For invited signups validate the
+    # INVITED address, since that's what the account is bound to.
+    effective_email = invitation.email if invitation else email
+    if User.query.filter(User.email.ilike(effective_email)).first():
+        flash("An account with that email address already exists. "
+              "Sign in instead, or use the password reset if you've forgotten it.", "error")
+        return redirect(url_for("login"))
 
     user = User(
         username=username,
@@ -866,6 +970,7 @@ def signup():
         db.session.add(user)
 
     db.session.commit()
+    _record_signup(request.remote_addr or "?")
     session.permanent = True
     login_user(user)
     _log_activity("signup", f"User {username} created account")
@@ -922,6 +1027,12 @@ def login():
         flash("Invalid username or password.", "error")
         return redirect(url_for("login"))
 
+    # Deactivated members can't sign in (checked after password verification so
+    # probing can't distinguish "wrong password" from "deactivated").
+    if user.is_active is False:
+        flash("This account has been deactivated. Contact your workspace admin.", "error")
+        return redirect(url_for("login"))
+
     _LOGIN_ATTEMPTS.pop(rl_key, None)
     if user.failed_login_count or user.lockout_until:
         user.failed_login_count = 0
@@ -937,20 +1048,33 @@ def login():
 # Email verification & password reset
 # ---------------------------------------------------------------------------
 
-def _issue_token(user, purpose: str, hours: int = 24) -> UserToken:
+def _hash_token(raw: str) -> str:
+    """Reset/verify tokens are stored hashed so a DB leak can't be replayed
+    into an account takeover. SHA-256 hex fits the existing 64-char column."""
+    return hashlib.sha256((raw or "").encode("utf-8")).hexdigest()
+
+
+def _issue_token(user, purpose: str, hours: int = 24) -> str:
+    """Create a single-use token and return the RAW value (for the emailed
+    link). Only its hash is persisted."""
     from datetime import timedelta
+    raw = uuid.uuid4().hex + uuid.uuid4().hex
     tok = UserToken(
         user_id=user.id,
         purpose=purpose,
+        token=_hash_token(raw),
         expires_at=datetime.utcnow() + timedelta(hours=hours),
     )
     db.session.add(tok)
     db.session.commit()
-    return tok
+    return raw
 
 
 def _consume_token(token_str: str, purpose: str):
-    tok = UserToken.query.filter_by(token=token_str, purpose=purpose).first()
+    tok = UserToken.query.filter_by(token=_hash_token(token_str), purpose=purpose).first()
+    if tok is None:
+        # Legacy rows created before hashing stored the raw token.
+        tok = UserToken.query.filter_by(token=token_str, purpose=purpose).first()
     if not tok or tok.used_at:
         return None
     if tok.expires_at:
@@ -961,8 +1085,8 @@ def _consume_token(token_str: str, purpose: str):
 
 
 def _send_verification_email(user):
-    tok = _issue_token(user, "verify", hours=72)
-    link = url_for("verify_email", token=tok.token, _external=True)
+    raw = _issue_token(user, "verify", hours=72)
+    link = url_for("verify_email", token=raw, _external=True)
     import mailer
     sent = mailer.send_email(
         to=user.email,
@@ -1010,8 +1134,8 @@ def forgot_password():
     generic = "If an account exists for that email, a reset link has been sent."
     user = User.query.filter(User.email.ilike(email)).first() if email else None
     if user:
-        tok = _issue_token(user, "reset", hours=2)
-        link = url_for("reset_password", token=tok.token, _external=True)
+        raw = _issue_token(user, "reset", hours=2)
+        link = url_for("reset_password", token=raw, _external=True)
         import mailer
         sent = mailer.send_email(
             to=user.email,
@@ -1313,8 +1437,12 @@ def quick_start():
     db.session.add(project)
     db.session.flush()
 
+    unreadable = []
     for f in valid:
         safe, path, size = _save_upload(f, f"projects/{project.id}")
+        chars = _extract_text_chars(path)
+        if chars == 0:
+            unreadable.append(safe)
         db.session.add(ProjectDocument(
             project_id=project.id,
             filename=f"{uuid.uuid4().hex[:8]}_{safe}",
@@ -1322,9 +1450,14 @@ def quick_start():
             file_type="rfp",
             file_path=path,
             file_size=size,
+            text_chars=chars,
         ))
 
     db.session.commit()
+    if unreadable:
+        flash("Heads up: no readable text could be extracted from "
+              f"{', '.join(unreadable)} — it may be a scanned image. "
+              "The AI won't be able to analyze it.", "error")
     _log_activity("project_quick_start", f"Quick-started project from {len(valid)} file(s)", project.id)
     _notify_role(
         "proposal", "rfp_uploaded",
@@ -1862,6 +1995,7 @@ def posture():
 
     return render_template(
         "posture.html",
+        org=db.session.get(Organization, current_user.org_id) if current_user.org_id else None,
         rate_sheets=rate_sheets,
         user_templates=user_templates,
         staff_roles=staff_roles,
@@ -1892,23 +2026,54 @@ def setup_wizard():
 @login_required
 def settings():
     if request.method == "POST":
+        org = db.session.get(Organization, current_user.org_id) if current_user.org_id else None
+
         current_user.display_name = request.form.get("display_name", current_user.display_name)
-        current_user.email = request.form.get("email", current_user.email)
-        current_user.company_name = request.form.get("company_name", current_user.company_name)
+
+        # Changing the email requires re-verification (otherwise "verified"
+        # would silently apply to an address that was never confirmed), and
+        # the new address must not collide with another account.
+        new_email = request.form.get("email", current_user.email).strip()
+        if new_email and new_email.lower() != (current_user.email or "").lower():
+            clash = User.query.filter(
+                User.email.ilike(new_email), User.id != current_user.id
+            ).first()
+            if clash:
+                flash("That email address is already in use by another account.", "error")
+                return redirect(url_for("settings"))
+            current_user.email = new_email
+            current_user.email_verified = False
+            try:
+                _send_verification_email(current_user)
+                flash("Email updated — please verify your new address "
+                      "(we sent a verification link).", "success")
+            except Exception:
+                pass
+
+        # Company identity is workspace-level; only admins may rename it.
+        company_name = request.form.get("company_name", "").strip()
+        if org and company_name and current_user.is_admin and company_name != org.name:
+            org.name = company_name[:300]
+
         current_user.font_preference = request.form.get("font_preference", current_user.font_preference)
-        current_user.llm_provider = request.form.get("llm_provider", current_user.llm_provider)
+        # Anthropic is the only supported provider — ignore anything else.
+        current_user.llm_provider = "anthropic"
         current_user.llm_model = request.form.get("llm_model", current_user.llm_model)
 
         api_key = request.form.get("api_key", "").strip()
         if api_key:
             current_user.api_key_encrypted = encrypt_api_key(api_key)
 
-        # Company logo preferences (checkboxes come through only when checked)
-        current_user.company_logo_use_in_proposals = bool(request.form.get("company_logo_use_in_proposals"))
-        current_user.company_logo_show_on_cover = bool(request.form.get("company_logo_show_on_cover"))
-        placement = request.form.get("company_logo_placement", current_user.company_logo_placement or "top_left")
-        if placement in ("top_left", "center"):
-            current_user.company_logo_placement = placement
+        # Workspace branding preferences. Only touched when the form actually
+        # carries them (signaled by the placement field both branding-aware
+        # forms always include) — otherwise any unrelated POST to /settings
+        # would silently zero the checkbox flags.
+        if org and "company_logo_placement" in request.form:
+            org.logo_use_in_proposals = bool(request.form.get("company_logo_use_in_proposals"))
+            org.logo_show_on_cover = bool(request.form.get("company_logo_show_on_cover"))
+            placement = request.form.get("company_logo_placement") or (org.logo_placement or "top_left")
+            if placement in ("top_left", "center"):
+                org.logo_placement = placement
 
         db.session.commit()
         _log_activity("settings_update", "Updated user settings")
@@ -1936,6 +2101,7 @@ def settings():
 
     return render_template(
         "settings.html",
+        org=db.session.get(Organization, current_user.org_id) if current_user.org_id else None,
         rate_sheets=rate_sheets,
         user_templates=user_templates,
         staff_roles=staff_roles,
@@ -1947,6 +2113,29 @@ def settings():
         verticals=VERTICALS,
         logo_max_dimension=LOGO_MAX_DIMENSION,
     )
+
+
+@app.route("/settings/change-password", methods=["POST"])
+@login_required
+def change_password():
+    """In-app password change (previously only the forgot-password flow existed)."""
+    current = request.form.get("current_password", "")
+    new = request.form.get("new_password", "")
+    confirm = request.form.get("confirm_password", "")
+    if not current_user.check_password(current):
+        flash("Your current password is incorrect.", "error")
+        return redirect(url_for("settings"))
+    if len(new) < 8:
+        flash("New password must be at least 8 characters.", "error")
+        return redirect(url_for("settings"))
+    if new != confirm:
+        flash("New passwords do not match.", "error")
+        return redirect(url_for("settings"))
+    current_user.set_password(new)
+    db.session.commit()
+    _log_activity("password_change", "Changed account password")
+    flash("Password updated.", "success")
+    return redirect(url_for("settings"))
 
 
 @app.route("/settings/upload-rate-sheet", methods=["POST"])
@@ -2204,6 +2393,10 @@ def delete_rate_sheet(sheet_id):
     sheet = db.session.get(UserRateSheet, sheet_id)
     if not sheet or sheet.org_id != current_user.org_id:
         abort(404)
+    try:
+        storage.delete(sheet.file_path)
+    except Exception:
+        pass
     db.session.delete(sheet)
     db.session.commit()
     flash("Rate sheet deleted.", "success")
@@ -2216,6 +2409,10 @@ def delete_user_template(template_id):
     tmpl = db.session.get(UserVerticalTemplate, template_id)
     if not tmpl or tmpl.org_id != current_user.org_id:
         abort(404)
+    try:
+        storage.delete(tmpl.file_path)
+    except Exception:
+        pass
     db.session.delete(tmpl)
     db.session.commit()
     flash("Template deleted.", "success")
@@ -2241,26 +2438,28 @@ def upload_company_logo():
         )
         return redirect(url_for("posture") + "#branding")
 
+    org = db.session.get(Organization, current_user.org_id)
+    if org is None:
+        abort(400)
+
     try:
-        original_name, saved_path, saved_size = _process_and_save_logo(file, current_user.id)
+        original_name, saved_path, saved_size = _process_and_save_logo(file, org.id)
     except ValueError as e:
         flash(f"Could not process image: {e}", "error")
         return redirect(url_for("posture") + "#branding")
+    storage.sync_up(saved_path)
 
-    # Remove old logo file if any
-    if current_user.company_logo_path:
+    # Remove old logo file if any (local + object storage)
+    if org.logo_path:
         try:
-            old = Path(current_user.company_logo_path)
-            if old.exists() and old.is_file():
-                old.unlink()
+            storage.delete(org.logo_path)
         except Exception:
             pass
 
-    current_user.company_logo_path = saved_path
-    current_user.company_logo_original_name = original_name
-    # If this is the user's first logo upload, default "use in proposals" to True
-    if not current_user.company_logo_placement:
-        current_user.company_logo_placement = "top_left"
+    org.logo_path = saved_path
+    org.logo_original_name = original_name
+    if not org.logo_placement:
+        org.logo_placement = "top_left"
     db.session.commit()
     _log_activity("logo_upload", f"Uploaded company logo ({saved_size // 1024} KB)")
     flash(
@@ -2274,16 +2473,15 @@ def upload_company_logo():
 @app.route("/settings/delete-logo", methods=["POST"])
 @login_required
 def delete_company_logo():
-    if current_user.company_logo_path:
+    org = db.session.get(Organization, current_user.org_id)
+    if org and org.logo_path:
         try:
-            old = Path(current_user.company_logo_path)
-            if old.exists() and old.is_file():
-                old.unlink()
+            storage.delete(org.logo_path)
         except Exception:
             pass
-    current_user.company_logo_path = ""
-    current_user.company_logo_original_name = ""
-    db.session.commit()
+        org.logo_path = ""
+        org.logo_original_name = ""
+        db.session.commit()
     _log_activity("logo_delete", "Removed company logo")
     flash("Company logo removed.", "success")
     return redirect(url_for("posture") + "#branding")
@@ -2292,10 +2490,12 @@ def delete_company_logo():
 @app.route("/settings/logo-preview")
 @login_required
 def company_logo_preview():
-    """Serve the current user's company logo (private — only to the owner)."""
-    if not current_user.company_logo_path:
+    """Serve the workspace logo (members only)."""
+    org = db.session.get(Organization, current_user.org_id)
+    if not org or not org.logo_path:
         abort(404)
-    logo_path = Path(current_user.company_logo_path)
+    storage.ensure_local(org.logo_path)
+    logo_path = Path(org.logo_path)
     if not logo_path.exists():
         abort(404)
     return send_file(str(logo_path), mimetype="image/png")
@@ -2494,9 +2694,9 @@ def add_travel_rate():
         safe, path, size = _save_upload(uploaded_file, "rate_sheets")
         sheet = UserRateSheet(
             user_id=current_user.id,
-        org_id=current_user.org_id,
+            org_id=current_user.org_id,
             name=f"Travel Rates - {safe}",
-            sheet_type="labor_rates",
+            sheet_type="travel_rates",
             file_path=path,
             original_filename=safe,
         )
@@ -2663,9 +2863,13 @@ def project_upload(project_id):
         files = request.files.getlist("documents")
         file_type = request.form.get("file_type", "rfp")
 
+        unreadable = []
         for file in files:
             if file and _allowed_file(file.filename, ALLOWED_EXTENSIONS | {"xlsx", "xls"}):
                 safe, path, size = _save_upload(file, f"projects/{project_id}")
+                chars = _extract_text_chars(path)
+                if chars == 0 and file_type in ("rfp", "supporting", "legal"):
+                    unreadable.append(safe)
                 doc = ProjectDocument(
                     project_id=project_id,
                     filename=f"{uuid.uuid4().hex[:8]}_{safe}",
@@ -2673,10 +2877,15 @@ def project_upload(project_id):
                     file_type=file_type,
                     file_path=path,
                     file_size=size,
+                    text_chars=chars,
                 )
                 db.session.add(doc)
 
         db.session.commit()
+        if unreadable:
+            flash("Heads up: no readable text could be extracted from "
+                  f"{', '.join(unreadable)} — it may be a scanned image. "
+                  "The AI won't be able to analyze it.", "error")
         _log_activity("document_upload", f"Uploaded {len(files)} document(s)", project_id)
         # Notify proposal users when RFPs are uploaded
         _notify_role(
@@ -2753,6 +2962,12 @@ def project_generate(project_id):
     project = db.session.get(Project, project_id)
     if not _can_access_project(project):
         abort(404)
+
+    # Abuse gate: platform-key AI requires a verified email
+    ok, msg = _platform_ai_gate()
+    if not ok:
+        flash(msg, "error")
+        return redirect(url_for("project_upload", project_id=project_id))
 
     # Plan gate (Phase 5): enforce monthly generation limits
     allowed, limit_msg = billing_check_generation(current_user.org_id)
@@ -2843,7 +3058,10 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
 
     set_progress("reading", "Reading uploaded documents…")
     documents = ProjectDocument.query.filter_by(project_id=project_id).all()
-    rfp_docs = [d for d in documents if d.file_type in ("rfp", "supporting")]
+    # Legal/contract docs carry terms the proposal must honor — include them.
+    # (Drawings stay out: image-heavy PDFs parse to noise; rate sheets are
+    # folded into the pricing context below instead.)
+    rfp_docs = [d for d in documents if d.file_type in ("rfp", "supporting", "legal")]
     combined_text = ""
     for doc in rfp_docs:
         try:
@@ -2919,17 +3137,33 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
                 for t in rates
             ]
 
-    # Load user rate sheets (Excel uploads)
-    rate_sheet_data = None
-    active_sheets = UserRateSheet.query.filter_by(org_id=org_id, is_active=True).all()
-    if active_sheets:
-        rate_sheet_data = {}
-        for sheet in active_sheets:
-            try:
-                storage.ensure_local(sheet.file_path)
-                rate_sheet_data[sheet.sheet_type] = parse_rate_sheet(sheet.file_path)
-            except Exception:
-                continue
+    # Load org rate sheets (posture uploads). Multiple sheets of the same type
+    # are MERGED — previously each one silently overwrote the last.
+    rate_sheet_data = {}
+    for sheet in UserRateSheet.query.filter_by(org_id=org_id, is_active=True).all():
+        try:
+            storage.ensure_local(sheet.file_path)
+            parsed = parse_rate_sheet(sheet.file_path)
+        except Exception:
+            continue
+        entry = rate_sheet_data.setdefault(sheet.sheet_type, {"raw_text": ""})
+        raw = parsed.get("raw_text", "")
+        if raw:
+            entry["raw_text"] += (("\n\n" if entry["raw_text"] else "") + raw)
+
+    # Project documents uploaded as type 'rate_sheet' were previously ignored
+    # entirely — fold their content into the pricing context too.
+    for doc in documents:
+        if doc.file_type != "rate_sheet":
+            continue
+        try:
+            storage.ensure_local(doc.file_path)
+            raw = parse_document(doc.file_path)
+        except Exception:
+            continue
+        if raw.strip():
+            rate_sheet_data[f"project sheet {doc.original_filename[:60]}"] = {"raw_text": raw}
+    rate_sheet_data = rate_sheet_data or None
 
     user_templates = _load_org_templates(org_id, vertical)
 
@@ -2980,13 +3214,15 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
         for r in answered_rows if (r.answer or "").strip()
     ]
 
+    _gen_org = db.session.get(Organization, org_id) if org_id else None
+
     set_progress("drafting", "Claude is drafting your proposal…")
     result = generate_proposal(
         combined_text,
         vertical=vertical,
         rate_sheet_data=rate_sheet_data,
         user_templates=user_templates,
-        company_name=user.company_name,
+        company_name=(_gen_org.name if _gen_org else "") or "",
         user_api_key=decrypt_api_key(user.api_key_encrypted) or None,
         user_model=user.llm_model or None,
         answered_questions=answered_questions or None,
@@ -3058,7 +3294,7 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
     markdown_to_docx(
         result["proposal_markdown"],
         str(docx_path),
-        **_logo_docx_kwargs(_brand_user),
+        **_project_brand_kwargs(project, _brand_user),
     )
     storage.sync_up(docx_path)
 
@@ -3226,36 +3462,66 @@ def project_scope(project_id):
 @app.route("/projects/<project_id>/scope/generate", methods=["POST"])
 @login_required
 def generate_scope(project_id):
-    """AI-draft (or re-draft) the Scope of Work from the uploaded documents."""
+    """AI-draft (or re-draft) the Scope of Work — runs as a background job so
+    the minutes-long AI call doesn't hold a web worker or time out at the LB."""
     project = db.session.get(Project, project_id)
     if not _can_access_project(project):
         abort(404)
 
-    combined_text = _project_rfp_text(project_id)
-    if not combined_text:
+    ok, msg = _platform_ai_gate()
+    if not ok:
+        flash(msg, "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    has_docs = ProjectDocument.query.filter_by(project_id=project_id).filter(
+        ProjectDocument.file_type.in_(("rfp", "supporting", "legal"))
+    ).count() > 0
+    if not has_docs:
         flash("Upload an RFP/RFQ document before drafting the scope of work.", "error")
         return redirect(url_for("project_upload", project_id=project_id))
 
-    vertical = request.form.get("vertical", "auto")
+    job = jobs.enqueue(
+        "draft_scope",
+        {"project_id": project_id, "vertical": request.form.get("vertical", "auto")},
+        user_id=current_user.id,
+        org_id=current_user.org_id,
+    )
+    return redirect(url_for("job_status_page", job_id=job.id))
 
-    try:
-        result = draft_scope_of_work(
-            combined_text,
-            vertical=vertical,
-            company_name=current_user.company_name,
-            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
-            user_model=current_user.llm_model or None,
-        )
-    except RuntimeError as e:
-        flash(str(e), "error")
-        return redirect(url_for("project_upload", project_id=project_id))
-    except Exception as e:
-        flash(f"Scope drafting failed: {friendly_api_error(e)}", "error")
-        return redirect(url_for("project_upload", project_id=project_id))
 
-    # Replace any existing scope (regeneration starts fresh)
+def _perform_scope_draft(project_id, user, vertical, set_progress):
+    """Draft/re-draft the scope inside a background job. Items the TEAM added
+    by hand survive a re-draft — only AI-proposed items are replaced."""
+    project = db.session.get(Project, project_id)
+    if not project:
+        raise RuntimeError("Project no longer exists.")
+
+    set_progress("reading", "Reading uploaded documents…")
+    combined_text = _project_rfp_text(project_id)
+    if not combined_text:
+        raise RuntimeError("Could not extract text from the uploaded documents.")
+
+    org = db.session.get(Organization, user.org_id) if user.org_id else None
+
+    set_progress("drafting", "Claude is drafting the scope of work…")
+    result = draft_scope_of_work(
+        combined_text,
+        vertical=vertical,
+        company_name=(org.name if org else "") or "",
+        user_api_key=decrypt_api_key(user.api_key_encrypted) or None,
+        user_model=user.llm_model or None,
+    )
+
+    set_progress("saving", "Saving scope items…")
+    # Preserve team-added items across re-drafts; replace only AI items.
+    human_items = []
     existing = ProjectScope.query.filter_by(project_id=project_id).first()
     if existing:
+        human_items = [
+            {"text": i.item_text, "category": i.category, "status": i.status}
+            for i in ScopeItem.query.filter_by(scope_id=existing.id, source="human")
+            .order_by(ScopeItem.sort_order, ScopeItem.created_at).all()
+        ]
         ScopeItem.query.filter_by(scope_id=existing.id).delete()
         db.session.delete(existing)
         db.session.flush()
@@ -3270,7 +3536,8 @@ def generate_scope(project_id):
     db.session.add(scope)
     db.session.flush()
 
-    for idx, entry in enumerate(result["items"]):
+    idx = 0
+    for entry in result["items"]:
         db.session.add(ScopeItem(
             scope_id=scope.id,
             project_id=project_id,
@@ -3280,13 +3547,35 @@ def generate_scope(project_id):
             status="included",
             sort_order=idx,
         ))
+        idx += 1
+    for h in human_items:
+        db.session.add(ScopeItem(
+            scope_id=scope.id,
+            project_id=project_id,
+            item_text=h["text"],
+            category=h["category"],
+            source="human",
+            status=h["status"],
+            sort_order=idx,
+        ))
+        idx += 1
 
     project.vertical = result["vertical"]
     project.vertical_label = result["vertical_label"]
     db.session.commit()
-    _log_activity("scope_generate", f"AI drafted {len(result['items'])} scope item(s)", project_id)
-    flash(f"AI proposed {len(result['items'])} scope item(s). Review and approve below.", "success")
-    return redirect(url_for("project_scope", project_id=project_id))
+    _log_activity_for(user, "scope_generate",
+                      f"AI drafted {len(result['items'])} scope item(s)"
+                      + (f", kept {len(human_items)} team item(s)" if human_items else ""),
+                      project_id)
+    return {"redirect": url_for("project_scope", project_id=project_id)}
+
+
+@jobs.register("draft_scope")
+def _job_draft_scope(payload, job):
+    user = db.session.get(User, job.user_id)
+    def _sp(phase, message=""):
+        jobs.set_progress(job, phase, message)
+    return _perform_scope_draft(payload["project_id"], user, payload["vertical"], _sp)
 
 
 @app.route("/projects/<project_id>/scope/items/<item_id>/toggle", methods=["POST"])
@@ -3349,6 +3638,32 @@ def add_scope_item(project_id):
     db.session.commit()
     _log_activity("scope_item_add", f"Added scope item: {text[:80]}", project_id)
     flash("Scope item added.", "success")
+    return redirect(url_for("project_scope", project_id=project_id))
+
+
+@app.route("/projects/<project_id>/scope/items/<item_id>/edit", methods=["POST"])
+@login_required
+def edit_scope_item(project_id, item_id):
+    """Edit a scope item's text inline — core to actually negotiating the
+    scope with the AI (previously items could only be kept or struck)."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    item = db.session.get(ScopeItem, item_id)
+    if not item or item.project_id != project_id:
+        abort(404)
+    text = request.form.get("item_text", "").strip()
+    if not text:
+        flash("Scope item text is required.", "error")
+        return redirect(url_for("project_scope", project_id=project_id))
+    item.item_text = text
+    scope = db.session.get(ProjectScope, item.scope_id)
+    if scope and scope.status == "approved":
+        scope.status = "draft"
+        flash("Scope modified — re-approve it before generating.", "success")
+    db.session.commit()
+    _log_activity("scope_item_edit", f"Edited scope item: {text[:80]}", project_id)
+    flash("Scope item updated.", "success")
     return redirect(url_for("project_scope", project_id=project_id))
 
 
@@ -3737,17 +4052,18 @@ def _ensure_proposal_pdf(proposal, project):
         md_path = GENERATED_DIR / proposal.md_file
         md_text = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
 
-    owner = project.owner or db.session.get(User, project.user_id)
+    org = _org_for_project(project)
     pdf_filename = proposal.pdf_file or f"proposal_{proposal.job_id}.pdf"
     pdf_path = GENERATED_DIR / pdf_filename
 
     logo_path = None
     company_name = ""
-    if owner:
-        company_name = owner.company_name or ""
-        if (owner.company_logo_path and getattr(owner, "company_logo_use_in_proposals", False)
-                and Path(owner.company_logo_path).exists()):
-            logo_path = owner.company_logo_path
+    if org:
+        company_name = org.name or ""
+        if org.logo_path and org.logo_use_in_proposals:
+            storage.ensure_local(org.logo_path)
+            if Path(org.logo_path).exists():
+                logo_path = org.logo_path
 
     markdown_to_pdf(md_text, str(pdf_path), logo_path=logo_path, company_name=company_name)
     storage.sync_up(pdf_path)
@@ -3802,7 +4118,7 @@ def proposal_estimate(proposal_id):
 @app.route("/proposal/<proposal_id>/estimate/draft", methods=["POST"])
 @login_required
 def draft_proposal_estimate(proposal_id):
-    """AI-draft a structured estimate from the RFP + the org's rates."""
+    """AI-draft a structured estimate — runs as a background job."""
     proposal = db.session.get(Proposal, proposal_id)
     if not proposal:
         abort(404)
@@ -3810,7 +4126,27 @@ def draft_proposal_estimate(proposal_id):
     if not _can_access_project(project):
         abort(404)
 
-    org_id = current_user.org_id
+    ok, msg = _platform_ai_gate()
+    if not ok:
+        flash(msg, "error")
+        return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
+
+    job = jobs.enqueue(
+        "draft_estimate",
+        {"proposal_id": proposal_id},
+        user_id=current_user.id,
+        org_id=current_user.org_id,
+    )
+    return redirect(url_for("job_status_page", job_id=job.id))
+
+
+def _perform_estimate_draft(proposal_id, user, set_progress):
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        raise RuntimeError("Proposal no longer exists.")
+    project = db.session.get(Project, proposal.project_id)
+
+    org_id = user.org_id
     staff = [{"role_name": r.role_name, "category": r.category, "hourly_rate": r.hourly_rate,
               "overtime_rate": r.overtime_rate}
              for r in StaffRole.query.filter_by(org_id=org_id, is_active=True).all()]
@@ -3825,21 +4161,18 @@ def draft_proposal_estimate(proposal_id):
         scope_items = [i.item_text for i in ScopeItem.query.filter_by(
             scope_id=scope.id, status="included").all()]
 
+    set_progress("reading", "Reading project documents and rates…")
     rfp_text = _project_rfp_text(project.id)
-    try:
-        result = draft_estimate(
-            rfp_text, staff_roles=staff, equipment=equip, travel=travel,
-            approved_scope=scope_items,
-            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
-            user_model=current_user.llm_model or None,
-        )
-    except RuntimeError as e:
-        flash(str(e), "error")
-        return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
-    except Exception as e:
-        flash(f"Estimate drafting failed: {friendly_api_error(e)}", "error")
-        return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
 
+    set_progress("drafting", "Claude is drafting the estimate…")
+    result = draft_estimate(
+        rfp_text, staff_roles=staff, equipment=equip, travel=travel,
+        approved_scope=scope_items,
+        user_api_key=decrypt_api_key(user.api_key_encrypted) or None,
+        user_model=user.llm_model or None,
+    )
+
+    set_progress("saving", "Saving line items…")
     existing = ProposalEstimate.query.filter_by(proposal_id=proposal_id).first()
     if existing:
         db.session.delete(existing)
@@ -3856,9 +4189,17 @@ def draft_proposal_estimate(proposal_id):
             quantity=it["quantity"], unit=it["unit"], unit_cost=it["unit_cost"], sort_order=idx,
         ))
     db.session.commit()
-    _log_activity("estimate_draft", f"AI drafted {len(result['items'])} estimate line(s)", project.id)
-    flash(f"AI drafted {len(result['items'])} line item(s). Review and adjust below.", "success")
-    return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
+    _log_activity_for(user, "estimate_draft",
+                      f"AI drafted {len(result['items'])} estimate line(s)", project.id)
+    return {"redirect": url_for("proposal_estimate", proposal_id=proposal_id)}
+
+
+@jobs.register("draft_estimate")
+def _job_draft_estimate(payload, job):
+    user = db.session.get(User, job.user_id)
+    def _sp(phase, message=""):
+        jobs.set_progress(job, phase, message)
+    return _perform_estimate_draft(payload["proposal_id"], user, _sp)
 
 
 @app.route("/proposal/<proposal_id>/estimate/save", methods=["POST"])
@@ -4015,7 +4356,7 @@ def insert_estimate_into_proposal(proposal_id):
     if proposal.docx_file:
         docx_path = GENERATED_DIR / proposal.docx_file
         _brand_user = project.owner or current_user
-        markdown_to_docx(updated_md, str(docx_path), **_logo_docx_kwargs(_brand_user))
+        markdown_to_docx(updated_md, str(docx_path), **_project_brand_kwargs(project, _brand_user))
         storage.sync_up(docx_path)
     project.dollar_amount = _estimate_totals(estimate)["grand_total"]
     db.session.commit()
@@ -4076,7 +4417,7 @@ def edit_proposal(proposal_id):
             markdown_to_docx(
                 new_content,
                 str(docx_path),
-                **_logo_docx_kwargs(_brand_user),
+                **_project_brand_kwargs(project, _brand_user),
             )
             storage.sync_up(docx_path)
 
@@ -4140,6 +4481,9 @@ def ai_assist(proposal_id):
     if not text:
         return {"error": "Select some text first."}, 400
 
+    if _ai_rate_limited(f"assist:{current_user.id}", max_calls=10):
+        return {"error": "Too many AI edits at once — wait a minute and try again."}, 429
+
     instructions = {
         "tighten": "Rewrite this passage to be more concise and punchy without losing meaning.",
         "formal": "Rewrite this passage in a more formal, professional business tone.",
@@ -4154,8 +4498,9 @@ def ai_assist(proposal_id):
     if not key:
         return {"error": "No API key configured. Add one in Settings."}, 400
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=key, timeout=45, max_retries=1)
+        # Metered client: records token usage and enforces the org's monthly AI
+        # budget (raw clients here previously bypassed both).
+        client = proposal_agent._make_client(key)
         import platform_config
         resp = client.messages.create(
             model=current_user.llm_model or platform_config.get("llm_model", "claude-opus-4-8"),
@@ -4237,7 +4582,7 @@ def restore_version(proposal_id, version_id):
         markdown_to_docx(
             version.markdown_content,
             str(docx_path),
-            **_logo_docx_kwargs(_brand_user),
+            **_project_brand_kwargs(project, _brand_user),
         )
         storage.sync_up(docx_path)
 
@@ -4793,32 +5138,65 @@ def apply_feedback(proposal_id):
             lifecycle_labels=LIFECYCLE_LABELS,
         )
 
-    # POST — collect selected request ids & edited directives
+    # POST — validate the selection, then hand the minutes-long AI revision to a
+    # background job (previously ran inline, holding a web worker and risking a
+    # load-balancer timeout on the largest AI call in the app).
     selected_ids = request.form.getlist("apply_request_id")
     if not selected_ids:
         flash("Please select at least one revision request to apply.", "error")
         return redirect(url_for("apply_feedback", proposal_id=proposal_id))
 
-    selected_requests = []
+    valid_ids = []
+    directives = {}
     for rid in selected_ids:
         req = db.session.get(RevisionRequest, rid)
         if not req or req.proposal_id != proposal_id or req.status != "pending":
             continue
+        valid_ids.append(rid)
         # Allow owner to edit the directive inline before the AI sees it
         edited = request.form.get(f"directive_{rid}", "").strip()
         if edited:
-            req.directive = edited
-        selected_requests.append(req)
+            directives[rid] = edited
 
-    if not selected_requests:
+    if not valid_ids:
         flash("No valid requests selected.", "error")
         return redirect(url_for("apply_feedback", proposal_id=proposal_id))
 
-    # Build the AI payload
-    current_version = latest_version(proposal_id)
-    if not current_version:
+    if not latest_version(proposal_id):
         flash("Proposal has no version to revise.", "error")
         return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
+    job = jobs.enqueue(
+        "revise_proposal",
+        {"proposal_id": proposal_id, "request_ids": valid_ids, "directives": directives},
+        user_id=current_user.id,
+        org_id=current_user.org_id,
+    )
+    return redirect(url_for("job_status_page", job_id=job.id))
+
+
+def _perform_revision(proposal_id, user, request_ids, directives, set_progress):
+    """Apply a batch of revision requests with AI. Runs inside a background job."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        raise RuntimeError("Proposal no longer exists.")
+    project = db.session.get(Project, proposal.project_id)
+
+    set_progress("reading", "Collecting revision requests and context…")
+    selected_requests = []
+    for rid in request_ids:
+        req = db.session.get(RevisionRequest, rid)
+        if not req or req.proposal_id != proposal_id or req.status != "pending":
+            continue
+        if directives.get(rid):
+            req.directive = directives[rid]
+        selected_requests.append(req)
+    if not selected_requests:
+        raise RuntimeError("The selected revision requests are no longer pending.")
+
+    current_version = latest_version(proposal_id)
+    if not current_version:
+        raise RuntimeError("Proposal has no version to revise.")
 
     ai_payload = []
     for r in selected_requests:
@@ -4833,9 +5211,7 @@ def apply_feedback(proposal_id):
             "author_label": f"{author_label} — {role_label}",
         })
 
-    # Load supporting context
-    owner = _proposal_owner(proposal)
-    owner_id = owner.id if owner else current_user.id
+    org = _org_for_project(project)
     standards = CompanyStandard.query.filter_by(org_id=_owner_org_id(project), is_active=True).all()
     standards_data = [
         {"category": s.category, "title": s.title, "content": s.content}
@@ -4856,32 +5232,26 @@ def apply_feedback(proposal_id):
         for c in corrections
     ] if corrections else None
 
-    try:
-        result = revise_proposal(
-            current_markdown=current_version.markdown_content,
-            revision_requests=ai_payload,
-            vertical=proposal.vertical,
-            company_name=current_user.company_name,
-            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
-            user_model=current_user.llm_model or None,
-            company_standards=standards_data,
-            past_corrections=corrections_data,
-        )
-    except RuntimeError as e:
-        flash(str(e), "error")
-        return redirect(url_for("apply_feedback", proposal_id=proposal_id))
-    except Exception as e:
-        flash(f"AI revision failed: {friendly_api_error(e)}", "error")
-        return redirect(url_for("apply_feedback", proposal_id=proposal_id))
+    set_progress("drafting", "Claude is applying the revision requests…")
+    result = revise_proposal(
+        current_markdown=current_version.markdown_content,
+        revision_requests=ai_payload,
+        vertical=proposal.vertical,
+        company_name=(org.name if org else "") or "",
+        user_api_key=decrypt_api_key(user.api_key_encrypted) or None,
+        user_model=user.llm_model or None,
+        company_standards=standards_data,
+        past_corrections=corrections_data,
+    )
 
-    # Create the new version
+    set_progress("saving", "Formatting and saving the new version…")
     latest_num = current_version.version_number
     new_version = ProposalVersion(
         proposal_id=proposal_id,
         version_number=latest_num + 1,
         markdown_content=result["revised_markdown"],
         edit_source="ai",
-        editor_id=current_user.id,
+        editor_id=user.id,
         change_summary=f"AI revision: {result['ai_summary']}",
     )
     db.session.add(new_version)
@@ -4893,9 +5263,8 @@ def apply_feedback(proposal_id):
     storage.sync_up(md_path)
     if proposal.docx_file:
         docx_path = GENERATED_DIR / proposal.docx_file
-        _brand_user = project.owner or current_user
         markdown_to_docx(result["revised_markdown"], str(docx_path),
-                         **_logo_docx_kwargs(_brand_user))
+                         **_project_brand_kwargs(project, project.owner or user))
         storage.sync_up(docx_path)
 
     # Update action items count
@@ -4908,7 +5277,7 @@ def apply_feedback(proposal_id):
         proposal_id=proposal_id,
         from_version_id=current_version.id,
         to_version_id=new_version.id,
-        triggered_by=current_user.id,
+        triggered_by=user.id,
         request_count=len(selected_requests),
         ai_change_summary=json.dumps({
             "summary": result["ai_summary"],
@@ -4929,7 +5298,7 @@ def apply_feedback(proposal_id):
             "revision_requested", "in_review", "internally_approved", "customer_feedback"
         ):
             lifecycle_transition(
-                proposal, "in_review", current_user.id,
+                proposal, "in_review", user.id,
                 note=f"AI generated v{new_version.version_number} from {len(selected_requests)} request(s)."
             )
     except LifecycleError:
@@ -4938,7 +5307,7 @@ def apply_feedback(proposal_id):
     # Notify reviewers a new version needs their attention
     reviewers = ProposalReviewer.query.filter_by(proposal_id=proposal_id).all()
     for rv in reviewers:
-        if rv.user_id == current_user.id:
+        if rv.user_id == user.id:
             continue
         _notify(
             rv.user_id,
@@ -4949,16 +5318,22 @@ def apply_feedback(proposal_id):
         )
 
     db.session.commit()
-    _log_activity(
+    _log_activity_for(
+        user,
         "proposal_revise",
         f"AI-revised proposal to v{new_version.version_number} ({len(selected_requests)} requests applied)",
         project.id,
     )
-    flash(
-        f"Version {new_version.version_number} generated. {len(selected_requests)} request(s) applied.",
-        "success",
-    )
-    return redirect(url_for("view_proposal", proposal_id=proposal_id))
+    return {"redirect": url_for("view_proposal", proposal_id=proposal_id)}
+
+
+@jobs.register("revise_proposal")
+def _job_revise_proposal(payload, job):
+    user = db.session.get(User, job.user_id)
+    def _sp(phase, message=""):
+        jobs.set_progress(job, phase, message)
+    return _perform_revision(payload["proposal_id"], user, payload["request_ids"],
+                             payload.get("directives") or {}, _sp)
 
 
 @app.route("/proposal/<proposal_id>/submit-to-customer", methods=["POST"])
@@ -5031,6 +5406,9 @@ def create_share(proposal_id):
     share.allow_comments = allow_comments
     share.allow_decision = allow_decision
     share.version_number = version.version_number if version else 0
+    # Share links carry accept/decline authority — they must not live forever.
+    # Every (re)share extends the window rather than leaving it open-ended.
+    share.expires_at = datetime.now(timezone.utc) + timedelta(days=90)
     db.session.flush()
 
     # Advance lifecycle if we're at the internally-approved gate
@@ -5050,8 +5428,9 @@ def create_share(proposal_id):
         except Exception:
             pdf_path = None
         import mailer
+        _share_org = _org_for_project(project)
         body = (
-            f"Hello,\n\n{current_user.company_name or 'We'} have prepared a proposal for "
+            f"Hello,\n\n{(_share_org.name if _share_org else '') or 'We'} have prepared a proposal for "
             f"{project.name}. You can review it online here:\n\n{share_url}\n\n"
         )
         if share.allow_decision:
@@ -5108,7 +5487,7 @@ def customer_portal(token):
 
     proposal = db.session.get(Proposal, share.proposal_id)
     project = db.session.get(Project, share.project_id)
-    owner = db.session.get(User, project.user_id) if project else None
+    brand_org = _org_for_project(project)
 
     # Record the view (dedupe rapid reloads within 60s from same IP)
     ip = request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()
@@ -5151,11 +5530,12 @@ def customer_portal(token):
     md_text = re.sub(r"\[ASSUMED:.*?\]", "", md_text, flags=re.DOTALL | re.IGNORECASE)
     proposal_html = htmlsafe.sanitize(md.markdown(md_text, extensions=["tables", "fenced_code"]))
 
-    company_name = (owner.company_name if owner else "") or ""
-    logo_url = url_for("portal_logo", token=token) if (
-        owner and owner.company_logo_path and getattr(owner, "company_logo_use_in_proposals", False)
-        and Path(owner.company_logo_path).exists()
-    ) else ""
+    company_name = (brand_org.name if brand_org else "") or ""
+    logo_url = ""
+    if brand_org and brand_org.logo_path and brand_org.logo_use_in_proposals:
+        storage.ensure_local(brand_org.logo_path)
+        if Path(brand_org.logo_path).exists():
+            logo_url = url_for("portal_logo", token=token)
 
     return render_template(
         "portal.html",
@@ -5173,11 +5553,13 @@ def portal_logo(token):
     share = _valid_share(token)
     if not share:
         abort(404)
-    project = db.session.get(Project, share.project_id)
-    owner = db.session.get(User, project.user_id) if project else None
-    if not owner or not owner.company_logo_path or not Path(owner.company_logo_path).exists():
+    org = _org_for_project(db.session.get(Project, share.project_id))
+    if not org or not org.logo_path:
         abort(404)
-    return send_file(owner.company_logo_path, mimetype="image/png")
+    storage.ensure_local(org.logo_path)
+    if not Path(org.logo_path).exists():
+        abort(404)
+    return send_file(org.logo_path, mimetype="image/png")
 
 
 @app.route("/p/<token>/comment", methods=["POST"])
@@ -6138,6 +6520,48 @@ def toggle_admin(user_id):
     return redirect(url_for("admin_panel"))
 
 
+@app.route("/admin/deactivate-user/<user_id>", methods=["POST"])
+@login_required
+def deactivate_user(user_id):
+    """Offboard a member: they can no longer sign in, existing sessions die on
+    next request, and their seat is freed. Their projects/data stay visible to
+    the org. Reversible via reactivate."""
+    if not current_user.is_admin:
+        abort(403)
+    if user_id == current_user.id:
+        flash("You cannot deactivate your own account.", "error")
+        return redirect(url_for("admin_panel"))
+    user = db.session.get(User, user_id)
+    if not user or not _same_org(user):
+        abort(404)
+    user.is_active = False
+    db.session.commit()
+    _log_activity("user_deactivate", f"Deactivated {user.username}")
+    flash(f"{user.display_name or user.username} deactivated. "
+          "They can no longer sign in; their seat is freed.", "success")
+    return redirect(url_for("admin_panel"))
+
+
+@app.route("/admin/reactivate-user/<user_id>", methods=["POST"])
+@login_required
+def reactivate_user(user_id):
+    if not current_user.is_admin:
+        abort(403)
+    user = db.session.get(User, user_id)
+    if not user or not _same_org(user):
+        abort(404)
+    # Reactivation consumes a seat again — enforce the plan limit.
+    ok, msg = billing_check_seat(current_user.org_id)
+    if not ok:
+        flash(msg, "error")
+        return redirect(url_for("billing_page"))
+    user.is_active = True
+    db.session.commit()
+    _log_activity("user_reactivate", f"Reactivated {user.username}")
+    flash(f"{user.display_name or user.username} reactivated.", "success")
+    return redirect(url_for("admin_panel"))
+
+
 @app.route("/admin/update-role/<user_id>", methods=["POST"])
 @login_required
 def update_user_role(user_id):
@@ -6315,6 +6739,104 @@ def preview_document(doc_id):
     if not _can_access_project(project):
         abort(404)
     return _send_stored_file(doc.file_path, as_attachment=False)
+
+
+@app.route("/documents/<doc_id>/delete", methods=["POST"])
+@login_required
+def delete_document(doc_id):
+    """Delete an uploaded document (row, tags, local file, and object-storage
+    copy). Previously there was no way to remove a mis-uploaded file at all."""
+    doc = db.session.get(ProjectDocument, doc_id)
+    if not doc:
+        abort(404)
+    project = db.session.get(Project, doc.project_id)
+    if not _can_access_project(project):
+        abort(404)
+    name = doc.original_filename
+    DocumentTag.query.filter_by(document_id=doc.id).delete()
+    try:
+        storage.delete(doc.file_path)
+    except Exception:
+        pass
+    db.session.delete(doc)
+    db.session.commit()
+    _log_activity("document_delete", f"Deleted document: {name}", project.id)
+    flash(f"'{name}' deleted.", "success")
+    return redirect(request.referrer or url_for("project_upload", project_id=project.id))
+
+
+@app.route("/projects/<project_id>/delete", methods=["POST"])
+@login_required
+def delete_project(project_id):
+    """Permanently delete a project and everything under it (documents,
+    proposals, versions, scope, estimates, shares…), including files on disk
+    and in object storage. Owner or org admin only."""
+    project = db.session.get(Project, project_id)
+    if not project:
+        abort(404)
+    is_owner = project.user_id == current_user.id
+    is_org_admin = current_user.is_admin and _same_org(project.org_id or _owner_org_id(project))
+    if not (is_owner or is_org_admin):
+        abort(404)
+    if request.form.get("confirm_name", "").strip() != project.name:
+        flash("Type the project's exact name to confirm deletion.", "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    name = project.name
+    proposal_ids = [p.id for p in Proposal.query.filter_by(project_id=project_id).all()]
+
+    # Generated proposal files (md/docx/pdf)
+    for prop in Proposal.query.filter_by(project_id=project_id).all():
+        for fname in (prop.md_file, prop.docx_file, prop.pdf_file):
+            if fname:
+                try:
+                    storage.delete(GENERATED_DIR / fname)
+                except Exception:
+                    pass
+
+    # Uploaded document files + tags
+    docs = ProjectDocument.query.filter_by(project_id=project_id).all()
+    for doc in docs:
+        try:
+            storage.delete(doc.file_path)
+        except Exception:
+            pass
+        DocumentTag.query.filter_by(document_id=doc.id).delete()
+
+    if proposal_ids:
+        # Children of proposals, leaves first (FKs are not ON DELETE CASCADE)
+        share_ids = [s.id for s in ProposalShare.query.filter(
+            ProposalShare.proposal_id.in_(proposal_ids)).all()]
+        if share_ids:
+            ShareView.query.filter(ShareView.share_id.in_(share_ids)).delete(synchronize_session=False)
+        ProposalShare.query.filter(ProposalShare.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        ProposalApproval.query.filter(ProposalApproval.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        ProposalReviewer.query.filter(ProposalReviewer.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        ProposalRevisionBatch.query.filter(ProposalRevisionBatch.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        RevisionRequest.query.filter(RevisionRequest.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        ProposalStatusHistory.query.filter(ProposalStatusHistory.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        ProposalComment.query.filter(ProposalComment.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        ReviewComment.query.filter(ReviewComment.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        ReviewCycle.query.filter(ReviewCycle.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        ProposalCorrection.query.filter(ProposalCorrection.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        est_ids = [e.id for e in ProposalEstimate.query.filter(
+            ProposalEstimate.proposal_id.in_(proposal_ids)).all()]
+        if est_ids:
+            EstimateLineItem.query.filter(EstimateLineItem.estimate_id.in_(est_ids)).delete(synchronize_session=False)
+        ProposalEstimate.query.filter(ProposalEstimate.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        ProposalVersion.query.filter(ProposalVersion.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+
+    ClarificationItem.query.filter_by(project_id=project_id).delete(synchronize_session=False)
+    ProposalQuestion.query.filter_by(project_id=project_id).delete(synchronize_session=False)
+    ScopeItem.query.filter_by(project_id=project_id).delete(synchronize_session=False)
+    ProjectScope.query.filter_by(project_id=project_id).delete(synchronize_session=False)
+    ProjectDocument.query.filter_by(project_id=project_id).delete(synchronize_session=False)
+    Proposal.query.filter_by(project_id=project_id).delete(synchronize_session=False)
+    db.session.delete(project)
+    db.session.commit()
+    _log_activity("project_delete", f"Deleted project: {name}")
+    flash(f"Project '{name}' and all its data were permanently deleted.", "success")
+    return redirect(url_for("proposals_list"))
 
 
 @app.route("/documents/<doc_id>/tags", methods=["POST"])
@@ -7413,7 +7935,8 @@ def generate_rfi_letter(project_id):
     db.session.commit()
 
     # Generate DOCX
-    company_name = current_user.company_name or "Our Company"
+    _rfi_org = _org_for_project(project)
+    company_name = (_rfi_org.name if _rfi_org else "") or "Our Company"
     rfi_filename = f"rfi_letter_{project_id[:8]}_{datetime.now(timezone.utc).strftime('%Y%m%d')}.docx"
     rfi_path = GENERATED_DIR / rfi_filename
 
@@ -7580,12 +8103,13 @@ def regenerate_proposal_section(proposal_id):
             continue
 
     try:
+        _sec_org = _org_for_project(project)
         result = regenerate_section(
             full_proposal_md=current_md,
             section_heading=section_heading,
             clarification_answer=clarification_answer,
             original_rfp_text=rfp_text,
-            company_name=current_user.company_name,
+            company_name=(_sec_org.name if _sec_org else ""),
             user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
             user_model=current_user.llm_model or None,
         )
@@ -7624,7 +8148,7 @@ def regenerate_proposal_section(proposal_id):
             docx_path = GENERATED_DIR / proposal.docx_file
             _brand_user = project.owner or current_user
             markdown_to_docx(updated_md, str(docx_path),
-                             **_logo_docx_kwargs(_brand_user))
+                             **_project_brand_kwargs(project, _brand_user))
             storage.sync_up(docx_path)
 
         # Update action items count
@@ -7805,6 +8329,9 @@ def chat_help():
     if not message:
         return {"reply": "Please type a question and I'll do my best to help!"}
 
+    if _ai_rate_limited(f"chat:{current_user.id}", max_calls=20):
+        return {"reply": "You're sending messages very quickly — give me a minute to catch up."}
+
     def _record(reply, answered_by):
         # Store the Q&A for platform-owner analytics (best-effort).
         try:
@@ -7821,8 +8348,9 @@ def chat_help():
     effective_key = api_key or platform_config.get("anthropic_api_key")
     if effective_key:
         try:
-            import anthropic
-            client = anthropic.Anthropic(api_key=effective_key, timeout=30, max_retries=1)
+            # Metered client: chat usage counts toward the org's AI budget and
+            # is recorded like every other LLM call.
+            client = proposal_agent._make_client(effective_key)
             resp = client.messages.create(
                 model=current_user.llm_model or platform_config.get("llm_model", "claude-opus-4-8"),
                 max_tokens=400,

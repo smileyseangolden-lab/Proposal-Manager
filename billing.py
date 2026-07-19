@@ -157,8 +157,11 @@ def generations_this_month(org_id) -> int:
 
 
 def seats_used(org_id) -> int:
+    """Active members only — deactivated (offboarded) users free their seat."""
     from models import User
-    return User.query.filter_by(org_id=org_id).count()
+    return User.query.filter(
+        User.org_id == org_id, User.is_active.isnot(False)
+    ).count()
 
 
 def check_generation(org_id) -> tuple[bool, str]:

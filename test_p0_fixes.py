@@ -93,6 +93,9 @@ with app.app_context():
                             'password': 'password123', 'display_name': 'Pat',
                             'company_name': 'OrgA'})
     pat = User.query.filter_by(username='pat').first()
+    # Platform-key AI requires a verified email (P1 abuse gate)
+    pat.email_verified = True
+    db.session.commit()
 
     r = c.post('/settings/upload-template', data={
         'template_name': 'House Style', 'vertical': 'general', 'template_type': 'proposal',

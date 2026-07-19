@@ -35,32 +35,33 @@
             </div>
         </div>
         <div class="form-group">
-            <label for="company_name">Company Name</label>
-            <input type="text" id="company_name" name="company_name" value="{{ current_user.company_name }}">
+            <label for="company_name">Company Name <span class="form-hint">(workspace-wide — brands every member's proposals)</span></label>
+            <input type="text" id="company_name" name="company_name" value="{{ org.name if org else '' }}"{% if not current_user.is_admin %} readonly title="Only workspace admins can rename the company"{% endif %}>
+            {% if not current_user.is_admin %}<span class="form-hint">Only workspace admins can change this.</span>{% endif %}
         </div>
-        <!-- Preserve logo preferences when saving this form -->
-        <input type="hidden" name="company_logo_placement" value="{{ current_user.company_logo_placement or 'top_left' }}">
-        {% if current_user.company_logo_use_in_proposals %}<input type="hidden" name="company_logo_use_in_proposals" value="1">{% endif %}
-        {% if current_user.company_logo_show_on_cover %}<input type="hidden" name="company_logo_show_on_cover" value="1">{% endif %}
+        <!-- Preserve workspace logo preferences when saving this form -->
+        <input type="hidden" name="company_logo_placement" value="{{ (org.logo_placement if org else '') or 'top_left' }}">
+        {% if org and org.logo_use_in_proposals %}<input type="hidden" name="company_logo_use_in_proposals" value="1">{% endif %}
+        {% if org and org.logo_show_on_cover %}<input type="hidden" name="company_logo_show_on_cover" value="1">{% endif %}
 
         <h2 style="margin-top: 22px;">AI Provider</h2>
         <div class="form-row">
             <div class="form-group">
                 <label for="llm_provider">AI LLM Provider</label>
                 <select id="llm_provider" name="llm_provider">
-                    <option value="anthropic" {{ 'selected' if current_user.llm_provider == 'anthropic' }}>Anthropic (Claude)</option>
-                    <option value="openai" {{ 'selected' if current_user.llm_provider == 'openai' }}>OpenAI (GPT)</option>
-                    <option value="google" {{ 'selected' if current_user.llm_provider == 'google' }}>Google (Gemini)</option>
+                    <option value="anthropic" selected>Anthropic (Claude)</option>
                 </select>
             </div>
             <div class="form-group">
                 <label for="llm_model">Model</label>
+                {% set known_models = ['claude-opus-4-8', 'claude-sonnet-5', 'claude-haiku-4-5-20251001'] %}
                 <select id="llm_model" name="llm_model">
-                    <optgroup label="Anthropic">
-                        <option value="claude-opus-4-6" {{ 'selected' if current_user.llm_model == 'claude-opus-4-6' }}>Claude Opus 4.6</option>
-                        <option value="claude-sonnet-4-6" {{ 'selected' if current_user.llm_model == 'claude-sonnet-4-6' }}>Claude Sonnet 4.6</option>
-                        <option value="claude-haiku-4-5-20251001" {{ 'selected' if current_user.llm_model == 'claude-haiku-4-5-20251001' }}>Claude Haiku 4.5</option>
-                    </optgroup>
+                    <option value="claude-opus-4-8" {{ 'selected' if current_user.llm_model == 'claude-opus-4-8' }}>Claude Opus 4.8 (recommended)</option>
+                    <option value="claude-sonnet-5" {{ 'selected' if current_user.llm_model == 'claude-sonnet-5' }}>Claude Sonnet 5 (faster)</option>
+                    <option value="claude-haiku-4-5-20251001" {{ 'selected' if current_user.llm_model == 'claude-haiku-4-5-20251001' }}>Claude Haiku 4.5 (lightest)</option>
+                    {% if current_user.llm_model and current_user.llm_model not in known_models %}
+                    <option value="{{ current_user.llm_model }}" selected>{{ current_user.llm_model }} (current)</option>
+                    {% endif %}
                 </select>
             </div>
         </div>
@@ -82,6 +83,27 @@
             </select>
         </div>
         <button type="submit" class="btn btn-primary">Save Settings</button>
+    </form>
+</div>
+
+<div class="card" style="max-width: 760px;">
+    <h2>Change Password</h2>
+    <form method="post" action="{{ url_for('change_password') }}">
+        <div class="form-group">
+            <label for="current_password">Current Password</label>
+            <input type="password" id="current_password" name="current_password" required autocomplete="current-password">
+        </div>
+        <div class="form-row">
+            <div class="form-group">
+                <label for="new_password">New Password <span class="form-hint">(min 8 characters)</span></label>
+                <input type="password" id="new_password" name="new_password" required minlength="8" autocomplete="new-password">
+            </div>
+            <div class="form-group">
+                <label for="confirm_password">Confirm New Password</label>
+                <input type="password" id="confirm_password" name="confirm_password" required minlength="8" autocomplete="new-password">
+            </div>
+        </div>
+        <button type="submit" class="btn btn-secondary">Update Password</button>
     </form>
 </div>
 

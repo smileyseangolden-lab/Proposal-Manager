@@ -18,7 +18,7 @@
             </a>
         </div>
 
-        {% set workspace_name = current_user.company_name or (current_user.display_name or current_user.username) %}
+        {% set workspace_name = nav_org_name or current_user.company_name or (current_user.display_name or current_user.username) %}
         <a class="workspace-chip" href="{{ url_for('settings') }}" title="Workspace settings">
             <span class="workspace-chip-avatar">{{ workspace_name[:1] | upper }}</span>
             <span class="workspace-chip-name">{{ workspace_name }}</span>
@@ -87,7 +87,7 @@
         <div class="sidebar-footer">
             <div class="sidebar-user">
                 <span class="sidebar-user-name">{{ current_user.display_name or current_user.username }}</span>
-                <span class="sidebar-user-company">{{ current_user.company_name or '' }}</span>
+                <span class="sidebar-user-company">{{ nav_org_name or '' }}</span>
             </div>
             <form method="POST" action="{{ url_for('logout') }}" style="margin:0">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">

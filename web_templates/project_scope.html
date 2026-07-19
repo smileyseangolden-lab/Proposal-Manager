@@ -24,7 +24,7 @@
         </div>
         <div class="header-actions">
             <form method="post" action="{{ url_for('generate_scope', project_id=project.id) }}" class="inline-form"
-                  onsubmit="return confirm('Re-draft the scope with AI? Your current items (including edits) will be replaced.');">
+                  onsubmit="return confirm('Re-draft the scope with AI? AI-proposed items will be replaced; items your team added are kept.');">
                 <input type="hidden" name="vertical" value="auto">
                 <button type="submit" class="btn btn-secondary">&#10227; Re-draft with AI</button>
             </form>
@@ -86,6 +86,13 @@
                             <span class="chip chip-red">Removed from scope</span>
                             {% endif %}
                         </div>
+                        <details class="scope-item-edit" style="margin-top:6px;">
+                            <summary style="cursor:pointer; font-size:12.5px; color:var(--sea-600);">&#9998; Edit wording</summary>
+                            <form method="post" action="{{ url_for('edit_scope_item', project_id=project.id, item_id=item.id) }}" style="margin-top:6px;">
+                                <textarea name="item_text" rows="2" required style="width:100%; font-size:13px;">{{ item.item_text }}</textarea>
+                                <button type="submit" class="btn btn-small btn-secondary" style="margin-top:4px;">Save wording</button>
+                            </form>
+                        </details>
                     </div>
                     {% if item.source == 'human' %}
                     <form method="post" action="{{ url_for('delete_scope_item', project_id=project.id, item_id=item.id) }}" class="inline-form" onsubmit="return confirm('Delete this scope item?');">
