@@ -1,6 +1,6 @@
 # Enhanced Overview of MCT AE Flow — AI Agent Training Document
 
-**Document Purpose:** This document provides the detailed workflow narrative for E Tech Group's Mission Critical Team (MCT) proposal process. It is designed to train an AI agent to understand each step of the process and produce first-draft MCT/Data Center proposals from RFPs and RFQs.
+**Document Purpose:** This document provides the detailed workflow narrative for the Company's Mission Critical Team (MCT) proposal process. It is designed to train an AI agent to understand each step of the process and produce first-draft MCT/Data Center proposals from RFPs and RFQs.
 
 **Version:** 3.0 — Updated to incorporate the MCT Proposal RACI Matrix (r2)
 **Date:** February 19, 2026
@@ -73,9 +73,9 @@ When the AE reviews the RFP package, they contact the BDM to get a better unders
 **Key Decisions at This Step:**
 
 - **System type:** Is this a BMS project, an EPMS project, or both?
-- **Delivery model:** Is this a turnkey bid (E Tech procures materials and executes) or labor-only?
+- **Delivery model:** Is this a turnkey bid (the Company procures materials and executes) or labor-only?
 - **Program assignment:** Is this a Hyperscale, OSI, or Colocation project? (The specific group assignment is determined by BD and the Program Directors — the AE group is not privy to that process.)
-- **Bid/No-Bid evaluation:** The team assesses whether to proceed based on: project timing, project size (megawatts), availability of low voltage contractors and other contractors at that location, whether the site location is suitable for E Tech Group's capabilities, and whether it logistically makes sense to pursue.
+- **Bid/No-Bid evaluation:** The team assesses whether to proceed based on: project timing, project size (megawatts), availability of low voltage contractors and other contractors at that location, whether the site location is suitable for the Company's capabilities, and whether it logistically makes sense to pursue.
 - **Win Theme:** The BDM is Responsible for defining the win theme for the pursuit — Quality, Experience, or Value Engineering. This strategic framing informs how the AI agent should position the entire proposal.
 
 **Output:** A go/no-go decision, an assigned pursuit team with defined roles per the RACI, a defined win theme, and an organized document repository with all RFP materials accessible to the team.
@@ -90,9 +90,9 @@ When the AE reviews the RFP package, they contact the BDM to get a better unders
 The full bid package from Step 1, specifically the design drawings and specifications. The AE reviews multiple drawing sets including: Mechanical, Architecture, Telecom, Controls and Automation, Electrical, Plumbing, and Technology. Most of these drawing sets are always present regardless of project type. Additional drawing sets may also be included (e.g., structural, civil, fire protection).
 
 **Process:**
-The AE physically goes sheet by sheet through every drawing set, marking up and counting every relevant item: instruments (temperature sensors, humidity sensors, flow meters, control valves, differential pressure sensors, etc.), panels (PLC panels, RIO panels, leak detection panels, etc.), gateways, VAV controllers, network devices, cable runs, and conduit paths. For each item, the AE documents: the quantity, its location in the facility, the signal type, wiring type, where it is wired to (destination panel), who is supplying it (E Tech, client/OFCI, or LV Sub), and who is installing it.
+The AE physically goes sheet by sheet through every drawing set, marking up and counting every relevant item: instruments (temperature sensors, humidity sensors, flow meters, control valves, differential pressure sensors, etc.), panels (PLC panels, RIO panels, leak detection panels, etc.), gateways, VAV controllers, network devices, cable runs, and conduit paths. For each item, the AE documents: the quantity, its location in the facility, the signal type, wiring type, where it is wired to (destination panel), who is supplying it (the Company, client/OFCI, or LV Sub), and who is installing it.
 
-The AE is identifying everything that falls within E Tech's controls scope — specifically anything related to Controls, BMS, BAS, EPMS, PMS, and low voltage electrical. Life-supporting devices such as fire or hydrogen sensors tied to life safety systems are excluded from E Tech's scope (though standalone hydrogen sensors for environmental monitoring may be included).
+The AE is identifying everything that falls within the Company's controls scope — specifically anything related to Controls, BMS, BAS, EPMS, PMS, and low voltage electrical. Life-supporting devices such as fire or hydrogen sensors tied to life safety systems are excluded from the Company's scope (though standalone hydrogen sensors for environmental monitoring may be included).
 
 The takeoff also captures:
 
@@ -114,9 +114,9 @@ Some AEs use the BMS/EPMS Automation Worksheet (a standardized scope matrix spre
 - Asking project engineers for help on technical questions that require specialized expertise.
 - Determining which contractors to send scope packages to for subcontractor bids. The Procurement Manager is responsible for recommending subcontractors. The BDM and BU Leadership decide which subcontractors will be asked to bid.
 
-**Typical Duration:** A day or two for E Tech's internal takeoff work, but the overall process can stretch to weeks depending on project size and the time required to get bids back from contractors (which is outside E Tech's control).
+**Typical Duration:** A day or two for the Company's internal takeoff work, but the overall process can stretch to weeks depending on project size and the time required to get bids back from contractors (which is outside the Company's control).
 
-**Output:** A completed material takeoff with instrument counts, panel counts, cable/conduit quantities, I/O counts, software requirements, and a categorized list of all scope items with ownership assignments (E Tech vs. OFCI vs. LV Sub). This data feeds directly into the estimate workbook (Step 6) and informs the LV Sub SOW (Step 3).
+**Output:** A completed material takeoff with instrument counts, panel counts, cable/conduit quantities, I/O counts, software requirements, and a categorized list of all scope items with ownership assignments (the Company vs. OFCI vs. LV Sub). This data feeds directly into the estimate workbook (Step 6) and informs the LV Sub SOW (Step 3).
 
 ---
 
@@ -130,9 +130,9 @@ The RFP specifications, design drawings, project timeline, and the material take
 **Process:**
 The AE drafts the Scope of Work for the Low Voltage Subcontractor (LV Sub), with the Operations Engineer jointly Responsible or Consulted on the content. This is a standalone deliverable — a detailed document that tells the LV Sub exactly what they are responsible for procuring, installing, and testing.
 
-Key information that flows from the RFP into the LV Sub SOW includes: specific cable color requirements, conduit fill rates, connector types, and safety staffing requirements. These requirements are always dictated by the client specifications — the AE does not set these based on E Tech standards.
+Key information that flows from the RFP into the LV Sub SOW includes: specific cable color requirements, conduit fill rates, connector types, and safety staffing requirements. These requirements are always dictated by the client specifications — the AE does not set these based on the Company standards.
 
-The scope boundary between E Tech and the LV Sub is consistent: the LV Sub does conduit and wire installation; E Tech does commissioning and programming. Specifically, the LV Sub is typically responsible for: procurement of raceways/conduit/cables, installation of conduit and accessories, cable pulling and termination, installation of EPMS control panels (physical mounting), and verification of proper wiring (continuity checks, labeling). E Tech retains responsibility for: construction/field supervision, programming, point-to-point commissioning, system commissioning support, and as-built documentation.
+The scope boundary between the Company and the LV Sub is consistent: the LV Sub does conduit and wire installation; the Company does commissioning and programming. Specifically, the LV Sub is typically responsible for: procurement of raceways/conduit/cables, installation of conduit and accessories, cable pulling and termination, installation of EPMS control panels (physical mounting), and verification of proper wiring (continuity checks, labeling). The Company retains responsibility for: construction/field supervision, programming, point-to-point commissioning, system commissioning support, and as-built documentation.
 
 **Review Gate:** After the AE finishes building the LV Sub SOW and prior to distribution for subcontractor bids, it is reviewed by an Ops Engineer and Procurement Manager.
 
@@ -168,15 +168,15 @@ This step is managed primarily by Procurement, with the Prop Mgr as the Accounta
 
 *Note: BDM, Ops Director, and Executive are conditionally consulted on sub selection (marked C* in the RACI), meaning their involvement depends on the project's strategic importance or size.*
 
-The team targets at least 2 bids, but sometimes only 1 is obtainable depending on location and availability. The format of LV Sub quotes varies depending on the GC or end user being supported. E Tech tries to have the LV contractor follow the same format or breakout structure that E Tech is being asked to provide to the customer.
+The team targets at least 2 bids, but sometimes only 1 is obtainable depending on location and availability. The format of LV Sub quotes varies depending on the GC or end user being supported. The Company tries to have the LV contractor follow the same format or breakout structure that the Company is being asked to provide to the customer.
 
 **Selection Criteria:**
-LV Sub selection is based on: local presence, price, customer knowledge (familiarity with the client's standards and expectations), and client preference. Sometimes multiple bids are not required if the right contractor is already identified. Especially if that contractor has recently completed a successful project with E Tech.
+LV Sub selection is based on: local presence, price, customer knowledge (familiarity with the client's standards and expectations), and client preference. Sometimes multiple bids are not required if the right contractor is already identified. Especially if that contractor has recently completed a successful project with the Company.
 
 **If Bids Come in Over Budget:**
-The Prop Mgr, AE, and Ops Eng go through bid leveling to identify scope gaps driving the price. The Procurement Mgr and Ops Director should be consulted. If the gap cannot be resolved and the bid number is firm, E Tech submits the scope as an alternate in the proposal so the customer can choose whether they want E Tech to carry that scope or not.
+The Prop Mgr, AE, and Ops Eng go through bid leveling to identify scope gaps driving the price. The Procurement Mgr and Ops Director should be consulted. If the gap cannot be resolved and the bid number is firm, the Company submits the scope as an alternate in the proposal so the customer can choose whether they want the Company to carry that scope or not.
 
-**What the AI Agent Should Know:** This step is always a "Needs Input" flag. The AI agent cannot solicit or evaluate LV Sub bids, but it CAN generate the LV Sub SOW (Step 3) and identify the information needed for the bid package. The AI agent should structure the proposal pricing section to accommodate the sub's cost. E Tech defines the sub's scope and any assumptions or exclusions agreed upon during bid leveling.
+**What the AI Agent Should Know:** This step is always a "Needs Input" flag. The AI agent cannot solicit or evaluate LV Sub bids, but it CAN generate the LV Sub SOW (Step 3) and identify the information needed for the bid package. The AI agent should structure the proposal pricing section to accommodate the sub's cost. The Company defines the sub's scope and any assumptions or exclusions agreed upon during bid leveling.
 
 **Output:** A selected LV Sub with a reviewed and leveled quote, ready to be input into the estimate workbook.
 
@@ -194,7 +194,7 @@ Per the RACI, Procurement is Responsible for sending RFQs to vendors and pricing
 
 Categories typically quoted include: instruments, panels, control hardware, software licenses, valves, breakers, gateways, IT/OT hardware, and MCCs (Motor Control Centers).
 
-The AE determines what to quote vs. what is OFCI based on what is specified in the RFQ or in site standards. Ops Eng is consulted and reviews the instrument take-offs. E Tech maintains a preferred supplier list; if the needed supplier is not on the list, the AE or Procurement will find an appropriate supplier. In some cases, the customer has mandated suppliers or approved manufacturer lists specified in the specifications.
+The AE determines what to quote vs. what is OFCI based on what is specified in the RFQ or in site standards. Ops Eng is consulted and reviews the instrument take-offs. The Company maintains a preferred supplier list; if the needed supplier is not on the list, the AE or Procurement will find an appropriate supplier. In some cases, the customer has mandated suppliers or approved manufacturer lists specified in the specifications.
 
 Supplier quotes typically come back as line items. The AE needs to map those line items into the customer's required workbook or breakout format — this is a manual process.
 
@@ -206,7 +206,7 @@ Supplier quotes typically come back as line items. The AE needs to map those lin
 | Panels | Procurement | Prop Mgr | AE |
 
 **Panel Shop Quoting:**
-The go-to rule is to quote using E Tech's internal panel shops. If the internal panel shops cannot meet the customer's timeline, E Tech will look to outsource. In very specific cases, E Tech's panel shops need to be approved by the end user, and if E Tech is at capacity and cannot get approval for an external shop, this may require a no-bid on the panel scope. When panel fabrication is OFCI (client-provided), it will be called out in the RFQ or in the standards.
+The go-to rule is to quote using the Company's internal panel shops. If the internal panel shops cannot meet the customer's timeline, the Company will look to outsource. In very specific cases, the Company's panel shops need to be approved by the end user, and if the Company is at capacity and cannot get approval for an external shop, this may require a no-bid on the panel scope. When panel fabrication is OFCI (client-provided), it will be called out in the RFQ or in the standards.
 
 **Expense Estimation (per the RACI — AE is Responsible for all):**
 The AE estimates the following expense categories, with the Prop Mgr as Accountable and Procurement Consulted where applicable:
@@ -283,18 +283,18 @@ The proposal is assembled by multiple team members according to the RACI. The Pr
 
 ### Proposal Sections — Ownership and Content Source
 
-**Cover Letter** — BDM is Responsible. Follows a standard, intentionally consistent format across all MCT proposals. Customized with the client/GC name, project name/code, system type (BMS/EPMS/both), and the names of E Tech signers. References E Tech's Zer0Defects™ Methodology and decade-plus data center experience. The AI agent can draft this from the standard template, flagging client name, project code, and signer names as "Needs Input."
+**Cover Letter** — BDM is Responsible. Follows a standard, intentionally consistent format across all MCT proposals. Customized with the client/GC name, project name/code, system type (BMS/EPMS/both), and the names of the Company signers. References the Company's Zer0Defects™ Methodology and decade-plus data center experience. The AI agent can draft this from the standard template, flagging client name, project code, and signer names as "Needs Input."
 
 **Section 1: Proposal Baseline** — Mostly templated, customized with project details.
 
 - 1.1 Revision History — Project-specific (version, date, initials, comments).
 - 1.2 Documents Provided by Client — Project-specific (list of RFP documents received, with the platform/source noted).
 - 1.3 Client Contacts — Project-specific (names, titles, phone, email from the RFP).
-- 1.4 E Tech Group Contacts — Project-specific (assigned E Tech team members — typically BD lead, Program Director, and Engineering Manager). Needs Input from BD/PD.
+- 1.4 the Company Contacts — Project-specific (assigned the Company team members — typically BD lead, Program Director, and Engineering Manager). Needs Input from BD/PD.
 
-**Section 2: Executive Summary** — Standard boilerplate, sometimes lightly adapted. Per the RACI, the BDM defines the win theme (Quality, Experience, or Value Engineering) which should inform the executive summary's emphasis. E Tech has a standard executive summary that is rarely customized significantly. Includes the Strategy for Project Completion narrative and the project schedule reference. The AI agent should use the standard boilerplate and adapt emphasis based on the win theme.
+**Section 2: Executive Summary** — Standard boilerplate, sometimes lightly adapted. Per the RACI, the BDM defines the win theme (Quality, Experience, or Value Engineering) which should inform the executive summary's emphasis. The Company has a standard executive summary that is rarely customized significantly. Includes the Strategy for Project Completion narrative and the project schedule reference. The AI agent should use the standard boilerplate and adapt emphasis based on the win theme.
 
-**Section 3: E Tech Company Overview & Qualifications** — Boilerplate — does not change. Per the RACI, the BDM is Responsible for the Corporate Overview, with the Ops Director and Executive Consulted. In practice, this section is pulled from the standard template verbatim. It includes the company overview pages, customer testimonial, and Mission Critical Business Unit Overview (Colo Program, Hyperscale Program, OSI Program descriptions, QA/QC audit results chart, and certifications). The AI agent should pull this section directly from the template.
+**Section 3: Company Overview & Qualifications** — Boilerplate — does not change. Per the RACI, the BDM is Responsible for the Corporate Overview, with the Ops Director and Executive Consulted. In practice, this section is pulled from the standard template verbatim. It includes the company overview pages, customer testimonial, and Mission Critical Business Unit Overview (Colo Program, Hyperscale Program, OSI Program descriptions, QA/QC audit results chart, and certifications). The AI agent should pull this section directly from the template.
 
 **Section 4: Project Scope** — Heavily customized per project. Multiple owners.
 
@@ -305,10 +305,10 @@ Per the RACI:
 Subsections include:
 - 4.1 Scope Summary — Derived from the takeoff; lists the major deliverables.
 - 4.2 Design, Documentation, and BIM Services — Lists as-built deliverables. Adjusted based on turnkey vs. labor-only.
-- 4.3 Materials - Scope of Supply — Directly from the material takeoff. Delineates E Tech-procured vs. OFCI vs. LV Sub-procured.
+- 4.3 Materials - Scope of Supply — Directly from the material takeoff. Delineates the Company-procured vs. OFCI vs. LV Sub-procured.
 - 4.4 PLC System Software, Execution — Derived from the specifications.
-- 4.5 System Installation — Describes the LV Sub scope and E Tech's supervision role. Names the selected LV Sub partner.
-- 4.6 On-Site Support & Commissioning — Describes E Tech's commissioning scope.
+- 4.5 System Installation — Describes the LV Sub scope and the Company's supervision role. Names the selected LV Sub partner.
+- 4.6 On-Site Support & Commissioning — Describes the Company's commissioning scope.
 - 4.7 Testing (SAT/IST) — Project-specific based on RFP requirements.
 - 4.8 Change Management — Standard WOCN boilerplate.
 - 4.9 Safety & Security — Standard boilerplate.
@@ -370,7 +370,7 @@ Per the RACI, the BDM is Responsible for this review. The Prop Mgr and AE are Co
 **Stage 4B — Executive Margin Review with CEO/CFO/CRO/President:**
 Per the RACI, the BDM is Responsible. The same Consulted parties apply. The executive team evaluates:
 - Labor margin vs. material margin vs. sub margin (the detailed breakdown, not just overall margin).
-- Strategic pricing considerations — whether to take a deeper cut on pricing to win a project with a strategically important client name, or to win a project where E Tech already has staff on a nearby project and the timing allows easy staff transfer.
+- Strategic pricing considerations — whether to take a deeper cut on pricing to win a project with a strategically important client name, or to win a project where the Company already has staff on a nearby project and the timing allows easy staff transfer.
 
 **Margin Review Deliverable:** Prior to the review, the BDM and Prop Mgr prepare a Margin Review PowerPoint presentation (BDM and Prop Mgr are jointly Responsible, AE is Consulted). The BDM is Responsible for scheduling the executive margin review.
 
@@ -394,7 +394,7 @@ Per the RACI, the BDM is Responsible for submitting the bid documents and propos
 The proposal is submitted primarily in PDF format, though some clients may require Word format. There are no known file size restrictions on the submission platforms. The BDM submits via the appropriate channel — online portal (Amazon Concentric, BuildingConnected, or other client-specific platforms) or email, depending on the client's requirements.
 
 **Submission Package:**
-Beyond the proposal document, the package may include (depending on customer requirements and E Tech's history with the client): bid response forms, pricing spreadsheets in the client's format, certificates (insurance, safety), personnel resumes, schedule files, and other supplemental documents.
+Beyond the proposal document, the package may include (depending on customer requirements and the Company's history with the client): bid response forms, pricing spreadsheets in the client's format, certificates (insurance, safety), personnel resumes, schedule files, and other supplemental documents.
 
 **File Naming Convention:**
 The recommended standard naming convention is: "MCT Proposal for [Client] [Project Code] [System Type]" — for example, "MCT Proposal for AWS ATL078 EPMS."
@@ -452,7 +452,7 @@ Based on this workflow and the RACI matrix, the AI agent's primary responsibilit
 - All pricing (never fabricated by the AI agent)
 - Labor rates (vary by project, region, and client)
 - Travel rotation assumptions and per diem rates
-- E Tech team member assignments and contact information
+- the Company team member assignments and contact information
 - Panel shop quotes and capacity decisions
 
 ### What the AI Agent Should Never Do

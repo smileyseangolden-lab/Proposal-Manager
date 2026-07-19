@@ -9,6 +9,14 @@ WORKDIR /app
 # IPv6 precedence makes glibc return A records first so httpx connects over v4.
 RUN printf '\nprecedence ::ffff:0:0/96  100\n' >> /etc/gai.conf
 
+# Tesseract powers OCR of scanned (image-only) PDF uploads. Optional at
+# runtime — the app degrades gracefully if it's absent — but installed here so
+# hosted deployments get it. (PDF page rendering uses the self-contained
+# pypdfium2 wheel, so no poppler/system renderer is needed.)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

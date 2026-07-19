@@ -82,7 +82,7 @@
                     </div>
                     <div class="focus-item-sub">
                         {% if item.due_str %}<span class="{{ 'focus-overdue' if item.overdue }}">{{ item.due_str }}</span>{% if item.sub or item.value %} &middot; {% endif %}{% endif %}
-                        {% if item.value %}${{ "{:,.1f}".format(item.value / 1000000) }}M{% if item.sub %} &middot; {% endif %}{% endif %}
+                        {% if item.value %}{{ item.value | money_compact }}{% if item.sub %} &middot; {% endif %}{% endif %}
                         {{ item.sub }}
                     </div>
                 </div>
@@ -94,7 +94,7 @@
         </ul>
         <div class="focus-footer">
             <span>Showing <strong id="focus-shown">{{ focus_items | length }}</strong> of {{ focus_items | length }} open item{{ 's' if focus_items | length != 1 }}
-                {% if combined_exposure %} &middot; <strong>${{ "{:,.1f}".format(combined_exposure / 1000000) }}M</strong> combined exposure{% endif %}
+                {% if combined_exposure %} &middot; <strong>{{ combined_exposure | money_compact }}</strong> combined exposure{% endif %}
             </span>
             <a href="{{ url_for('proposals_list') }}">See all proposals &rarr;</a>
         </div>

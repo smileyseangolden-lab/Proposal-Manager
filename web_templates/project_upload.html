@@ -111,14 +111,26 @@
         <div class="card">
             <h2>Project Documents ({{ documents | length }})</h2>
             <table class="mini-table">
-                <thead><tr><th>File</th><th>Type</th><th>Size</th><th>Uploaded</th></tr></thead>
+                <thead><tr><th>File</th><th>Type</th><th>AI-readable</th><th>Size</th><th>Uploaded</th><th></th></tr></thead>
                 <tbody>
                 {% for d in documents %}
                 <tr>
                     <td>{{ d.original_filename }}</td>
                     <td><span class="badge badge-doc-{{ d.file_type }}">{{ d.file_type }}</span></td>
+                    <td>
+                        {% if d.text_chars is none %}<span class="form-hint">&mdash;</span>
+                        {% elif d.text_chars == 0 and d.original_filename.lower().endswith('.pdf') and ocr_enabled %}<span class="chip chip-gold" title="No embedded text, but it will be read with OCR when you generate.">&#128444; Scanned &middot; OCR</span>
+                        {% elif d.text_chars == 0 %}<span class="chip chip-red" title="No machine-readable text — likely a scanned image. The AI cannot analyze this file.">&#9888; No text</span>
+                        {% else %}<span class="chip chip-ok" title="{{ '{:,}'.format(d.text_chars) }} characters extracted">&#10003; {{ '{:,}'.format(d.text_chars) }} chars</span>
+                        {% endif %}
+                    </td>
                     <td>{% if d.file_size >= 1048576 %}{{ "%.1f"|format(d.file_size / 1048576) }} MB{% elif d.file_size >= 1024 %}{{ "%.0f"|format(d.file_size / 1024) }} KB{% else %}{{ d.file_size }} B{% endif %}</td>
-                    <td>{{ d.uploaded_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                    <td>{{ d.uploaded_at | localtime('full') }}</td>
+                    <td>
+                        <form method="post" action="{{ url_for('delete_document', doc_id=d.id) }}" class="inline-form" onsubmit="return confirm('Delete {{ d.original_filename }}? This cannot be undone.');">
+                            <button type="submit" class="btn btn-small btn-danger">Delete</button>
+                        </form>
+                    </td>
                 </tr>
                 {% endfor %}
                 </tbody>
@@ -166,6 +178,14 @@
             <h2>Draft Proposal with AI</h2>
             {% if scope and scope.status == 'approved' %}
             <p class="card-desc">Using your approved Scope of Work ({{ scope_included }} item(s)).</p>
+            {% elif scope and scope.status == 'draft' %}
+            <div class="posture-callout" style="border-left: 3px solid var(--gold); background: var(--gold-bg); margin-bottom: 12px;">
+                <span>&#9888;</span>
+                <div>
+                    <strong>Your drafted scope is NOT approved yet — this draft will ignore it.</strong>
+                    <a href="{{ url_for('project_scope', project_id=project.id) }}">Review &amp; approve the scope</a> first if the proposal should follow it.
+                </div>
+            </div>
             {% endif %}
             <form method="post" action="{{ url_for('project_generate', project_id=project.id) }}" id="generate-form">
 
@@ -251,6 +271,14 @@
                 </div>
 
                 <button type="submit" class="btn btn-primary btn-large" id="generate-btn">Generate Proposal</button>
+                <p class="form-hint" style="margin-top:8px;">
+                    Takes ~1&ndash;3 minutes and uses 1 AI generation
+                    {% if gen_limit is defined and gen_limit >= 0 %}
+                    &mdash; <strong>{{ gens_used }} of {{ gen_limit }}</strong> used this month{% if gen_limit - gens_used <= 2 %} <a href="{{ url_for('billing_page') }}">(upgrade for more)</a>{% endif %}.
+                    {% else %}
+                    (your plan has unlimited generations).
+                    {% endif %}
+                </p>
             </form>
 
             <div class="processing-overlay" id="processing" style="display:none;">
@@ -291,7 +319,7 @@
                 <tbody>
                 {% for prop in proposals %}
                 <tr>
-                    <td>{{ prop.generated_at.strftime('%Y-%m-%d %H:%M') if prop.generated_at else 'N/A' }}</td>
+                    <td>{% if prop.generated_at %}{{ prop.generated_at | localtime('full') }}{% else %}N/A{% endif %}</td>
                     <td><span class="badge badge-{{ prop.document_type | lower }}">{{ prop.document_type }}</span></td>
                     <td><span class="badge badge-vertical">{{ prop.vertical_label }}</span></td>
                     <td>
@@ -358,12 +386,29 @@
             {% endif %}
         </div>
 
+        {% if project.user_id == current_user.id or current_user.is_admin %}
+        <div class="rail-card" style="border: 1px solid var(--red-line);">
+            <h3 style="color: var(--red);">Danger Zone</h3>
+            <p style="font-size: 12.5px; color: var(--ink-500); margin-bottom: 10px;">
+                Permanently delete this project, its documents, proposals, and files. This cannot be undone.
+            </p>
+            <form method="post" action="{{ url_for('delete_project', project_id=project.id) }}"
+                  onsubmit="return confirm('Permanently delete “{{ project.name }}” and ALL its data? This cannot be undone.');">
+                <div class="form-group">
+                    <label style="font-size: 12px;">Type the project name to confirm</label>
+                    <input type="text" name="confirm_name" placeholder="{{ project.name }}" required>
+                </div>
+                <button type="submit" class="btn btn-small btn-danger" style="width:100%;">Delete project</button>
+            </form>
+        </div>
+        {% endif %}
+
         <div class="rail-card">
             <h3>At a Glance</h3>
             <ul class="timeline">
                 <li>
                     <span class="tl-title">{{ documents | length }} document(s) uploaded</span>
-                    <div class="tl-meta">{{ 'Latest: ' + documents[0].uploaded_at.strftime('%b %d, %H:%M') if documents else 'Upload an RFP/RFQ to begin' }}</div>
+                    <div class="tl-meta">{% if documents %}Latest: {{ documents[0].uploaded_at | localtime }}{% else %}Upload an RFP/RFQ to begin{% endif %}</div>
                 </li>
                 <li>
                     <span class="tl-title">{{ open_clarifications }} open clarification(s)</span>

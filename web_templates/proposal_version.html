@@ -12,7 +12,7 @@
                 <span class="badge badge-{{ 'status-active' if version.edit_source == 'ai' else 'status-submitted' }}">
                     {{ 'AI Generated' if version.edit_source == 'ai' else 'Human Edited' }}
                 </span>
-                &mdash; {{ version.created_at.strftime('%Y-%m-%d %H:%M') }}
+                &mdash; {{ version.created_at | localtime('full') }}
             </p>
             {% if version.change_summary %}
             <p class="page-subtitle" style="margin-top:4px;">{{ version.change_summary }}</p>

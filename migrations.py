@@ -74,6 +74,26 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("users", "lockout_until", "TIMESTAMP"),
     # Platform-admin dashboard
     ("users", "platform_owner", "BOOLEAN DEFAULT FALSE"),
+    # P1 hardening: member offboarding
+    ("users", "is_active", "BOOLEAN DEFAULT TRUE"),
+    # P1: org-level branding (proposals branded per workspace, not per user)
+    ("organizations", "logo_path", "VARCHAR(1000) DEFAULT ''"),
+    ("organizations", "logo_original_name", "VARCHAR(500) DEFAULT ''"),
+    ("organizations", "logo_use_in_proposals", "BOOLEAN DEFAULT TRUE"),
+    ("organizations", "logo_placement", "VARCHAR(20) DEFAULT 'top_left'"),
+    ("organizations", "logo_show_on_cover", "BOOLEAN DEFAULT TRUE"),
+    # P1: parse receipt captured at upload (NULL = never checked)
+    ("project_documents", "text_chars", "INTEGER"),
+    # P3: typed-name acceptance on the customer portal
+    ("proposal_shares", "decided_by_name", "VARCHAR(200) DEFAULT ''"),
+    ("proposal_shares", "decided_by_title", "VARCHAR(200) DEFAULT ''"),
+    # Two-factor auth (TOTP)
+    ("users", "totp_secret_encrypted", "TEXT DEFAULT ''"),
+    ("users", "totp_enabled", "BOOLEAN DEFAULT FALSE"),
+    ("users", "totp_backup_codes", "TEXT DEFAULT ''"),
+    # SSO: per-org domain claim + JIT provisioning
+    ("organizations", "sso_domain", "VARCHAR(200) DEFAULT ''"),
+    ("organizations", "sso_jit", "BOOLEAN DEFAULT FALSE"),
 ]
 
 # Indexes on hot filter / foreign-key columns. CREATE INDEX IF NOT EXISTS is
@@ -94,6 +114,20 @@ _INDEX_MIGRATIONS: list[tuple[str, str, str]] = [
     ("ix_background_jobs_org_id", "background_jobs", "org_id"),
     ("ix_background_jobs_status", "background_jobs", "status"),
     ("ix_background_jobs_created_at", "background_jobs", "created_at"),
+    # P2 hot-path indexes (list pages, dashboard focus list, generation context)
+    ("ix_revision_requests_proposal_id", "revision_requests", "proposal_id, status"),
+    ("ix_proposal_questions_project_status", "proposal_questions", "project_id, status"),
+    ("ix_scope_items_scope_id", "scope_items", "scope_id"),
+    ("ix_proposal_reviewers_user_id", "proposal_reviewers", "user_id"),
+    ("ix_proposal_shares_proposal_id", "proposal_shares", "proposal_id"),
+    ("ix_notifications_user_read", "notifications", "user_id, is_read"),
+    ("ix_user_rate_sheets_org_id", "user_rate_sheets", "org_id"),
+    ("ix_user_vertical_templates_org_id", "user_vertical_templates", "org_id"),
+    ("ix_staff_roles_org_id", "staff_roles", "org_id"),
+    ("ix_equipment_items_org_id", "equipment_items", "org_id"),
+    ("ix_travel_expense_rates_org_id", "travel_expense_rates", "org_id"),
+    ("ix_company_standards_org_id", "company_standards", "org_id"),
+    ("ix_organizations_sso_domain", "organizations", "sso_domain"),
 ]
 
 # Tables that carry a per-user org_id needing backfill from the owning user.
@@ -194,6 +228,71 @@ def _backfill_organizations():
     db.session.commit()
 
 
+def _backfill_active_flag():
+    """Rows that predate users.is_active get NULL on some engines — a NULL is
+    falsy to flask-login and would lock every legacy user out. Force TRUE."""
+    db.session.execute(text("UPDATE users SET is_active = TRUE WHERE is_active IS NULL"))
+    db.session.commit()
+
+
+def _backfill_org_branding():
+    """Move per-user branding up to the organization (one-time).
+
+    Historically the logo/company identity lived on User rows, so proposals
+    were branded by whoever owned the project. Copy the best candidate (an
+    admin's logo, else any member's) onto the org so branding is consistent
+    workspace-wide. User columns are left in place but are no longer read."""
+    orgs = Organization.query.filter(
+        db.or_(Organization.logo_path.is_(None), Organization.logo_path == "")
+    ).all()
+    changed = False
+    for org in orgs:
+        donor = (
+            User.query.filter(User.org_id == org.id,
+                              User.company_logo_path.isnot(None),
+                              User.company_logo_path != "")
+            .order_by(User.is_admin.desc(), User.created_at.asc())
+            .first()
+        )
+        if not donor:
+            continue
+        org.logo_path = donor.company_logo_path
+        org.logo_original_name = donor.company_logo_original_name or ""
+        org.logo_use_in_proposals = bool(donor.company_logo_use_in_proposals)
+        org.logo_placement = donor.company_logo_placement or "top_left"
+        org.logo_show_on_cover = bool(donor.company_logo_show_on_cover)
+        changed = True
+
+    # Orgs still carrying the auto-generated "<name>'s Workspace" label pick up
+    # the admin's company name for proposal branding, if one was ever set.
+    for org in Organization.query.filter(Organization.name.like("%'s Workspace")).all():
+        admin = (User.query.filter(User.org_id == org.id, User.is_admin.is_(True))
+                 .order_by(User.created_at.asc()).first())
+        if admin and (admin.company_name or "").strip():
+            org.name = admin.company_name.strip()
+            changed = True
+    if changed:
+        db.session.commit()
+
+
+def _add_unique_email_index():
+    """Case-insensitive unique index on users.email (P1: duplicate emails break
+    password reset and verification). Best-effort: if legacy duplicates exist
+    the index can't be created — log loudly so the operator can dedupe, while
+    the app-level uniqueness checks still stop NEW duplicates."""
+    try:
+        db.session.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_email_lower ON users (lower(email))"
+        ))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        logger.exception(
+            "Migration: could not create unique email index — duplicate emails "
+            "likely exist in users; dedupe them manually."
+        )
+
+
 def ensure_schema():
     """Create tables, add missing columns, and run data backfills.
     Must be called inside an app context."""
@@ -207,3 +306,6 @@ def ensure_schema():
     _add_missing_columns()
     _add_indexes()
     _backfill_organizations()
+    _backfill_active_flag()
+    _backfill_org_branding()
+    _add_unique_email_index()

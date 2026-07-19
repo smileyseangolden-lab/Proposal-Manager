@@ -26,10 +26,10 @@
 <div class="posture-summary">
     <div class="posture-summary-check">&#10003;</div>
     <div>
-        <div class="posture-summary-title">{{ current_user.company_name or 'Your' }} Posture</div>
+        <div class="posture-summary-title">{{ (org.name if org else '') or 'Your' }} Posture</div>
         <div class="posture-summary-meta">
             {{ total_items }} item(s) configured
-            {% if last_updated %} &middot; Updated {{ last_updated.strftime('%b %d, %Y %H:%M') }}{% endif %}
+            {% if last_updated %} &middot; Updated {{ last_updated | localtime('full') }}{% endif %}
             &middot; Maintained by {{ current_user.display_name or current_user.username }}
         </div>
     </div>
@@ -272,9 +272,22 @@
                     <td>${{ "%.2f"|format(r.hourly_rate) }}</td>
                     <td>{{ "$%.2f"|format(r.overtime_rate) if r.overtime_rate else '—' }}</td>
                     <td class="td-desc">{{ r.description or '—' }}</td>
-                    <td>
+                    <td style="white-space:nowrap;">
+                        <button type="button" class="btn btn-small btn-secondary row-edit-btn" data-target="edit-sr-{{ r.id }}">Edit</button>
                         <form method="post" action="{{ url_for('delete_staff_role', role_id=r.id) }}" class="inline-form">
                             <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this staff role?')">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+                <tr id="edit-sr-{{ r.id }}" class="inline-edit-row" style="display:none;">
+                    <td colspan="6">
+                        <form method="post" action="{{ url_for('edit_staff_role', role_id=r.id) }}" class="inline-form" style="display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end;">
+                            <label style="font-size:11px;">Role<br><input type="text" name="role_name" value="{{ r.role_name }}"></label>
+                            <label style="font-size:11px;">Category<br><input type="text" name="category" value="{{ r.category }}"></label>
+                            <label style="font-size:11px;">Hourly $<br><input type="number" step="0.01" min="0" name="hourly_rate" value="{{ r.hourly_rate }}" style="width:100px;"></label>
+                            <label style="font-size:11px;">OT $<br><input type="number" step="0.01" min="0" name="overtime_rate" value="{{ r.overtime_rate or '' }}" style="width:100px;"></label>
+                            <label style="font-size:11px; flex:1;">Description<br><input type="text" name="description" value="{{ r.description }}" style="width:100%;"></label>
+                            <button type="submit" class="btn btn-small btn-primary">Save</button>
                         </form>
                     </td>
                 </tr>
@@ -402,9 +415,23 @@
                     <td>{{ e.manufacturer or '—' }}</td>
                     <td>${{ "%.2f"|format(e.unit_cost) }}</td>
                     <td>{{ e.unit }}</td>
-                    <td>
+                    <td style="white-space:nowrap;">
+                        <button type="button" class="btn btn-small btn-secondary row-edit-btn" data-target="edit-eq-{{ e.id }}">Edit</button>
                         <form method="post" action="{{ url_for('delete_equipment_item', item_id=e.id) }}" class="inline-form">
                             <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this item?')">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+                <tr id="edit-eq-{{ e.id }}" class="inline-edit-row" style="display:none;">
+                    <td colspan="7">
+                        <form method="post" action="{{ url_for('edit_equipment_item', item_id=e.id) }}" class="inline-form" style="display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end;">
+                            <label style="font-size:11px; flex:1;">Item<br><input type="text" name="item_name" value="{{ e.item_name }}" style="width:100%;"></label>
+                            <label style="font-size:11px;">Category<br><input type="text" name="eq_category" value="{{ e.category }}"></label>
+                            <label style="font-size:11px;">Part #<br><input type="text" name="part_number" value="{{ e.part_number }}" style="width:120px;"></label>
+                            <label style="font-size:11px;">Manufacturer<br><input type="text" name="manufacturer" value="{{ e.manufacturer }}" style="width:140px;"></label>
+                            <label style="font-size:11px;">Unit $<br><input type="number" step="0.01" min="0" name="unit_cost" value="{{ e.unit_cost }}" style="width:110px;"></label>
+                            <label style="font-size:11px;">Unit<br><input type="text" name="unit" value="{{ e.unit }}" style="width:80px;"></label>
+                            <button type="submit" class="btn btn-small btn-primary">Save</button>
                         </form>
                     </td>
                 </tr>
@@ -491,9 +518,21 @@
                     <td>${{ "%.2f"|format(t.rate) }}</td>
                     <td>{{ t.unit }}</td>
                     <td class="td-desc">{{ t.description or '—' }}</td>
-                    <td>
+                    <td style="white-space:nowrap;">
+                        <button type="button" class="btn btn-small btn-secondary row-edit-btn" data-target="edit-tr-{{ t.id }}">Edit</button>
                         <form method="post" action="{{ url_for('delete_travel_rate', rate_id=t.id) }}" class="inline-form">
                             <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this rate?')">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+                <tr id="edit-tr-{{ t.id }}" class="inline-edit-row" style="display:none;">
+                    <td colspan="5">
+                        <form method="post" action="{{ url_for('edit_travel_rate', rate_id=t.id) }}" class="inline-form" style="display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end;">
+                            <label style="font-size:11px;">Expense<br><input type="text" name="expense_type" value="{{ t.expense_type }}"></label>
+                            <label style="font-size:11px;">Rate $<br><input type="number" step="0.01" min="0" name="travel_rate" value="{{ t.rate }}" style="width:110px;"></label>
+                            <label style="font-size:11px;">Unit<br><input type="text" name="travel_unit" value="{{ t.unit }}" style="width:110px;"></label>
+                            <label style="font-size:11px; flex:1;">Description<br><input type="text" name="travel_description" value="{{ t.description }}" style="width:100%;"></label>
+                            <button type="submit" class="btn btn-small btn-primary">Save</button>
                         </form>
                     </td>
                 </tr>
@@ -511,26 +550,27 @@
         <summary class="accordion-head">
             Branding &amp; Logo
             <span class="accordion-head-chips">
-                <span class="count-chip {{ 'count-zero' if not current_user.company_logo_path }}">{{ 'Logo set' if current_user.company_logo_path else 'No logo' }}</span>
+                <span class="count-chip {{ 'count-zero' if not (org and org.logo_path) }}">{{ 'Logo set' if org and org.logo_path else 'No logo' }}</span>
                 <span class="acc-chevron">&#9654;</span>
             </span>
         </summary>
         <div class="accordion-body">
             <p class="card-desc" style="margin-top:12px;">
                 Upload your company logo to automatically brand your generated proposals.
+                The logo is <strong>workspace-wide</strong> — every member's proposals carry the same identity.
                 Accepted formats: <strong>PNG, JPG, JPEG, WebP, GIF, BMP</strong>.
                 Uploaded images are automatically resized and re-encoded as optimized PNG
                 (longest side up to {{ logo_max_dimension }}px) so they stay small in memory
                 and look crisp in Word documents.
             </p>
 
-            {% if current_user.company_logo_path %}
+            {% if org and org.logo_path %}
             <div class="logo-preview-wrap">
                 <div class="logo-preview-box">
-                    <img src="{{ url_for('company_logo_preview') }}?v={{ current_user.id[:6] }}{{ current_user.company_logo_original_name }}" alt="Company logo preview" class="logo-preview-img">
+                    <img src="{{ url_for('company_logo_preview') }}?v={{ org.id[:6] }}{{ org.logo_original_name }}" alt="Company logo preview" class="logo-preview-img">
                 </div>
                 <div class="logo-preview-meta">
-                    <div class="logo-preview-name">{{ current_user.company_logo_original_name or 'logo.png' }}</div>
+                    <div class="logo-preview-name">{{ org.logo_original_name or 'logo.png' }}</div>
                     <form method="post" action="{{ url_for('delete_company_logo') }}" class="inline-form" onsubmit="return confirm('Remove your company logo?');">
                         <button type="submit" class="btn btn-small btn-danger">Remove logo</button>
                     </form>
@@ -543,17 +583,17 @@
             <form method="post" action="{{ url_for('upload_company_logo') }}" enctype="multipart/form-data" class="upload-inline">
                 <div class="form-group">
                     <label for="company_logo">
-                        {% if current_user.company_logo_path %}Replace logo{% else %}Upload logo{% endif %}
+                        {% if org and org.logo_path %}Replace logo{% else %}Upload logo{% endif %}
                     </label>
                     <input type="file" id="company_logo" name="company_logo" accept=".png,.jpg,.jpeg,.webp,.gif,.bmp,image/*" required>
                     <span class="form-hint">Most common image types accepted. Images are automatically compressed.</span>
                 </div>
                 <button type="submit" class="btn btn-secondary">
-                    {% if current_user.company_logo_path %}Replace Logo{% else %}Upload Logo{% endif %}
+                    {% if org and org.logo_path %}Replace Logo{% else %}Upload Logo{% endif %}
                 </button>
             </form>
 
-            {% if current_user.company_logo_path %}
+            {% if org and org.logo_path %}
             <hr class="card-divider">
             <form method="post" action="{{ url_for('settings') }}">
                 <h3 class="subheading">Proposal Branding Options</h3>
@@ -562,7 +602,7 @@
                 <div class="form-group checkbox-group">
                     <label class="checkbox-label">
                         <input type="checkbox" name="company_logo_use_in_proposals" value="1"
-                               {% if current_user.company_logo_use_in_proposals %}checked{% endif %}>
+                               {% if org.logo_use_in_proposals %}checked{% endif %}>
                         <span>Use this logo on all newly generated proposals</span>
                     </label>
                 </div>
@@ -570,15 +610,15 @@
                 <div class="form-group">
                     <label>Logo Placement</label>
                     <div class="radio-group">
-                        <label class="radio-card {% if (current_user.company_logo_placement or 'top_left') == 'top_left' %}selected{% endif %}">
+                        <label class="radio-card {% if (org.logo_placement or 'top_left') == 'top_left' %}selected{% endif %}">
                             <input type="radio" name="company_logo_placement" value="top_left"
-                                   {% if (current_user.company_logo_placement or 'top_left') == 'top_left' %}checked{% endif %}>
+                                   {% if (org.logo_placement or 'top_left') == 'top_left' %}checked{% endif %}>
                             <span class="radio-card-title">Top Left</span>
                             <span class="radio-card-desc">Left-aligned header on the title page. Classic letterhead look.</span>
                         </label>
-                        <label class="radio-card {% if current_user.company_logo_placement == 'center' %}selected{% endif %}">
+                        <label class="radio-card {% if org.logo_placement == 'center' %}selected{% endif %}">
                             <input type="radio" name="company_logo_placement" value="center"
-                                   {% if current_user.company_logo_placement == 'center' %}checked{% endif %}>
+                                   {% if org.logo_placement == 'center' %}checked{% endif %}>
                             <span class="radio-card-title">Centered</span>
                             <span class="radio-card-desc">Centered above the proposal title (cover-page style).</span>
                         </label>
@@ -588,7 +628,7 @@
                 <div class="form-group checkbox-group">
                     <label class="checkbox-label">
                         <input type="checkbox" name="company_logo_show_on_cover" value="1"
-                               {% if current_user.company_logo_show_on_cover %}checked{% endif %}>
+                               {% if org.logo_show_on_cover %}checked{% endif %}>
                         <span>Add a dedicated cover page with the logo before the proposal body</span>
                     </label>
                     <span class="form-hint">Recommended for formal RFP responses. Uncheck to embed inline at the top of page 1 only.</span>
@@ -597,9 +637,7 @@
                 <!-- Preserve other profile fields so this form save doesn't wipe them -->
                 <input type="hidden" name="display_name" value="{{ current_user.display_name }}">
                 <input type="hidden" name="email" value="{{ current_user.email }}">
-                <input type="hidden" name="company_name" value="{{ current_user.company_name }}">
                 <input type="hidden" name="font_preference" value="{{ current_user.font_preference }}">
-                <input type="hidden" name="llm_provider" value="{{ current_user.llm_provider }}">
                 <input type="hidden" name="llm_model" value="{{ current_user.llm_model }}">
                 <input type="hidden" name="from_posture" value="1">
 
@@ -694,6 +732,14 @@
         btn.addEventListener("click", function(){
             var target = document.getElementById(btn.dataset.target);
             if (target) target.open = true;
+        });
+    });
+
+    // Inline row editing for rate tables
+    document.querySelectorAll(".row-edit-btn").forEach(function(btn){
+        btn.addEventListener("click", function(){
+            var row = document.getElementById(btn.dataset.target);
+            if (row) row.style.display = row.style.display === "none" ? "" : "none";
         });
     });
 

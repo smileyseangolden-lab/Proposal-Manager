@@ -113,12 +113,42 @@ def plan_for(org) -> dict:
     return PLANS.get((org.plan if org else "free") or "free", PLANS["free"])
 
 
+def trial_active(org) -> bool:
+    """True while a free-plan org's signup trial window is still open.
+    trial_ends_at is stamped at workspace creation (14 days); orgs that
+    predate trials (NULL) and paid orgs never count as trialing."""
+    if not org or not getattr(org, "trial_ends_at", None):
+        return False
+    if (org.plan or "free") != "free":
+        return False
+    end = org.trial_ends_at
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    return end > datetime.now(timezone.utc)
+
+
+def trial_days_left(org) -> int:
+    """Whole days remaining in the trial (0 when inactive/expired)."""
+    if not trial_active(org):
+        return 0
+    end = org.trial_ends_at
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    return max(int((end - datetime.now(timezone.utc)).total_seconds() // 86400), 0)
+
+
 def effective_plan(org) -> dict:
-    """The plan whose LIMITS currently apply. A paid org that is delinquent
-    (past_due / unpaid) is soft-locked to free-tier limits until its payment
-    recovers; plan_for() still reports the nominal plan for the billing page."""
+    """The plan whose LIMITS currently apply.
+
+    - A paid org that is delinquent (past_due / unpaid) is soft-locked to
+      free-tier limits until its payment recovers.
+    - A free org inside its 14-day signup trial gets PRO limits — the trial
+      field was previously stamped but never enforced anywhere.
+    plan_for() still reports the nominal plan for the billing page."""
     if org and (getattr(org, "billing_status", "") or "") in _DELINQUENT_STATUSES:
         return PLANS["free"]
+    if trial_active(org):
+        return PLANS["pro"]
     return plan_for(org)
 
 
@@ -132,27 +162,36 @@ def _month_key(dt=None) -> str:
 
 
 def generations_this_month(org_id) -> int:
-    """Count generations for the org in the current calendar month.
+    """Count AI proposal generations for the org in the current calendar month.
 
-    Counts queued + running + done (everything except failed), keyed on
-    created_at, so in-flight jobs count against the limit too. This closes the
-    burst/parallel bypass where only completed jobs were counted, letting a user
-    enqueue many generations before any finished."""
-    from models import BackgroundJob
+    Counts in-flight jobs (queued/running — closes the burst/parallel bypass
+    where many generations could be enqueued before any finished) PLUS
+    proposals actually produced. A run that finished WITHOUT producing a
+    proposal — the AI stopped to ask clarification questions, or the job
+    failed — no longer consumes quota, so answering questions and regenerating
+    doesn't burn a second credit for the same proposal attempt."""
+    from models import BackgroundJob, Project, Proposal
     start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    return (
-        BackgroundJob.query.filter(
-            BackgroundJob.org_id == org_id,
-            BackgroundJob.kind == "generate_proposal",
-            BackgroundJob.status.in_(("queued", "running", "done")),
-            BackgroundJob.created_at >= start,
-        ).count()
+    inflight = BackgroundJob.query.filter(
+        BackgroundJob.org_id == org_id,
+        BackgroundJob.kind == "generate_proposal",
+        BackgroundJob.status.in_(("queued", "running")),
+        BackgroundJob.created_at >= start,
+    ).count()
+    produced = (
+        Proposal.query.join(Project, Proposal.project_id == Project.id)
+        .filter(Project.org_id == org_id, Proposal.generated_at >= start)
+        .count()
     )
+    return inflight + produced
 
 
 def seats_used(org_id) -> int:
+    """Active members only — deactivated (offboarded) users free their seat."""
     from models import User
-    return User.query.filter_by(org_id=org_id).count()
+    return User.query.filter(
+        User.org_id == org_id, User.is_active.isnot(False)
+    ).count()
 
 
 def check_generation(org_id) -> tuple[bool, str]:

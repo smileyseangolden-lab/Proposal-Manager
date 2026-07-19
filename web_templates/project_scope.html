@@ -19,12 +19,12 @@
             <h1>Scope of Work</h1>
             <p class="page-subtitle">
                 {{ project.name }} &middot; {{ scope.vertical_label }}
-                &middot; AI drafted {{ scope.generated_at.strftime('%b %d, %Y %H:%M') }}
+                &middot; AI drafted {{ scope.generated_at | localtime('full') }}
             </p>
         </div>
         <div class="header-actions">
             <form method="post" action="{{ url_for('generate_scope', project_id=project.id) }}" class="inline-form"
-                  onsubmit="return confirm('Re-draft the scope with AI? Your current items (including edits) will be replaced.');">
+                  onsubmit="return confirm('Re-draft the scope with AI? AI-proposed items will be replaced; items your team added are kept.');">
                 <input type="hidden" name="vertical" value="auto">
                 <button type="submit" class="btn btn-secondary">&#10227; Re-draft with AI</button>
             </form>
@@ -38,7 +38,7 @@
 {% if scope.status == 'approved' %}
 <div class="scope-approved-banner">
     <span>&#10003;</span>
-    <span>Scope approved{% if scope.approved_at %} on {{ scope.approved_at.strftime('%b %d, %Y %H:%M') }}{% endif %}
+    <span>Scope approved{% if scope.approved_at %} on {{ scope.approved_at | localtime('full') }}{% endif %}
         — the AI will draft the proposal against exactly these {{ included_count }} item(s).</span>
     <form method="post" action="{{ url_for('reopen_scope', project_id=project.id) }}" class="inline-form" style="margin-left:auto;">
         <button type="submit" class="btn btn-small btn-secondary">Reopen for edits</button>
@@ -61,6 +61,11 @@
 </div>
 {% endif %}
 
+<!-- One batch form collects every include/strike checkbox (via the HTML
+     form= attribute) so reviewing 25 items is one save, not 25 page loads. -->
+<form id="scope-batch-form" method="post"
+      action="{{ url_for('batch_update_scope', project_id=project.id) }}"></form>
+
 <div class="workspace-grid">
     <div class="workspace-main">
         <div class="card">
@@ -68,11 +73,12 @@
             <ul class="scope-list" style="margin-top: 12px;">
                 {% for item in items %}
                 <li class="scope-item{% if item.status == 'removed' %} scope-removed{% endif %}{% if item.source == 'human' %} scope-added{% endif %}">
-                    <form method="post" action="{{ url_for('toggle_scope_item', project_id=project.id, item_id=item.id) }}" class="scope-item-toggle">
-                        <input type="checkbox" {{ 'checked' if item.status == 'included' }}
-                               onchange="this.form.submit()"
+                    <span class="scope-item-toggle">
+                        <input type="checkbox" form="scope-batch-form" name="included" value="{{ item.id }}"
+                               class="scope-batch-check" {{ 'checked' if item.status == 'included' }}
+                               aria-label="Include in scope"
                                title="{{ 'Remove from scope' if item.status == 'included' else 'Include in scope' }}">
-                    </form>
+                    </span>
                     <div class="scope-item-main">
                         <div class="scope-item-text">{{ item.item_text }}</div>
                         <div class="scope-item-meta">
@@ -86,6 +92,13 @@
                             <span class="chip chip-red">Removed from scope</span>
                             {% endif %}
                         </div>
+                        <details class="scope-item-edit" style="margin-top:6px;">
+                            <summary style="cursor:pointer; font-size:12.5px; color:var(--sea-600);">&#9998; Edit wording</summary>
+                            <form method="post" action="{{ url_for('edit_scope_item', project_id=project.id, item_id=item.id) }}" style="margin-top:6px;">
+                                <textarea name="item_text" rows="2" required style="width:100%; font-size:13px;">{{ item.item_text }}</textarea>
+                                <button type="submit" class="btn btn-small btn-secondary" style="margin-top:4px;">Save wording</button>
+                            </form>
+                        </details>
                     </div>
                     {% if item.source == 'human' %}
                     <form method="post" action="{{ url_for('delete_scope_item', project_id=project.id, item_id=item.id) }}" class="inline-form" onsubmit="return confirm('Delete this scope item?');">
@@ -126,7 +139,7 @@
     <aside class="rail">
         <div class="rail-card">
             <h3>{{ 'Scope Approved' if scope.status == 'approved' else 'Approve This Scope' }}</h3>
-            <p style="font-size: 13px; color: var(--ink-500); margin-bottom: 12px;">
+            <p style="font-size: 13px; color: var(--ink-500); margin-bottom: 8px;">
                 {% if scope.status == 'approved' %}
                 Next: generate the proposal from the project page. The draft will follow this scope exactly.
                 {% else %}
@@ -134,7 +147,13 @@
                 Removed items stay visible here for the record.
                 {% endif %}
             </p>
+            <p style="font-size: 12.5px; color: var(--ink-500); margin-bottom: 12px;">
+                <span class="chip chip-ok">{{ ai_kept }} AI kept</span>
+                <span class="chip chip-red">{{ ai_struck }} struck</span>
+                <span class="chip chip-sea">{{ human_added }} team-added</span>
+            </p>
             <div class="rail-actions">
+                <button type="submit" form="scope-batch-form" class="btn btn-secondary" id="scope-save-btn">Save item changes</button>
                 {% if scope.status != 'approved' %}
                 <form method="post" action="{{ url_for('approve_scope', project_id=project.id) }}" class="inline-form">
                     <button type="submit" class="btn btn-primary">&#10003; Approve Scope ({{ included_count }})</button>
@@ -143,6 +162,7 @@
                 <a href="{{ url_for('project_upload', project_id=project.id) }}" class="btn btn-primary">Continue to Generate &rarr;</a>
                 {% endif %}
             </div>
+            <p class="form-hint" id="scope-dirty-hint" style="display:none; margin-top:6px;">&#9888; Unsaved checkbox changes — save before approving.</p>
         </div>
 
         <div class="rail-card">
@@ -156,4 +176,22 @@
         </div>
     </aside>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function(){
+    var saveBtn = document.getElementById("scope-save-btn");
+    var hint = document.getElementById("scope-dirty-hint");
+    if (!saveBtn) return;
+    document.querySelectorAll(".scope-batch-check").forEach(function(cb){
+        cb.addEventListener("change", function(){
+            saveBtn.classList.remove("btn-secondary");
+            saveBtn.classList.add("btn-primary");
+            saveBtn.textContent = "Save item changes •";
+            if (hint) hint.style.display = "block";
+        });
+    });
+})();
+</script>
 {% endblock %}

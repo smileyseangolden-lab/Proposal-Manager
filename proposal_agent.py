@@ -674,7 +674,8 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
                       past_corrections: list = None,
                       company_standards: list = None,
                       approved_scope: list = None,
-                      request_type: str = "") -> dict:
+                      request_type: str = "",
+                      include_global_boilerplate: bool = True) -> dict:
     """Generate a proposal from the given RFP/RFQ text.
 
     Args:
@@ -693,6 +694,11 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
         travel_data: List of travel expense rate dicts from user's settings.
         past_corrections: List of correction dicts from past human edits.
         company_standards: List of company standard dicts for auto-injection.
+        include_global_boilerplate: When False (hosted multi-tenant mode), the
+            install-level sample templates/reference documents and any vertical
+            company-boilerplate files are NOT injected into the prompt — they
+            describe a different company and would contaminate tenant output.
+            Self-hosted installs keep True (they customize those files).
 
     Returns:
         dict with proposal_markdown, action_items, confidence_score,
@@ -722,8 +728,23 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
 
     # Load resources
     vertical_resources = load_vertical_resources(vertical)
-    global_templates = load_templates(TEMPLATES_DIR)
-    global_references = load_reference_documents(REFERENCE_DIR)
+    if include_global_boilerplate:
+        global_templates = load_templates(TEMPLATES_DIR)
+        global_references = load_reference_documents(REFERENCE_DIR)
+    else:
+        # Hosted multi-tenant mode: only the org's own posture (templates,
+        # standards, rates — passed in by the caller) may describe the company.
+        # Vertical workflow + structural templates stay; company boilerplate
+        # files (e.g. verticals/*/templates/company_boilerplate.md) are dropped.
+        global_templates = {}
+        global_references = {}
+        vertical_resources = dict(vertical_resources)
+        vertical_resources["templates"] = {
+            name: content
+            for name, content in (vertical_resources.get("templates") or {}).items()
+            if "boilerplate" not in name.lower()
+        }
+        vertical_resources["reference_proposals"] = []
 
     # Build rate sheet context
     rate_sheet_text = ""

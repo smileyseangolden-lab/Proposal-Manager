@@ -137,12 +137,15 @@
                 <th>Win Rate</th>
                 <th>Pipeline Value</th>
                 <th>Last Active</th>
+                <th></th>
             </tr>
         </thead>
         <tbody>
             {% for us in user_stats %}
-            <tr>
-                <td><strong>{{ us.user.display_name or us.user.username }}</strong></td>
+            <tr{% if us.user.is_active is sameas false %} style="opacity:0.55;"{% endif %}>
+                <td><strong>{{ us.user.display_name or us.user.username }}</strong>
+                    {% if us.user.is_active is sameas false %}<span class="chip chip-red" style="margin-left:6px;">Deactivated</span>{% endif %}
+                </td>
                 <td>{{ us.user.email }}</td>
                 <td>
                     {% if us.user.id == current_user.id %}
@@ -165,10 +168,45 @@
                 <td>{{ us.win_rate }}%</td>
                 <td>${{ "{:,.0f}".format(us.total_dollar) }}</td>
                 <td>{{ us.last_active or '&mdash;' }}</td>
+                <td>
+                    {% if us.user.id != current_user.id %}
+                    {% if us.user.is_active is sameas false %}
+                    <form method="post" action="{{ url_for('reactivate_user', user_id=us.user.id) }}" class="inline-form">
+                        <button type="submit" class="btn btn-small btn-secondary">Reactivate</button>
+                    </form>
+                    {% else %}
+                    <form method="post" action="{{ url_for('deactivate_user', user_id=us.user.id) }}" class="inline-form"
+                          onsubmit="return confirm('Deactivate {{ us.user.display_name or us.user.username }}? They will be signed out and can no longer access this workspace. Their seat is freed.');">
+                        <button type="submit" class="btn btn-small btn-danger">Deactivate</button>
+                    </form>
+                    {% endif %}
+                    {% endif %}
+                </td>
             </tr>
             {% endfor %}
         </tbody>
     </table>
+</div>
+
+<!-- Single sign-on -->
+<div class="card" id="sso">
+    <h2>Single Sign-On (SSO)</h2>
+    {% if sso_configured %}
+    <p class="card-desc">Claim your company's email domain so teammates sign in through your identity provider. With auto-provisioning on, a first-time user at that domain is added to this workspace automatically.</p>
+    <form method="post" action="{{ url_for('update_sso_domain') }}" style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end;">
+        <div class="form-group" style="margin:0; min-width:240px;">
+            <label for="sso_domain">Email domain</label>
+            <input type="text" id="sso_domain" name="sso_domain" placeholder="acme.com" value="{{ org.sso_domain if org else '' }}">
+        </div>
+        <div class="form-group" style="margin:0;">
+            <label class="checkbox-label"><input type="checkbox" name="sso_jit" value="1" {{ 'checked' if org and org.sso_jit }}> Auto-provision new members (JIT)</label>
+        </div>
+        <button type="submit" class="btn btn-secondary">Save SSO settings</button>
+    </form>
+    <p class="form-hint" style="margin-top:8px;">Users still need to exist here (or be auto-provisioned) — SSO never creates a brand-new workspace. Deactivated accounts are refused.</p>
+    {% else %}
+    <p class="card-desc">Single sign-on isn't configured on this deployment yet. The platform operator sets up the identity provider (OIDC) in Platform-Admin, after which you can claim your email domain here.</p>
+    {% endif %}
 </div>
 
 <!-- Integrations -->
@@ -222,7 +260,7 @@
             <td><span class="role-badge role-{{ log.user.role or 'proposal' }}">{{ (log.user.role or 'proposal') | title }}</span></td>
             <td><span class="badge badge-activity">{{ log.action }}</span></td>
             <td class="td-desc">{{ log.detail[:100] }}{{ '...' if log.detail|length > 100 }}</td>
-            <td style="white-space:nowrap;">{{ log.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+            <td style="white-space:nowrap;">{{ log.created_at | localtime('full') }}</td>
         </tr>
         {% endfor %}
         </tbody>

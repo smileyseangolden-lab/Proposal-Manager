@@ -25,7 +25,7 @@
         <div class="notif-full-body">
             <div class="notif-full-title">{{ n.title }}</div>
             {% if n.message %}<div class="notif-full-msg">{{ n.message }}</div>{% endif %}
-            <div class="notif-full-time">{{ n.created_at.strftime('%b %d, %Y at %H:%M') }}</div>
+            <div class="notif-full-time">{{ n.created_at | localtime('full') }}</div>
         </div>
         <div class="notif-full-actions">
             {% if n.link %}<a href="{{ n.link }}" class="btn btn-small btn-primary">View</a>{% endif %}

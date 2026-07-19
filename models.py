@@ -38,6 +38,20 @@ class Organization(db.Model):
     slack_webhook_url = db.Column(db.String(1000), default="")
     outbound_webhook_url = db.Column(db.String(1000), default="")
 
+    # SSO: the email domain this workspace claims (e.g. "acme.com"). Users at
+    # that domain sign in via the configured OIDC IdP; sso_jit auto-provisions
+    # first-time members into this org.
+    sso_domain = db.Column(db.String(200), default="")
+    sso_jit = db.Column(db.Boolean, default=False, nullable=False)
+
+    # Workspace branding (org-level — proposals are branded per ORG, not per
+    # user, so every member's generations carry the same identity)
+    logo_path = db.Column(db.String(1000), default="")
+    logo_original_name = db.Column(db.String(500), default="")
+    logo_use_in_proposals = db.Column(db.Boolean, default=True)
+    logo_placement = db.Column(db.String(20), default="top_left")  # top_left, center
+    logo_show_on_cover = db.Column(db.Boolean, default=True)
+
     members = db.relationship("User", backref="organization", lazy="dynamic",
                               foreign_keys="User.org_id")
 
@@ -114,6 +128,9 @@ class User(UserMixin, db.Model):
     is_admin = db.Column(db.Boolean, default=False)
     role = db.Column(db.String(20), default="proposal")  # admin, sales, proposal
     email_verified = db.Column(db.Boolean, default=False)
+    # Deactivated members can't sign in and don't hold a seat (offboarding).
+    # Shadows flask-login's UserMixin.is_active property with a real column.
+    is_active = db.Column(db.Boolean, default=True, nullable=False)
     created_at = db.Column(db.DateTime, default=_utcnow)
 
     # Platform ownership — the SaaS operator, NOT a tenant admin. Grants access
@@ -124,6 +141,13 @@ class User(UserMixin, db.Model):
     # per-IP limiter, which doesn't survive multiple gunicorn workers).
     failed_login_count = db.Column(db.Integer, default=0)
     lockout_until = db.Column(db.DateTime, nullable=True)
+
+    # Two-factor auth (TOTP). Secret is encrypted at rest; backup codes are a
+    # JSON array of single-use SHA-256 hashes. totp_enabled gates the login
+    # second step (an unconfirmed enrollment stores a secret but stays False).
+    totp_secret_encrypted = db.Column(db.Text, default="")
+    totp_enabled = db.Column(db.Boolean, default=False, nullable=False)
+    totp_backup_codes = db.Column(db.Text, default="")
 
     # LLM settings — per-user overrides
     llm_provider = db.Column(db.String(50), default="anthropic")
@@ -202,6 +226,9 @@ class ProjectDocument(db.Model):
     file_size = db.Column(db.Integer, default=0)
     uploaded_at = db.Column(db.DateTime, default=_utcnow)
     is_reference = db.Column(db.Boolean, default=False)  # True = available across all projects
+    # Characters of machine-readable text extracted at upload time. 0 = the
+    # file parsed but yielded no text (e.g. a scanned PDF); NULL = not checked.
+    text_chars = db.Column(db.Integer, nullable=True)
     notes = db.Column(db.Text, default="")
     version_group = db.Column(db.String(32), default="")  # Groups document versions together
     version_label = db.Column(db.String(100), default="")  # e.g., "Addendum 1", "Rev B"
@@ -802,9 +829,12 @@ class ProposalShare(db.Model):
     view_count = db.Column(db.Integer, default=0)
     last_viewed_at = db.Column(db.DateTime, nullable=True)
 
-    # Customer's decision recorded through the portal
+    # Customer's decision recorded through the portal. Name/title typed by the
+    # decider give the acceptance a lightweight signature record.
     decision = db.Column(db.String(20), default="")  # accepted, declined
     decision_note = db.Column(db.Text, default="")
+    decided_by_name = db.Column(db.String(200), default="")
+    decided_by_title = db.Column(db.String(200), default="")
     decided_at = db.Column(db.DateTime, nullable=True)
 
     revoked_at = db.Column(db.DateTime, nullable=True)

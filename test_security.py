@@ -66,6 +66,10 @@ with app.app_context():
     (GENERATED_DIR / 'sec_dummy.md').unlink()
 
     print("\n=== Billing gates ===")
+    # Fresh workspaces carry a 14-day Pro trial (P2); these assertions test the
+    # FREE-plan limits, so end the trials first.
+    Organization.query.update({'trial_ends_at': None})
+    db.session.commit()
     billing.STRIPE_SECRET_KEY = ''
     login(c, 'bob')
     appmod.SELF_HOSTED = False

@@ -30,6 +30,14 @@ SETTINGS = {
     "smtp_use_tls":           ("SMTP_USE_TLS", False, "Use TLS (true/false)", "email"),
     "mail_from":              ("MAIL_FROM", False, "From address", "email"),
     "mail_from_name":         ("MAIL_FROM_NAME", False, "From name", "email"),
+    # SSO (OIDC)
+    "oidc_client_id":         ("OIDC_CLIENT_ID", False, "OIDC client ID", "sso"),
+    "oidc_client_secret":     ("OIDC_CLIENT_SECRET", True, "OIDC client secret", "sso"),
+    "oidc_auth_url":          ("OIDC_AUTH_URL", False, "OIDC authorization URL", "sso"),
+    "oidc_token_url":         ("OIDC_TOKEN_URL", False, "OIDC token URL", "sso"),
+    "oidc_userinfo_url":      ("OIDC_USERINFO_URL", False, "OIDC userinfo URL", "sso"),
+    "oidc_scopes":            ("OIDC_SCOPES", False, "OIDC scopes", "sso"),
+    "oidc_button_label":      ("OIDC_BUTTON_LABEL", False, "SSO button label", "sso"),
 }
 
 

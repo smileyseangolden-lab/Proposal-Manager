@@ -69,21 +69,66 @@ def _since(days: int):
 # Auth
 # ---------------------------------------------------------------------------
 
+# Brute-force protection for the operator login — the highest-value credential
+# in the system. In-process per-IP window plus the same DB-backed per-account
+# lockout the tenant login uses (survives multiple gunicorn workers).
+_PA_ATTEMPTS: dict[str, list[float]] = {}
+_PA_MAX_ATTEMPTS = 8
+_PA_WINDOW_SECONDS = 300
+_PA_LOCK_THRESHOLD = 10
+_PA_LOCK_SECONDS = 15 * 60
+
+
+def _pa_rate_limited(key: str) -> bool:
+    import time
+    now = time.time()
+    attempts = [t for t in _PA_ATTEMPTS.get(key, []) if now - t < _PA_WINDOW_SECONDS]
+    _PA_ATTEMPTS[key] = attempts
+    return len(attempts) >= _PA_MAX_ATTEMPTS
+
+
 @bp.route("/login", methods=["GET", "POST"])
 def login():
     if is_platform_owner(current_user):
         return redirect(url_for("platform_admin.overview"))
     if request.method == "POST":
+        import time
         ident = request.form.get("email", "").strip()
         password = request.form.get("password", "")
+
+        rl_key = f"{request.remote_addr}:{ident.lower()}"
+        if _pa_rate_limited(rl_key):
+            flash("Too many attempts. Please wait a few minutes and try again.", "error")
+            return render_template("platform/login.html")
+
         user = User.query.filter(
-            db.or_(User.email.ilike(ident), User.username == ident)
+            db.or_(db.func.lower(User.email) == ident.lower(), User.username == ident)
         ).first()
+
+        now = datetime.now(timezone.utc)
+        if user and user.lockout_until:
+            lock = user.lockout_until if user.lockout_until.tzinfo else user.lockout_until.replace(tzinfo=timezone.utc)
+            if lock > now:
+                flash("Invalid credentials.", "error")
+                return render_template("platform/login.html")
+
         # Same generic failure whether the credentials are wrong OR the account
         # simply isn't a platform owner — don't reveal who the owners are.
         if user and user.check_password(password) and is_platform_owner(user):
+            if user.failed_login_count or user.lockout_until:
+                user.failed_login_count = 0
+                user.lockout_until = None
+                db.session.commit()
             login_user(user)
             return redirect(url_for("platform_admin.overview"))
+
+        _PA_ATTEMPTS.setdefault(rl_key, []).append(time.time())
+        if user:
+            user.failed_login_count = (user.failed_login_count or 0) + 1
+            if user.failed_login_count >= _PA_LOCK_THRESHOLD:
+                user.lockout_until = now + timedelta(seconds=_PA_LOCK_SECONDS)
+                user.failed_login_count = 0
+            db.session.commit()
         flash("Invalid credentials.", "error")
     return render_template("platform/login.html")
 
@@ -354,6 +399,9 @@ _CONTROL_GROUPS = [
     ("email", "Email (SMTP)",
      ["smtp_host", "smtp_port", "smtp_user", "smtp_password", "smtp_use_tls",
       "mail_from", "mail_from_name"]),
+    ("sso", "Single sign-on (OIDC)",
+     ["oidc_client_id", "oidc_client_secret", "oidc_auth_url", "oidc_token_url",
+      "oidc_userinfo_url", "oidc_scopes", "oidc_button_label"]),
 ]
 
 
@@ -412,7 +460,7 @@ def controls_settings():
 def controls_owner():
     email = request.form.get("email", "").strip().lower()
     action = request.form.get("action", "grant")
-    user = User.query.filter(User.email.ilike(email)).first() if email else None
+    user = User.query.filter(db.func.lower(User.email) == email).first() if email else None
     if not user:
         flash("No user found with that email.", "error")
         return redirect(url_for("platform_admin.controls"))

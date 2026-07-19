@@ -8,20 +8,42 @@ import PyPDF2
 from config.settings import VERTICALS
 
 
-def parse_document(file_path: str) -> str:
+def parse_document(file_path: str, ocr: bool = False) -> str:
     """Parse a document file and return its text content.
 
-    Supports PDF, DOCX, and plain text formats.
+    Supports PDF, DOCX, plain text, and Excel formats. (Excel matters because
+    RFQs frequently arrive as bid forms / pricing schedules in .xlsx — the
+    upload UI advertises it, so silently skipping it would drop scope.)
+
+    When ``ocr=True`` and OCR is available, a PDF whose embedded text is sparse
+    (a scan) gets an OCR pass, and image files are OCR'd directly. OCR is slow,
+    so callers pass ``ocr=True`` only from background jobs — never the request
+    path.
     """
     path = Path(file_path)
     suffix = path.suffix.lower()
 
     if suffix == ".pdf":
-        return _parse_pdf(path)
+        text = _parse_pdf(path)
+        if ocr and len(text.strip()) < 100:
+            try:
+                import ocr as _ocr
+                ocr_text = _ocr.pdf_text(str(path))
+                if len(ocr_text.strip()) > len(text.strip()):
+                    text = ocr_text
+            except Exception:
+                pass
+        return text
     elif suffix in (".docx", ".doc"):
         return _parse_docx(path)
-    elif suffix in (".txt", ".md"):
-        return path.read_text(encoding="utf-8")
+    elif suffix in (".txt", ".md", ".csv"):
+        return path.read_text(encoding="utf-8", errors="replace")
+    elif suffix in (".xlsx", ".xls"):
+        from rate_sheet_parser import parse_rate_sheet
+        return parse_rate_sheet(str(path)).get("raw_text", "")
+    elif ocr and suffix in (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".gif"):
+        import ocr as _ocr
+        return _ocr.image_text(str(path))
     else:
         raise ValueError(f"Unsupported file format: {suffix}")
 

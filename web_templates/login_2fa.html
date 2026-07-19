@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Two-Factor Verification &mdash; {{ app_name }}</title>
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='img/pm-logo-mark.svg') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="auth-page">
+    <div class="auth-container">
+        <div class="auth-brand">
+            <img src="{{ url_for('static', filename='img/pm-logo-full.svg') }}" alt="{{ app_name }}">
+            <p class="auth-tagline">AI-Powered Proposal Platform</p>
+        </div>
+        <div class="auth-card">
+            <h2 class="auth-heading">Two-factor verification</h2>
+            <p class="auth-sub">Enter the 6-digit code from your authenticator app, or a backup code.</p>
+
+            {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}{% for category, message in messages %}
+            <div class="flash flash-{{ category }}" role="alert">{{ message }}</div>
+            {% endfor %}{% endif %}
+            {% endwith %}
+
+            <form method="post" action="{{ url_for('login_2fa') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <div class="form-group">
+                    <label for="code">Authentication code</label>
+                    <input type="text" id="code" name="code" required autofocus autocomplete="one-time-code"
+                           inputmode="numeric" placeholder="123456 or a backup code"
+                           style="letter-spacing: 2px;">
+                </div>
+                <button type="submit" class="btn btn-primary btn-large" style="background: var(--sea-800);">Verify</button>
+            </form>
+            <p class="auth-footer"><a href="{{ url_for('login') }}">Cancel and sign in again</a></p>
+        </div>
+        <p class="auth-below">{{ app_footer }}</p>
+    </div>
+</body>
+</html>

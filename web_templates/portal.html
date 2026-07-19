@@ -42,9 +42,14 @@
         {% if share.decision %}
         <div class="decided-banner decided-{{ share.decision }}">
             You {{ 'accepted' if share.decision == 'accepted' else 'declined' }} this proposal
+            {% if share.decided_by_name %}as {{ share.decided_by_name }}{% if share.decided_by_title %} ({{ share.decided_by_title }}){% endif %}{% endif %}
             {{ 'on ' + share.decided_at.strftime('%B %d, %Y') if share.decided_at else '' }}.
         </div>
         {% endif %}
+
+        <p style="text-align:right; margin: 0 0 10px;">
+            <a class="btn btn-secondary" href="{{ url_for('portal_pdf', token=share.token) }}">&#8681; Download PDF</a>
+        </p>
 
         <div class="portal-doc">
             {{ proposal_html | safe }}
@@ -55,18 +60,20 @@
             {% if share.allow_decision %}
             <h3>Your decision</h3>
             <p>Ready to move forward, or need changes?</p>
-            <div class="decision-row">
-                <form method="post" action="{{ url_for('portal_decision', token=share.token) }}">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                    <input type="hidden" name="decision" value="accepted">
-                    <button type="submit" class="btn btn-primary">Accept proposal</button>
-                </form>
-                <form method="post" action="{{ url_for('portal_decision', token=share.token) }}">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                    <input type="hidden" name="decision" value="declined">
-                    <button type="submit" class="btn btn-secondary">Decline</button>
-                </form>
-            </div>
+            <form method="post" action="{{ url_for('portal_decision', token=share.token) }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <div class="decision-row" style="margin-bottom:10px;">
+                    <input type="text" name="decider_name" placeholder="Your full name (required to accept)"
+                           style="flex:1; min-width:200px; padding:9px 11px; border:1px solid #ccc; border-radius:8px; font:inherit;">
+                    <input type="text" name="decider_title" placeholder="Title (optional)"
+                           style="flex:1; min-width:150px; padding:9px 11px; border:1px solid #ccc; border-radius:8px; font:inherit;">
+                </div>
+                <textarea name="note" placeholder="Optional note to the team…" style="min-height:60px; margin-bottom:10px;"></textarea>
+                <div class="decision-row">
+                    <button type="submit" name="decision" value="accepted" class="btn btn-primary">Accept proposal</button>
+                    <button type="submit" name="decision" value="declined" class="btn btn-secondary">Decline</button>
+                </div>
+            </form>
             {% endif %}
 
             {% if share.allow_comments %}

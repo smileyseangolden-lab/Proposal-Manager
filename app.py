@@ -12,6 +12,7 @@ Full-featured intranet application with:
 """
 
 import difflib
+import hashlib
 import hmac
 import json
 import logging
@@ -67,8 +68,11 @@ import billing
 import crypto_util
 import htmlsafe
 import jobs
+import ocr
 import proposal_agent
+import sso
 import storage
+import twofa
 from document_parser import parse_document
 from models import (
     ActivityLog,
@@ -239,6 +243,47 @@ LOGO_MAX_PIXELS = 40_000_000  # 40 MP — far larger than any real logo
 Image.MAX_IMAGE_PIXELS = LOGO_MAX_PIXELS
 
 
+@app.template_filter("localtime")
+def localtime_filter(dt, style="dt"):
+    """Render a stored-UTC datetime as a <time> element that base.html's
+    localizer converts to the VIEWER'S timezone. Falls back to a UTC-labeled
+    string when JS is unavailable. Styles: 'dt' (Jan 5, 14:32),
+    'date' (Jan 5, 2026), 'full' (Jan 5, 2026, 14:32)."""
+    from markupsafe import Markup, escape
+    if not dt:
+        return ""
+    aware = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    iso = aware.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if style == "date":
+        fallback = aware.strftime("%b %d, %Y")
+    elif style == "full":
+        fallback = aware.strftime("%b %d, %Y %H:%M UTC")
+    else:
+        fallback = aware.strftime("%b %d, %H:%M UTC")
+    return Markup(
+        f'<time datetime="{iso}" data-utc="{iso}" data-style="{escape(style)}">{escape(fallback)}</time>'
+    )
+
+
+@app.template_filter("money_compact")
+def money_compact_filter(value):
+    """Humanized currency: $850 · $45k · $1.2M — replaces the old always-in-
+    millions formatting that showed a $45,000 deal as \"$0.0M\"."""
+    try:
+        v = float(value or 0)
+    except (TypeError, ValueError):
+        v = 0.0
+    sign = "-" if v < 0 else ""
+    v = abs(v)
+    if v >= 1_000_000:
+        return f"{sign}${v / 1_000_000:,.1f}M"
+    if v >= 10_000:
+        return f"{sign}${v / 1_000:,.0f}k"
+    if v >= 1_000:
+        return f"{sign}${v / 1_000:,.1f}k"
+    return f"{sign}${v:,.0f}"
+
+
 @app.context_processor
 def inject_branding():
     return dict(
@@ -251,7 +296,12 @@ def inject_branding():
 
 @login_manager.user_loader
 def load_user(user_id):
-    return db.session.get(User, user_id)
+    user = db.session.get(User, user_id)
+    # Deactivated (offboarded) members are logged out everywhere immediately —
+    # returning None invalidates any session they still hold.
+    if user is not None and user.is_active is False:
+        return None
+    return user
 
 
 @app.route("/healthz")
@@ -309,6 +359,15 @@ def _csrf_protect():
 
 
 @app.before_request
+def _ensure_job_workers():
+    """Start the background job pollers in every web process (idempotent,
+    no-op in inline/test mode). Previously workers only started in the process
+    that enqueued a job — if that process died on deploy, queued jobs sat
+    stranded until some other user happened to enqueue."""
+    jobs.start_workers()
+
+
+@app.before_request
 def _tag_ai_usage():
     """Attribute any LLM calls made while serving this request to the current
     org/user, so token usage is metered and the monthly AI budget is enforced.
@@ -356,6 +415,39 @@ def _login_rate_limited(key: str) -> bool:
 
 def _record_login_attempt(key: str):
     _LOGIN_ATTEMPTS.setdefault(key, []).append(time.time())
+
+
+# Signup throttle: each free workspace gets platform-funded AI budget, so
+# unlimited signups from one network is a scriptable spend attack.
+_SIGNUP_ATTEMPTS: dict[str, list[float]] = {}
+_SIGNUP_MAX_PER_WINDOW = 5
+_SIGNUP_WINDOW_SECONDS = 3600
+
+
+def _signup_rate_limited(ip: str) -> bool:
+    now = time.time()
+    attempts = [t for t in _SIGNUP_ATTEMPTS.get(ip, []) if now - t < _SIGNUP_WINDOW_SECONDS]
+    _SIGNUP_ATTEMPTS[ip] = attempts
+    return len(attempts) >= _SIGNUP_MAX_PER_WINDOW
+
+
+def _record_signup(ip: str):
+    _SIGNUP_ATTEMPTS.setdefault(ip, []).append(time.time())
+
+
+# In-process AI-endpoint throttle (chat / editor assist) per user.
+_AI_CALLS: dict[str, list[float]] = {}
+
+
+def _ai_rate_limited(key: str, max_calls: int, window: int = 60) -> bool:
+    now = time.time()
+    calls = [t for t in _AI_CALLS.get(key, []) if now - t < window]
+    if len(calls) >= max_calls:
+        _AI_CALLS[key] = calls
+        return True
+    calls.append(now)
+    _AI_CALLS[key] = calls
+    return False
 
 
 with app.app_context():
@@ -476,12 +568,27 @@ def _org_users_query():
 
 
 def _org_proposal_users():
-    """Org members who can be assigned proposals (proposal + admin roles)."""
+    """Active org members who can be assigned proposals (proposal + admin roles)."""
     return (
         _org_users_query()
-        .filter(User.role.in_(["proposal", "admin"]))
+        .filter(User.role.in_(["proposal", "admin"]), User.is_active.isnot(False))
         .order_by(User.display_name)
         .all()
+    )
+
+
+def _platform_ai_gate() -> tuple[bool, str]:
+    """Using the platform's built-in API key requires a verified email — curbs
+    throwaway-signup abuse of platform-funded AI. Users generating with their
+    OWN key (and invited members, who are auto-verified) are unaffected."""
+    if current_user.email_verified:
+        return True, ""
+    if decrypt_api_key(current_user.api_key_encrypted):
+        return True, ""
+    return False, (
+        "Please verify your email address before using the built-in AI "
+        "(check your inbox, or use 'Resend verification email' in the banner "
+        "above). Alternatively, add your own Anthropic API key in Settings."
     )
 
 
@@ -542,14 +649,17 @@ def _setup_progress(user) -> dict:
     Returns dict with 'steps' (list of {key,title,desc,done,url_endpoint,anchor}),
     'done' count, 'total' count, and 'complete' bool.
     """
+    org = db.session.get(Organization, user.org_id) if user.org_id else None
+    org_named = bool(org and (org.name or "").strip()
+                     and not org.name.endswith("'s Workspace"))
     steps = [
         {
             "key": "company",
-            "title": "Add your company profile",
+            "title": "Name your company workspace",
             "desc": "Company name used to brand generated proposals.",
             "endpoint": "settings",
             "anchor": "",
-            "done": bool((user.company_name or "").strip()),
+            "done": org_named,
         },
         {
             "key": "logo",
@@ -557,7 +667,16 @@ def _setup_progress(user) -> dict:
             "desc": "Placed on proposal cover pages and headers.",
             "endpoint": "posture",
             "anchor": "#branding",
-            "done": bool(user.company_logo_path),
+            "done": bool(org and org.logo_path),
+        },
+        {
+            "key": "team",
+            "title": "Invite your team",
+            "desc": "Teammates draft, review, and approve together.",
+            "endpoint": "admin_panel",
+            "anchor": "",
+            "done": (User.query.filter_by(org_id=user.org_id).count() > 1
+                     or OrgInvitation.query.filter_by(org_id=user.org_id).count() > 0),
         },
         {
             "key": "template",
@@ -617,6 +736,9 @@ def _setup_progress(user) -> dict:
             "done": Proposal.query.join(Project).filter(Project.user_id == user.id).count() > 0,
         },
     ]
+    # Only admins can invite — don't show members a to-do they can't act on.
+    if not user.is_admin:
+        steps = [s for s in steps if s["key"] != "team"]
     done = sum(1 for s in steps if s["done"])
     return {
         "steps": steps,
@@ -631,7 +753,7 @@ def _setup_progress(user) -> dict:
 def inject_nav_context():
     """Sidebar counts + setup wizard progress for the app shell."""
     if not (hasattr(current_user, "id") and current_user.is_authenticated):
-        return dict(setup_progress=None, nav_active_projects=0)
+        return dict(setup_progress=None, nav_active_projects=0, nav_org_name="")
     active_count = Project.query.filter(
         db.or_(
             Project.user_id == current_user.id,
@@ -639,9 +761,12 @@ def inject_nav_context():
         ),
         Project.status == "active",
     ).count()
+    nav_org = db.session.get(Organization, current_user.org_id) if current_user.org_id else None
     return dict(
         setup_progress=_setup_progress(current_user),
         nav_active_projects=active_count,
+        nav_org_name=(nav_org.name if nav_org else "") or "",
+        nav_trial_days=billing.trial_days_left(nav_org) if nav_org else 0,
     )
 
 
@@ -676,6 +801,39 @@ def _save_upload(file, subdir: str = "") -> tuple[str, str, int]:
     return safe, str(dest), size
 
 
+def _extract_text_chars(path: str):
+    """Parse receipt for an uploaded document: how many characters of
+    machine-readable text it yields (fast pass — no OCR, so the upload request
+    stays quick). 0 = parsed but empty (e.g. a scanned image PDF); None =
+    format we couldn't check. Lets the UI warn at UPLOAD time instead of
+    failing minutes later at generation."""
+    try:
+        return len(parse_document(path).strip())
+    except Exception:
+        return None
+
+
+def _flag_unreadable(entries):
+    """Given [(filename, text_chars)], flash the right message: files that will
+    be recovered by OCR at generation vs. genuinely unreadable ones."""
+    scanned, unreadable = [], []
+    for name, chars in entries:
+        if chars != 0:
+            continue
+        if name.lower().endswith(".pdf") and ocr.available():
+            scanned.append(name)
+        else:
+            unreadable.append(name)
+    if scanned:
+        flash("Looks like a scan: " + ", ".join(scanned)
+              + " has no embedded text, but we'll read it with OCR when you "
+              "generate (it may take a little longer).", "success")
+    if unreadable:
+        flash("Heads up: no readable text could be extracted from "
+              + ", ".join(unreadable) + " — it may be a scanned image. "
+              "The AI won't be able to analyze it.", "error")
+
+
 def _send_stored_file(path, **kwargs):
     """send_file wrapper that fetches the file from object storage first if the
     local copy is missing (ephemeral disk / multi-instance safety)."""
@@ -683,26 +841,56 @@ def _send_stored_file(path, **kwargs):
     return send_file(str(path), **kwargs)
 
 
-def _logo_docx_kwargs(user, company_name_override: str = "") -> dict:
-    """Build the logo-related kwargs passed into markdown_to_docx so they
-    respect the user's branding preferences."""
-    if not getattr(user, "company_logo_path", None):
-        return {"font_name": user.font_preference or "Calibri"}
-    if not getattr(user, "company_logo_use_in_proposals", False):
-        return {"font_name": user.font_preference or "Calibri"}
-    logo_path = user.company_logo_path
-    if not Path(logo_path).exists():
-        return {"font_name": user.font_preference or "Calibri"}
+def _proposal_markdown(proposal) -> str:
+    """Canonical proposal content for reading.
+
+    The latest ProposalVersion row is the source of truth — it survives
+    redeploys and multi-instance deployments where the generated file on local
+    disk may be missing or stale. The generated .md file (pulled from object
+    storage if needed) is only a fallback for legacy proposals without a
+    version row. Returns "" when no content can be found."""
+    version = latest_version(proposal.id)
+    if version and (version.markdown_content or "").strip():
+        return version.markdown_content
+    md_path = GENERATED_DIR / proposal.md_file
+    storage.ensure_local(md_path)
+    if md_path.exists():
+        return md_path.read_text(encoding="utf-8")
+    return ""
+
+
+def _org_for_project(project):
+    """The organization that owns a project (branding source of truth)."""
+    org_id = _owner_org_id(project) if project else None
+    return db.session.get(Organization, org_id) if org_id else None
+
+
+def _logo_docx_kwargs(org, font_user=None) -> dict:
+    """Logo/branding kwargs for markdown_to_docx. Branding is ORG-level so
+    every member's generations carry the same workspace identity; only the
+    body font follows the acting user's preference."""
+    font = (getattr(font_user, "font_preference", "") or "Calibri")
+    if org is None or not (org.logo_path or "") or not org.logo_use_in_proposals:
+        return {"font_name": font}
+    storage.ensure_local(org.logo_path)
+    if not Path(org.logo_path).exists():
+        return {"font_name": font}
     return {
-        "logo_path": logo_path,
-        "logo_placement": user.company_logo_placement or "top_left",
-        "logo_on_cover": bool(getattr(user, "company_logo_show_on_cover", False)),
-        "company_name": company_name_override or (user.company_name or ""),
-        "font_name": user.font_preference or "Calibri",
+        "logo_path": org.logo_path,
+        "logo_placement": org.logo_placement or "top_left",
+        "logo_on_cover": bool(org.logo_show_on_cover),
+        "company_name": org.name or "",
+        "font_name": font,
     }
 
 
-def _process_and_save_logo(file, user_id: str) -> tuple[str, str, int]:
+def _project_brand_kwargs(project, font_user) -> dict:
+    """DOCX branding kwargs for a project: the owning ORG's logo/identity with
+    the acting user's font preference."""
+    return _logo_docx_kwargs(_org_for_project(project), font_user=font_user)
+
+
+def _process_and_save_logo(file, owner_id: str) -> tuple[str, str, int]:
     """Load an uploaded image, auto-orient, resize to a reasonable size,
     and save as an optimized PNG. Transparency is preserved where possible.
 
@@ -710,7 +898,7 @@ def _process_and_save_logo(file, user_id: str) -> tuple[str, str, int]:
     Raises ValueError on an unreadable/invalid image.
     """
     original_name = secure_filename(file.filename or "logo")
-    dest_dir = UPLOADS_DIR / f"logos/{user_id}"
+    dest_dir = UPLOADS_DIR / f"logos/{owner_id}"
     dest_dir.mkdir(parents=True, exist_ok=True)
     unique = f"logo_{uuid.uuid4().hex[:8]}.png"
     dest = dest_dir / unique
@@ -756,6 +944,12 @@ def _process_and_save_logo(file, user_id: str) -> tuple[str, str, int]:
 # Auth routes
 # ---------------------------------------------------------------------------
 
+def _email_matches(email: str):
+    """Exact case-insensitive email predicate. (ilike allowed `%`/`_` wildcards
+    from user input into email lookups — usable to probe or spam resets.)"""
+    return db.func.lower(User.email) == (email or "").strip().lower()
+
+
 def _valid_invitation(token: str) -> OrgInvitation | None:
     if not token:
         return None
@@ -777,13 +971,17 @@ def accept_invite(token):
         flash("This invitation link is invalid, expired, or already used.", "error")
         return redirect(url_for("signup"))
     org = db.session.get(Organization, inv.org_id)
-    return render_template("signup.html", invitation=inv, invite_org=org)
+    return render_template("signup.html", invitation=inv, invite_org=org, form=None)
 
 
 @app.route("/signup", methods=["GET", "POST"])
 def signup():
     if request.method == "GET":
-        return render_template("signup.html", invitation=None, invite_org=None)
+        return render_template("signup.html", invitation=None, invite_org=None, form=None)
+
+    if not app.testing and _signup_rate_limited(request.remote_addr or "?"):
+        flash("Too many new accounts from this network. Please try again later.", "error")
+        return redirect(url_for("signup"))
 
     username = request.form.get("username", "").strip()
     email = request.form.get("email", "").strip()
@@ -797,17 +995,31 @@ def signup():
         flash("This invitation link is invalid, expired, or already used.", "error")
         return redirect(url_for("signup"))
 
+    def _signup_again(message):
+        # Re-render with the typed values preserved — the old redirect pattern
+        # wiped the whole form on every validation error.
+        flash(message, "error")
+        invite_org = db.session.get(Organization, invitation.org_id) if invitation else None
+        return render_template("signup.html", invitation=invitation,
+                               invite_org=invite_org, form=request.form)
+
     if not username or not email or not password:
-        flash("All fields are required.", "error")
-        return redirect(url_for("signup"))
+        return _signup_again("All fields are required.")
 
     if len(password) < 8:
-        flash("Password must be at least 8 characters.", "error")
-        return redirect(url_for("signup"))
+        return _signup_again("Password must be at least 8 characters.")
 
     if User.query.filter_by(username=username).first():
-        flash("Username already taken.", "error")
-        return redirect(url_for("signup"))
+        return _signup_again("Username already taken.")
+
+    # Email must be globally unique (case-insensitive) — duplicates break
+    # password reset and verification. For invited signups validate the
+    # INVITED address, since that's what the account is bound to.
+    effective_email = invitation.email if invitation else email
+    if User.query.filter(_email_matches(effective_email)).first():
+        flash("An account with that email address already exists. "
+              "Sign in instead, or use the password reset if you've forgotten it.", "error")
+        return redirect(url_for("login"))
 
     user = User(
         username=username,
@@ -848,6 +1060,7 @@ def signup():
         db.session.add(user)
 
     db.session.commit()
+    _record_signup(request.remote_addr or "?")
     session.permanent = True
     login_user(user)
     _log_activity("signup", f"User {username} created account")
@@ -873,25 +1086,32 @@ def login():
     if current_user.is_authenticated:
         return redirect(url_for("dashboard"))
     if request.method == "GET":
-        return render_template("login.html")
+        return render_template("login.html", ident="",
+                               sso_enabled=sso.configured(), sso_label=sso.button_label())
 
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "")
 
+    def _login_again(message):
+        flash(message, "error")
+        return render_template("login.html", ident=username,
+                               sso_enabled=sso.configured(), sso_label=sso.button_label())
+
     rl_key = f"{request.remote_addr}:{username.lower()}"
     if _login_rate_limited(rl_key):
-        flash("Too many login attempts. Please wait a few minutes and try again.", "error")
-        return redirect(url_for("login"))
+        return _login_again("Too many login attempts. Please wait a few minutes and try again.")
 
-    user = User.query.filter_by(username=username).first()
+    # Sign in with either username or email (emails are unique)
+    user = User.query.filter(
+        db.or_(User.username == username, _email_matches(username))
+    ).first()
 
     # Cross-worker, per-account lockout (survives multiple gunicorn workers and
     # catches password spraying against one account regardless of source IP).
     now = datetime.now(timezone.utc)
     if user and user.lockout_until and _aware(user.lockout_until) > now:
-        flash("This account is temporarily locked after too many failed attempts. "
-              "Please wait a few minutes and try again.", "error")
-        return redirect(url_for("login"))
+        return _login_again("This account is temporarily locked after too many "
+                            "failed attempts. Please wait a few minutes and try again.")
 
     if not user or not user.check_password(password):
         _record_login_attempt(rl_key)
@@ -901,17 +1121,186 @@ def login():
                 user.lockout_until = now + timedelta(seconds=_ACCOUNT_LOCK_SECONDS)
                 user.failed_login_count = 0
             db.session.commit()
-        flash("Invalid username or password.", "error")
-        return redirect(url_for("login"))
+        return _login_again("Invalid username or password.")
+
+    # Deactivated members can't sign in (checked after password verification so
+    # probing can't distinguish "wrong password" from "deactivated").
+    if user.is_active is False:
+        return _login_again("This account has been deactivated. Contact your workspace admin.")
 
     _LOGIN_ATTEMPTS.pop(rl_key, None)
     if user.failed_login_count or user.lockout_until:
         user.failed_login_count = 0
         user.lockout_until = None
         db.session.commit()
+
+    # Two-factor gate: password was correct, but don't authenticate yet — stash
+    # a short-lived "pending" marker (NOT a login) and require the TOTP step.
+    if user.totp_enabled:
+        session["pending_2fa_user"] = user.id
+        session["pending_2fa_at"] = time.time()
+        return redirect(url_for("login_2fa"))
+
     session.permanent = True  # apply PERMANENT_SESSION_LIFETIME idle expiry
     login_user(user)
     _log_activity("login")
+    return redirect(url_for("dashboard"))
+
+
+# Pending-2FA marker is valid for this long between password and code steps.
+_TWOFA_PENDING_TTL = 600
+
+
+def _complete_login(user):
+    session.pop("pending_2fa_user", None)
+    session.pop("pending_2fa_at", None)
+    session.permanent = True
+    login_user(user)
+    _log_activity("login")
+
+
+@app.route("/login/2fa", methods=["GET", "POST"])
+def login_2fa():
+    """Second login step for accounts with TOTP enabled. Reached only after a
+    correct password sets the pending marker — never a standalone entry point."""
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+    uid = session.get("pending_2fa_user")
+    started = session.get("pending_2fa_at", 0)
+    if not uid or (time.time() - float(started or 0)) > _TWOFA_PENDING_TTL:
+        session.pop("pending_2fa_user", None)
+        session.pop("pending_2fa_at", None)
+        flash("Your sign-in timed out. Please enter your password again.", "error")
+        return redirect(url_for("login"))
+    user = db.session.get(User, uid)
+    if not user or not user.totp_enabled or user.is_active is False:
+        session.pop("pending_2fa_user", None)
+        return redirect(url_for("login"))
+
+    if request.method == "GET":
+        return render_template("login_2fa.html")
+
+    rl_key = f"2fa:{request.remote_addr}:{uid}"
+    if _login_rate_limited(rl_key):
+        flash("Too many attempts. Please wait a few minutes and try again.", "error")
+        return render_template("login_2fa.html")
+
+    code = request.form.get("code", "").strip()
+    secret = crypto_util.decrypt(user.totp_secret_encrypted)
+    if twofa.verify_code(secret, code):
+        _complete_login(user)
+        return redirect(url_for("dashboard"))
+
+    # Fall back to a single-use backup code
+    ok, new_json = twofa.consume_backup_code(user.totp_backup_codes, code)
+    if ok:
+        user.totp_backup_codes = new_json
+        db.session.commit()
+        left = twofa.backup_codes_remaining(new_json)
+        _complete_login(user)
+        flash(f"Backup code accepted — {left} backup code(s) remaining.", "success")
+        return redirect(url_for("dashboard"))
+
+    _record_login_attempt(rl_key)
+    flash("Invalid code. Try again, or use one of your backup codes.", "error")
+    return render_template("login_2fa.html")
+
+
+# ---------------------------------------------------------------------------
+# Single sign-on (OIDC)
+# ---------------------------------------------------------------------------
+
+def _unique_username_from_email(email: str) -> str:
+    base = re.sub(r"[^a-z0-9._-]", "", (email.split("@")[0] or "").lower()) or "user"
+    candidate, i = base, 1
+    while User.query.filter_by(username=candidate).first():
+        i += 1
+        candidate = f"{base}{i}"
+    return candidate[:80]
+
+
+@app.route("/sso/login")
+def sso_login():
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+    if not sso.configured():
+        flash("Single sign-on isn't configured on this deployment.", "error")
+        return redirect(url_for("login"))
+    state = secrets.token_urlsafe(24)
+    session["sso_state"] = state
+    return redirect(sso.authorize_url(url_for("sso_callback", _external=True), state))
+
+
+@app.route("/sso/callback")
+def sso_callback():
+    """OIDC redirect target. Verifies state, exchanges the code, reads the
+    verified email from userinfo, and links / JIT-provisions the account.
+
+    Note: SSO is treated as strong authentication (the IdP performs its own
+    MFA), so it does not additionally trigger the app-level TOTP step."""
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+    if not sso.configured():
+        abort(404)
+
+    expected = session.pop("sso_state", None)
+    if not expected or not hmac.compare_digest(request.args.get("state", ""), expected):
+        flash("Sign-in could not be verified. Please try again.", "error")
+        return redirect(url_for("login"))
+    if request.args.get("error"):
+        flash("Single sign-on was canceled or denied.", "error")
+        return redirect(url_for("login"))
+    code = request.args.get("code", "")
+    if not code:
+        return redirect(url_for("login"))
+
+    try:
+        token = sso.exchange_code(code, url_for("sso_callback", _external=True))
+        access = token.get("access_token")
+        if not access:
+            raise RuntimeError("no access token in IdP response")
+        info = sso.fetch_userinfo(access)
+    except Exception:
+        app.logger.warning("SSO code exchange / userinfo failed", exc_info=True)
+        flash("Single sign-on failed. Please try again or use your password.", "error")
+        return redirect(url_for("login"))
+
+    email = (info.get("email") or "").strip()
+    res = sso.resolve(email, info.get("email_verified"))
+
+    if res.status == "unverified":
+        flash("Your identity provider hasn't verified that email address, so we can't sign you in.", "error")
+        return redirect(url_for("login"))
+    if res.status == "deactivated":
+        flash("This account has been deactivated. Contact your workspace admin.", "error")
+        return redirect(url_for("login"))
+    if res.status == "no_account":
+        flash("No workspace is set up for your email domain. Ask a workspace admin to invite you first.", "error")
+        return redirect(url_for("login"))
+
+    if res.status == "jit":
+        ok, _msg = billing.can_add_seat(res.org.id)
+        if not ok:
+            flash("Your team has reached its seat limit — ask an admin to upgrade or free a seat.", "error")
+            return redirect(url_for("login"))
+        user = User(
+            username=_unique_username_from_email(email),
+            email=email,
+            display_name=(info.get("name") or "").strip(),
+            org_id=res.org.id,
+            role="proposal",
+            email_verified=True,
+        )
+        user.set_password(secrets.token_urlsafe(32))  # unusable password — SSO only
+        db.session.add(user)
+        db.session.commit()
+        _log_activity_for(user, "sso_provision", f"Provisioned via SSO into {res.org.name}")
+    else:
+        user = res.user
+
+    session.permanent = True
+    login_user(user)
+    _log_activity_for(user, "login", "Signed in via SSO")
     return redirect(url_for("dashboard"))
 
 
@@ -919,20 +1308,33 @@ def login():
 # Email verification & password reset
 # ---------------------------------------------------------------------------
 
-def _issue_token(user, purpose: str, hours: int = 24) -> UserToken:
+def _hash_token(raw: str) -> str:
+    """Reset/verify tokens are stored hashed so a DB leak can't be replayed
+    into an account takeover. SHA-256 hex fits the existing 64-char column."""
+    return hashlib.sha256((raw or "").encode("utf-8")).hexdigest()
+
+
+def _issue_token(user, purpose: str, hours: int = 24) -> str:
+    """Create a single-use token and return the RAW value (for the emailed
+    link). Only its hash is persisted."""
     from datetime import timedelta
+    raw = uuid.uuid4().hex + uuid.uuid4().hex
     tok = UserToken(
         user_id=user.id,
         purpose=purpose,
+        token=_hash_token(raw),
         expires_at=datetime.utcnow() + timedelta(hours=hours),
     )
     db.session.add(tok)
     db.session.commit()
-    return tok
+    return raw
 
 
 def _consume_token(token_str: str, purpose: str):
-    tok = UserToken.query.filter_by(token=token_str, purpose=purpose).first()
+    tok = UserToken.query.filter_by(token=_hash_token(token_str), purpose=purpose).first()
+    if tok is None:
+        # Legacy rows created before hashing stored the raw token.
+        tok = UserToken.query.filter_by(token=token_str, purpose=purpose).first()
     if not tok or tok.used_at:
         return None
     if tok.expires_at:
@@ -943,8 +1345,8 @@ def _consume_token(token_str: str, purpose: str):
 
 
 def _send_verification_email(user):
-    tok = _issue_token(user, "verify", hours=72)
-    link = url_for("verify_email", token=tok.token, _external=True)
+    raw = _issue_token(user, "verify", hours=72)
+    link = url_for("verify_email", token=raw, _external=True)
     import mailer
     sent = mailer.send_email(
         to=user.email,
@@ -990,10 +1392,10 @@ def forgot_password():
     email = request.form.get("email", "").strip().lower()
     # Always show the same message to avoid leaking which emails exist
     generic = "If an account exists for that email, a reset link has been sent."
-    user = User.query.filter(User.email.ilike(email)).first() if email else None
+    user = User.query.filter(_email_matches(email)).first() if email else None
     if user:
-        tok = _issue_token(user, "reset", hours=2)
-        link = url_for("reset_password", token=tok.token, _external=True)
+        raw = _issue_token(user, "reset", hours=2)
+        link = url_for("reset_password", token=raw, _external=True)
         import mailer
         sent = mailer.send_email(
             to=user.email,
@@ -1153,21 +1555,40 @@ def _inline_redline_markdown(old_md: str, new_md: str) -> str:
 # Dashboard
 # ---------------------------------------------------------------------------
 
-def _project_focus_entry(p, now_naive):
+def _focus_context(active_projects) -> dict:
+    """Bulk-load everything _project_focus_entry needs for the dashboard focus
+    list in a fixed number of queries (previously 4+ queries per project)."""
+    ids = [p.id for p in active_projects]
+    latest = _latest_proposals_for(ids)
+    latest_ids = [prop.id for prop in latest.values()]
+    return {
+        "latest": latest,
+        "docs": _counts_by(
+            ProjectDocument.project_id, ProjectDocument.id,
+            ProjectDocument.project_id.in_(ids)) if ids else {},
+        "pending_q": _counts_by(
+            ProposalQuestion.project_id, ProposalQuestion.id,
+            ProposalQuestion.project_id.in_(ids),
+            ProposalQuestion.status == "pending") if ids else {},
+        "scopes": {s.project_id: s for s in ProjectScope.query.filter(
+            ProjectScope.project_id.in_(ids)).all()} if ids else {},
+        "pending_req": _counts_by(
+            RevisionRequest.proposal_id, RevisionRequest.id,
+            RevisionRequest.proposal_id.in_(latest_ids),
+            RevisionRequest.status == "pending") if latest_ids else {},
+    }
+
+
+def _project_focus_entry(p, now_naive, ctx):
     """Build a 'pick up where you left off' entry for an active project.
 
     Determines the single next action based on the latest proposal's
-    lifecycle state (or the pre-generation state of the project).
+    lifecycle state (or the pre-generation state of the project). All lookups
+    come from the prefetched `ctx` (see _focus_context) — no per-row queries.
     """
-    latest_prop = (
-        Proposal.query.filter_by(project_id=p.id)
-        .order_by(Proposal.generated_at.desc())
-        .first()
-    )
-    doc_count = ProjectDocument.query.filter_by(project_id=p.id).count()
-    pending_questions = ProposalQuestion.query.filter_by(
-        project_id=p.id, status="pending"
-    ).count()
+    latest_prop = ctx["latest"].get(p.id)
+    doc_count = ctx["docs"].get(p.id, 0)
+    pending_questions = ctx["pending_q"].get(p.id, 0)
 
     action_label = "Open"
     action_url = url_for("project_upload", project_id=p.id)
@@ -1180,7 +1601,7 @@ def _project_focus_entry(p, now_naive):
         chip = ("Your move", "chip-gold")
         sub = f"{pending_questions} clarification question(s) awaiting answers"
     elif latest_prop is None:
-        scope = ProjectScope.query.filter_by(project_id=p.id).first()
+        scope = ctx["scopes"].get(p.id)
         if doc_count == 0:
             action_label = "Upload documents"
             chip = ("Needs documents", "chip-neutral")
@@ -1200,9 +1621,7 @@ def _project_focus_entry(p, now_naive):
             sub = "Scope approved · awaiting AI draft"
     else:
         rs = latest_prop.review_status or "draft"
-        pending_req = RevisionRequest.query.filter_by(
-            proposal_id=latest_prop.id, status="pending"
-        ).count()
+        pending_req = ctx["pending_req"].get(latest_prop.id, 0)
         if rs == "draft":
             action_label = "Send for review"
             action_url = url_for("view_proposal", proposal_id=latest_prop.id)
@@ -1295,8 +1714,11 @@ def quick_start():
     db.session.add(project)
     db.session.flush()
 
+    receipts = []
     for f in valid:
         safe, path, size = _save_upload(f, f"projects/{project.id}")
+        chars = _extract_text_chars(path)
+        receipts.append((safe, chars))
         db.session.add(ProjectDocument(
             project_id=project.id,
             filename=f"{uuid.uuid4().hex[:8]}_{safe}",
@@ -1304,9 +1726,11 @@ def quick_start():
             file_type="rfp",
             file_path=path,
             file_size=size,
+            text_chars=chars,
         ))
 
     db.session.commit()
+    _flag_unreadable(receipts)
     _log_activity("project_quick_start", f"Quick-started project from {len(valid)} file(s)", project.id)
     _notify_role(
         "proposal", "rfp_uploaded",
@@ -1375,16 +1799,16 @@ def dashboard():
             ).scalar() or 0
             pipeline_by_status[status] = {"count": cnt, "value": val}
 
+    # Bulk context for the focus list + role widgets (fixed query count)
+    focus_ctx = _focus_context(active_projects)
+
     # Proposal-focused extras: docs needing proposals, recent generations
     pending_docs_projects = []
     recent_proposals = []
     if user_role == "proposal":
-        # Projects with docs but no proposals
-        my_projects = Project.query.filter(my_project_filter, Project.status == "active").all()
-        for p in my_projects:
-            doc_count = ProjectDocument.query.filter_by(project_id=p.id).count()
-            prop_count = Proposal.query.filter_by(project_id=p.id).count()
-            if doc_count > 0 and prop_count == 0:
+        for p in active_projects:
+            doc_count = focus_ctx["docs"].get(p.id, 0)
+            if doc_count > 0 and p.id not in focus_ctx["latest"]:
                 pending_docs_projects.append({"project": p, "doc_count": doc_count})
         recent_proposals = Proposal.query.join(Project).filter(
             my_project_filter
@@ -1432,31 +1856,37 @@ def dashboard():
     # --- Part 3: Review widgets ----------------------------------------------
 
     # "Pending My Review" — proposals where I'm an assigned reviewer and I
-    # haven't yet recorded a decision on the latest version.
+    # haven't yet recorded a decision on the latest version. Bulk-loaded
+    # (previously 4 queries per review assignment).
     my_reviews_pending: list[dict] = []
     my_assignments = ProposalReviewer.query.filter_by(user_id=current_user.id).all()
+    rev_prop_ids = [r.proposal_id for r in my_assignments]
+    rev_props = {p.id: p for p in Proposal.query.filter(
+        Proposal.id.in_(rev_prop_ids)).all()} if rev_prop_ids else {}
+    rev_versions = _latest_versions_for(list(rev_props))
+    decided = {
+        (a.proposal_id, a.version_id)
+        for a in ProposalApproval.query.filter(
+            ProposalApproval.proposal_id.in_(rev_prop_ids),
+            ProposalApproval.user_id == current_user.id).all()
+    } if rev_prop_ids else set()
+    rev_projects = {p.id: p for p in Project.query.filter(Project.id.in_(
+        [pr.project_id for pr in rev_props.values()])).all()} if rev_props else {}
     for r in my_assignments:
-        prop = db.session.get(Proposal, r.proposal_id)
-        if not prop:
+        prop = rev_props.get(r.proposal_id)
+        if not prop or prop.review_status not in ("in_review", "revision_requested"):
             continue
-        if prop.review_status not in ("in_review", "revision_requested"):
+        version = rev_versions.get(prop.id)
+        if not version or (prop.id, version.id) in decided:
             continue
-        version = latest_version(prop.id)
-        if not version:
-            continue
-        decision = ProposalApproval.query.filter_by(
-            proposal_id=prop.id, version_id=version.id, user_id=current_user.id
-        ).first()
-        if decision is not None:
-            continue
-        proj = db.session.get(Project, prop.project_id)
+        proj = rev_projects.get(prop.project_id)
         my_reviews_pending.append({
             "proposal": prop,
             "project": proj,
             "reviewer": r,
             "version_number": version.version_number,
             "deadline": r.deadline,
-            "overdue": bool(r.deadline) and r.deadline < datetime.now(timezone.utc),
+            "overdue": bool(r.deadline) and _aware(r.deadline) < datetime.now(timezone.utc),
         })
 
     # "Out for Review" — proposals I own that are currently in_review /
@@ -1468,16 +1898,19 @@ def dashboard():
                 Proposal.review_status.in_(("in_review", "revision_requested", "internally_approved")))
         .all()
     )
+    ofr_projects = {p.id: p for p in Project.query.filter(Project.id.in_(
+        [pr.project_id for pr in owned_props])).all()} if owned_props else {}
+    ofr_pending = _counts_by(
+        RevisionRequest.proposal_id, RevisionRequest.id,
+        RevisionRequest.proposal_id.in_([pr.id for pr in owned_props]),
+        RevisionRequest.status == "pending") if owned_props else {}
     for prop in owned_props:
         state = approval_state(prop)
-        proj = db.session.get(Project, prop.project_id)
         out_for_review.append({
             "proposal": prop,
-            "project": proj,
+            "project": ofr_projects.get(prop.project_id),
             "state": state,
-            "pending_req_count": RevisionRequest.query.filter_by(
-                proposal_id=prop.id, status="pending"
-            ).count(),
+            "pending_req_count": ofr_pending.get(prop.id, 0),
         })
 
     # "Awaiting Customer Response" — proposals I own that are out to customer
@@ -1487,10 +1920,12 @@ def dashboard():
                 Proposal.review_status.in_(("submitted_to_customer", "customer_feedback")))
         .all()
     )
-    awaiting_customer_items = []
-    for prop in awaiting_customer:
-        proj = db.session.get(Project, prop.project_id)
-        awaiting_customer_items.append({"proposal": prop, "project": proj})
+    ac_projects = {p.id: p for p in Project.query.filter(Project.id.in_(
+        [pr.project_id for pr in awaiting_customer])).all()} if awaiting_customer else {}
+    awaiting_customer_items = [
+        {"proposal": prop, "project": ac_projects.get(prop.project_id)}
+        for prop in awaiting_customer
+    ]
 
     # --- "Pick up where you left off" focus list -----------------------------
     focus_items = []
@@ -1516,7 +1951,7 @@ def dashboard():
         })
 
     for p in active_projects:
-        entry = _project_focus_entry(p, now_naive)
+        entry = _project_focus_entry(p, now_naive, focus_ctx)
         if entry:
             focus_items.append(entry)
 
@@ -1592,8 +2027,47 @@ PROPOSAL_FILTERS = [
 ]
 
 
+def _latest_proposals_for(project_ids) -> dict:
+    """{project_id: newest Proposal} in ONE query (newest-first, first wins)."""
+    latest = {}
+    if not project_ids:
+        return latest
+    for prop in (Proposal.query.filter(Proposal.project_id.in_(project_ids))
+                 .order_by(Proposal.generated_at.desc()).all()):
+        latest.setdefault(prop.project_id, prop)
+    return latest
+
+
+def _counts_by(column, count_of, *filters) -> dict:
+    """Generic bulk counter: {key_column_value: count}."""
+    q = db.session.query(column, db.func.count(count_of)).filter(*filters).group_by(column)
+    return dict(q.all())
+
+
+def _latest_versions_for(proposal_ids) -> dict:
+    """{proposal_id: newest ProposalVersion} in one grouped query."""
+    if not proposal_ids:
+        return {}
+    from sqlalchemy import func as _f
+    latest = db.session.query(
+        ProposalVersion.proposal_id,
+        _f.max(ProposalVersion.version_number).label("maxv"),
+    ).filter(ProposalVersion.proposal_id.in_(proposal_ids)).group_by(
+        ProposalVersion.proposal_id
+    ).subquery()
+    rows = ProposalVersion.query.join(latest, db.and_(
+        ProposalVersion.proposal_id == latest.c.proposal_id,
+        ProposalVersion.version_number == latest.c.maxv,
+    )).all()
+    return {v.proposal_id: v for v in rows}
+
+
 def _build_proposal_rows():
-    """Load all accessible projects enriched with their latest proposal state."""
+    """Load all accessible projects enriched with their latest proposal state.
+
+    Bulk-loads in a FIXED number of queries — previously this ran 3 extra
+    queries per project, so the proposals page degraded linearly with
+    pipeline size."""
     if current_user.is_admin:
         projects = Project.query.filter_by(org_id=current_user.org_id).order_by(
             Project.updated_at.desc()
@@ -1603,20 +2077,25 @@ def _build_proposal_rows():
             Project.updated_at.desc()
         ).all()
 
+    project_ids = [p.id for p in projects]
+    latest_by_project = _latest_proposals_for(project_ids)
+    doc_counts = _counts_by(
+        ProjectDocument.project_id, ProjectDocument.id,
+        ProjectDocument.project_id.in_(project_ids),
+    ) if project_ids else {}
+    latest_ids = [prop.id for prop in latest_by_project.values()]
+    pending_by_proposal = _counts_by(
+        RevisionRequest.proposal_id, RevisionRequest.id,
+        RevisionRequest.proposal_id.in_(latest_ids),
+        RevisionRequest.status == "pending",
+    ) if latest_ids else {}
+
     now_naive = datetime.utcnow()
     rows = []
     for p in projects:
-        latest = (
-            Proposal.query.filter_by(project_id=p.id)
-            .order_by(Proposal.generated_at.desc())
-            .first()
-        )
-        doc_count = ProjectDocument.query.filter_by(project_id=p.id).count()
-        pending_req = 0
-        if latest:
-            pending_req = RevisionRequest.query.filter_by(
-                proposal_id=latest.id, status="pending"
-            ).count()
+        latest = latest_by_project.get(p.id)
+        doc_count = doc_counts.get(p.id, 0)
+        pending_req = pending_by_proposal.get(latest.id, 0) if latest else 0
 
         overdue = False
         if p.due_date and p.status == "active":
@@ -1730,6 +2209,9 @@ def _apply_row_query_filters(rows):
     return rows
 
 
+PROPOSALS_PER_PAGE = 50
+
+
 @app.route("/proposals")
 @login_required
 def proposals_list():
@@ -1740,6 +2222,19 @@ def proposals_list():
     all_rows = _build_proposal_rows()
     counts = {key: len(_filter_proposal_rows(all_rows, key)) for key, _, _ in PROPOSAL_FILTERS}
     rows = _apply_row_query_filters(_filter_proposal_rows(all_rows, flt))
+
+    # Paginate the table view (the board stays whole — a paged kanban would
+    # misrepresent column totals; it's cheap now that loading is bulk).
+    view = request.args.get("view", "table")
+    try:
+        page = max(int(request.args.get("page", 1)), 1)
+    except (TypeError, ValueError):
+        page = 1
+    total_rows = len(rows)
+    total_pages = max((total_rows + PROPOSALS_PER_PAGE - 1) // PROPOSALS_PER_PAGE, 1)
+    page = min(page, total_pages)
+    if view != "board":
+        rows = rows[(page - 1) * PROPOSALS_PER_PAGE: page * PROPOSALS_PER_PAGE]
 
     proposal_users = _org_proposal_users()
 
@@ -1764,7 +2259,11 @@ def proposals_list():
         f_vertical=request.args.get("vertical", ""),
         sort=request.args.get("sort", "updated"),
         direction=request.args.get("dir", "desc"),
-        view=request.args.get("view", "table"),
+        view=view,
+        page=page,
+        total_pages=total_pages,
+        total_rows=total_rows,
+        per_page=PROPOSALS_PER_PAGE,
     )
 
 
@@ -1844,6 +2343,7 @@ def posture():
 
     return render_template(
         "posture.html",
+        org=db.session.get(Organization, current_user.org_id) if current_user.org_id else None,
         rate_sheets=rate_sheets,
         user_templates=user_templates,
         staff_roles=staff_roles,
@@ -1874,23 +2374,54 @@ def setup_wizard():
 @login_required
 def settings():
     if request.method == "POST":
+        org = db.session.get(Organization, current_user.org_id) if current_user.org_id else None
+
         current_user.display_name = request.form.get("display_name", current_user.display_name)
-        current_user.email = request.form.get("email", current_user.email)
-        current_user.company_name = request.form.get("company_name", current_user.company_name)
+
+        # Changing the email requires re-verification (otherwise "verified"
+        # would silently apply to an address that was never confirmed), and
+        # the new address must not collide with another account.
+        new_email = request.form.get("email", current_user.email).strip()
+        if new_email and new_email.lower() != (current_user.email or "").lower():
+            clash = User.query.filter(
+                _email_matches(new_email), User.id != current_user.id
+            ).first()
+            if clash:
+                flash("That email address is already in use by another account.", "error")
+                return redirect(url_for("settings"))
+            current_user.email = new_email
+            current_user.email_verified = False
+            try:
+                _send_verification_email(current_user)
+                flash("Email updated — please verify your new address "
+                      "(we sent a verification link).", "success")
+            except Exception:
+                pass
+
+        # Company identity is workspace-level; only admins may rename it.
+        company_name = request.form.get("company_name", "").strip()
+        if org and company_name and current_user.is_admin and company_name != org.name:
+            org.name = company_name[:300]
+
         current_user.font_preference = request.form.get("font_preference", current_user.font_preference)
-        current_user.llm_provider = request.form.get("llm_provider", current_user.llm_provider)
+        # Anthropic is the only supported provider — ignore anything else.
+        current_user.llm_provider = "anthropic"
         current_user.llm_model = request.form.get("llm_model", current_user.llm_model)
 
         api_key = request.form.get("api_key", "").strip()
         if api_key:
             current_user.api_key_encrypted = encrypt_api_key(api_key)
 
-        # Company logo preferences (checkboxes come through only when checked)
-        current_user.company_logo_use_in_proposals = bool(request.form.get("company_logo_use_in_proposals"))
-        current_user.company_logo_show_on_cover = bool(request.form.get("company_logo_show_on_cover"))
-        placement = request.form.get("company_logo_placement", current_user.company_logo_placement or "top_left")
-        if placement in ("top_left", "center"):
-            current_user.company_logo_placement = placement
+        # Workspace branding preferences. Only touched when the form actually
+        # carries them (signaled by the placement field both branding-aware
+        # forms always include) — otherwise any unrelated POST to /settings
+        # would silently zero the checkbox flags.
+        if org and "company_logo_placement" in request.form:
+            org.logo_use_in_proposals = bool(request.form.get("company_logo_use_in_proposals"))
+            org.logo_show_on_cover = bool(request.form.get("company_logo_show_on_cover"))
+            placement = request.form.get("company_logo_placement") or (org.logo_placement or "top_left")
+            if placement in ("top_left", "center"):
+                org.logo_placement = placement
 
         db.session.commit()
         _log_activity("settings_update", "Updated user settings")
@@ -1918,6 +2449,9 @@ def settings():
 
     return render_template(
         "settings.html",
+        org=db.session.get(Organization, current_user.org_id) if current_user.org_id else None,
+        twofa_enabled=current_user.totp_enabled,
+        backup_codes_left=twofa.backup_codes_remaining(current_user.totp_backup_codes),
         rate_sheets=rate_sheets,
         user_templates=user_templates,
         staff_roles=staff_roles,
@@ -1929,6 +2463,114 @@ def settings():
         verticals=VERTICALS,
         logo_max_dimension=LOGO_MAX_DIMENSION,
     )
+
+
+@app.route("/settings/change-password", methods=["POST"])
+@login_required
+def change_password():
+    """In-app password change (previously only the forgot-password flow existed)."""
+    current = request.form.get("current_password", "")
+    new = request.form.get("new_password", "")
+    confirm = request.form.get("confirm_password", "")
+    if not current_user.check_password(current):
+        flash("Your current password is incorrect.", "error")
+        return redirect(url_for("settings"))
+    if len(new) < 8:
+        flash("New password must be at least 8 characters.", "error")
+        return redirect(url_for("settings"))
+    if new != confirm:
+        flash("New passwords do not match.", "error")
+        return redirect(url_for("settings"))
+    current_user.set_password(new)
+    db.session.commit()
+    _log_activity("password_change", "Changed account password")
+    flash("Password updated.", "success")
+    return redirect(url_for("settings"))
+
+
+# ---------------------------------------------------------------------------
+# Two-factor authentication (TOTP)
+# ---------------------------------------------------------------------------
+
+def _twofa_setup_page(secret):
+    """Render the enrollment page for a freshly generated (unconfirmed) secret."""
+    uri = twofa.provisioning_uri(secret, current_user.email or current_user.username, issuer=APP_NAME)
+    return render_template("twofa_setup.html", secret=secret, qr=twofa.qr_data_uri(uri))
+
+
+@app.route("/settings/2fa/start", methods=["POST"])
+@login_required
+def twofa_start():
+    """Generate an (unconfirmed) secret and show the QR to scan. 2FA is not
+    active until the user confirms with a code from their authenticator."""
+    if current_user.totp_enabled:
+        flash("Two-factor authentication is already on.", "error")
+        return redirect(url_for("settings"))
+    secret = twofa.new_secret()
+    current_user.totp_secret_encrypted = crypto_util.encrypt(secret)
+    db.session.commit()
+    return _twofa_setup_page(secret)
+
+
+@app.route("/settings/2fa/enable", methods=["POST"])
+@login_required
+def twofa_enable():
+    if current_user.totp_enabled:
+        return redirect(url_for("settings"))
+    secret = crypto_util.decrypt(current_user.totp_secret_encrypted)
+    if not secret:
+        flash("Start the two-factor setup first.", "error")
+        return redirect(url_for("settings"))
+    if not twofa.verify_code(secret, request.form.get("code", "")):
+        flash("That code didn't match — check your authenticator's clock and try again.", "error")
+        return _twofa_setup_page(secret)
+    plaintext, hashes = twofa.generate_backup_codes()
+    current_user.totp_enabled = True
+    current_user.totp_backup_codes = hashes
+    db.session.commit()
+    _log_activity("2fa_enable", "Enabled two-factor authentication")
+    return render_template("twofa_backup_codes.html", codes=plaintext, first_time=True)
+
+
+@app.route("/settings/2fa/disable", methods=["POST"])
+@login_required
+def twofa_disable():
+    """Turn 2FA off. Requires re-proving identity (current password or a valid
+    code) so a hijacked open session can't silently strip the second factor."""
+    if not current_user.totp_enabled:
+        return redirect(url_for("settings"))
+    pw = request.form.get("password", "")
+    code = request.form.get("code", "").strip()
+    secret = crypto_util.decrypt(current_user.totp_secret_encrypted)
+    ok = bool(pw) and current_user.check_password(pw)
+    if not ok and code:
+        ok = twofa.verify_code(secret, code)
+    if not ok:
+        flash("Enter your current password (or a valid code) to turn off two-factor.", "error")
+        return redirect(url_for("settings"))
+    current_user.totp_enabled = False
+    current_user.totp_secret_encrypted = ""
+    current_user.totp_backup_codes = ""
+    db.session.commit()
+    _log_activity("2fa_disable", "Disabled two-factor authentication")
+    flash("Two-factor authentication is off.", "success")
+    return redirect(url_for("settings"))
+
+
+@app.route("/settings/2fa/backup-codes", methods=["POST"])
+@login_required
+def twofa_regenerate_codes():
+    if not current_user.totp_enabled:
+        return redirect(url_for("settings"))
+    secret = crypto_util.decrypt(current_user.totp_secret_encrypted)
+    if not twofa.verify_code(secret, request.form.get("code", "")):
+        flash("Enter a current code from your authenticator to regenerate backup codes.", "error")
+        return redirect(url_for("settings"))
+    plaintext, hashes = twofa.generate_backup_codes()
+    current_user.totp_backup_codes = hashes
+    db.session.commit()
+    _log_activity("2fa_backup_regen", "Regenerated 2FA backup codes")
+    return render_template("twofa_backup_codes.html", codes=plaintext, first_time=False)
 
 
 @app.route("/settings/upload-rate-sheet", methods=["POST"])
@@ -2186,6 +2828,10 @@ def delete_rate_sheet(sheet_id):
     sheet = db.session.get(UserRateSheet, sheet_id)
     if not sheet or sheet.org_id != current_user.org_id:
         abort(404)
+    try:
+        storage.delete(sheet.file_path)
+    except Exception:
+        pass
     db.session.delete(sheet)
     db.session.commit()
     flash("Rate sheet deleted.", "success")
@@ -2198,6 +2844,10 @@ def delete_user_template(template_id):
     tmpl = db.session.get(UserVerticalTemplate, template_id)
     if not tmpl or tmpl.org_id != current_user.org_id:
         abort(404)
+    try:
+        storage.delete(tmpl.file_path)
+    except Exception:
+        pass
     db.session.delete(tmpl)
     db.session.commit()
     flash("Template deleted.", "success")
@@ -2223,26 +2873,28 @@ def upload_company_logo():
         )
         return redirect(url_for("posture") + "#branding")
 
+    org = db.session.get(Organization, current_user.org_id)
+    if org is None:
+        abort(400)
+
     try:
-        original_name, saved_path, saved_size = _process_and_save_logo(file, current_user.id)
+        original_name, saved_path, saved_size = _process_and_save_logo(file, org.id)
     except ValueError as e:
         flash(f"Could not process image: {e}", "error")
         return redirect(url_for("posture") + "#branding")
+    storage.sync_up(saved_path)
 
-    # Remove old logo file if any
-    if current_user.company_logo_path:
+    # Remove old logo file if any (local + object storage)
+    if org.logo_path:
         try:
-            old = Path(current_user.company_logo_path)
-            if old.exists() and old.is_file():
-                old.unlink()
+            storage.delete(org.logo_path)
         except Exception:
             pass
 
-    current_user.company_logo_path = saved_path
-    current_user.company_logo_original_name = original_name
-    # If this is the user's first logo upload, default "use in proposals" to True
-    if not current_user.company_logo_placement:
-        current_user.company_logo_placement = "top_left"
+    org.logo_path = saved_path
+    org.logo_original_name = original_name
+    if not org.logo_placement:
+        org.logo_placement = "top_left"
     db.session.commit()
     _log_activity("logo_upload", f"Uploaded company logo ({saved_size // 1024} KB)")
     flash(
@@ -2256,16 +2908,15 @@ def upload_company_logo():
 @app.route("/settings/delete-logo", methods=["POST"])
 @login_required
 def delete_company_logo():
-    if current_user.company_logo_path:
+    org = db.session.get(Organization, current_user.org_id)
+    if org and org.logo_path:
         try:
-            old = Path(current_user.company_logo_path)
-            if old.exists() and old.is_file():
-                old.unlink()
+            storage.delete(org.logo_path)
         except Exception:
             pass
-    current_user.company_logo_path = ""
-    current_user.company_logo_original_name = ""
-    db.session.commit()
+        org.logo_path = ""
+        org.logo_original_name = ""
+        db.session.commit()
     _log_activity("logo_delete", "Removed company logo")
     flash("Company logo removed.", "success")
     return redirect(url_for("posture") + "#branding")
@@ -2274,10 +2925,12 @@ def delete_company_logo():
 @app.route("/settings/logo-preview")
 @login_required
 def company_logo_preview():
-    """Serve the current user's company logo (private — only to the owner)."""
-    if not current_user.company_logo_path:
+    """Serve the workspace logo (members only)."""
+    org = db.session.get(Organization, current_user.org_id)
+    if not org or not org.logo_path:
         abort(404)
-    logo_path = Path(current_user.company_logo_path)
+    storage.ensure_local(org.logo_path)
+    logo_path = Path(org.logo_path)
     if not logo_path.exists():
         abort(404)
     return send_file(str(logo_path), mimetype="image/png")
@@ -2449,6 +3102,31 @@ def add_equipment_item():
     return redirect(url_for("posture") + "#equipment")
 
 
+@app.route("/settings/edit-equipment-item/<item_id>", methods=["POST"])
+@login_required
+def edit_equipment_item(item_id):
+    """Inline edit — rates were previously delete-and-retype only."""
+    item = db.session.get(EquipmentItem, item_id)
+    if not item or item.org_id != current_user.org_id:
+        abort(404)
+    item.item_name = request.form.get("item_name", item.item_name).strip() or item.item_name
+    item.category = request.form.get("eq_category", item.category).strip()
+    item.part_number = request.form.get("part_number", item.part_number).strip()
+    item.manufacturer = request.form.get("manufacturer", item.manufacturer).strip()
+    item.unit = request.form.get("unit", item.unit).strip() or "each"
+    try:
+        cost = request.form.get("unit_cost", "").replace(",", "").replace("$", "")
+        if cost:
+            item.unit_cost = max(float(cost), 0.0)
+    except ValueError:
+        flash("Invalid cost format.", "error")
+        return redirect(url_for("posture") + "#equipment")
+    db.session.commit()
+    _log_activity("equipment_edit", f"Updated equipment: {item.item_name}")
+    flash(f"Equipment item '{item.item_name}' updated.", "success")
+    return redirect(url_for("posture") + "#equipment")
+
+
 @app.route("/settings/delete-equipment-item/<item_id>", methods=["POST"])
 @login_required
 def delete_equipment_item(item_id):
@@ -2476,9 +3154,9 @@ def add_travel_rate():
         safe, path, size = _save_upload(uploaded_file, "rate_sheets")
         sheet = UserRateSheet(
             user_id=current_user.id,
-        org_id=current_user.org_id,
+            org_id=current_user.org_id,
             name=f"Travel Rates - {safe}",
-            sheet_type="labor_rates",
+            sheet_type="travel_rates",
             file_path=path,
             original_filename=safe,
         )
@@ -2519,6 +3197,29 @@ def add_travel_rate():
     db.session.commit()
     _log_activity("travel_rate_add", f"Added travel rate: {expense_type} @ ${rate}/{unit}")
     flash(f"Travel rate '{expense_type}' added.", "success")
+    return redirect(url_for("posture") + "#travel")
+
+
+@app.route("/settings/edit-travel-rate/<rate_id>", methods=["POST"])
+@login_required
+def edit_travel_rate(rate_id):
+    """Inline edit — rates were previously delete-and-retype only."""
+    tr = db.session.get(TravelExpenseRate, rate_id)
+    if not tr or tr.org_id != current_user.org_id:
+        abort(404)
+    tr.expense_type = request.form.get("expense_type", tr.expense_type).strip() or tr.expense_type
+    tr.unit = request.form.get("travel_unit", tr.unit).strip() or tr.unit
+    tr.description = request.form.get("travel_description", tr.description).strip()
+    try:
+        rate = request.form.get("travel_rate", "").replace(",", "").replace("$", "")
+        if rate:
+            tr.rate = max(float(rate), 0.0)
+    except ValueError:
+        flash("Invalid rate format.", "error")
+        return redirect(url_for("posture") + "#travel")
+    db.session.commit()
+    _log_activity("travel_rate_edit", f"Updated travel rate: {tr.expense_type}")
+    flash(f"Travel rate '{tr.expense_type}' updated.", "success")
     return redirect(url_for("posture") + "#travel")
 
 
@@ -2645,9 +3346,13 @@ def project_upload(project_id):
         files = request.files.getlist("documents")
         file_type = request.form.get("file_type", "rfp")
 
+        receipts = []
         for file in files:
             if file and _allowed_file(file.filename, ALLOWED_EXTENSIONS | {"xlsx", "xls"}):
                 safe, path, size = _save_upload(file, f"projects/{project_id}")
+                chars = _extract_text_chars(path)
+                if file_type in ("rfp", "supporting", "legal"):
+                    receipts.append((safe, chars))
                 doc = ProjectDocument(
                     project_id=project_id,
                     filename=f"{uuid.uuid4().hex[:8]}_{safe}",
@@ -2655,10 +3360,12 @@ def project_upload(project_id):
                     file_type=file_type,
                     file_path=path,
                     file_size=size,
+                    text_chars=chars,
                 )
                 db.session.add(doc)
 
         db.session.commit()
+        _flag_unreadable(receipts)
         _log_activity("document_upload", f"Uploaded {len(files)} document(s)", project_id)
         # Notify proposal users when RFPs are uploaded
         _notify_role(
@@ -2705,8 +3412,16 @@ def project_upload(project_id):
     ).count()
     proposal_users = _org_proposal_users()
 
+    # Quota visibility: what a click on Generate costs and what's left
+    _quota_org = db.session.get(Organization, current_user.org_id) if current_user.org_id else None
+    gen_limit = billing.limits_for(_quota_org)["generations_per_month"]
+    gens_used = billing.generations_this_month(current_user.org_id)
+
     return render_template(
         "project_upload.html",
+        gen_limit=gen_limit,
+        gens_used=gens_used,
+        ocr_enabled=ocr.available(),
         project=project,
         documents=documents,
         verticals=VERTICALS,
@@ -2735,6 +3450,12 @@ def project_generate(project_id):
     project = db.session.get(Project, project_id)
     if not _can_access_project(project):
         abort(404)
+
+    # Abuse gate: platform-key AI requires a verified email
+    ok, msg = _platform_ai_gate()
+    if not ok:
+        flash(msg, "error")
+        return redirect(url_for("project_upload", project_id=project_id))
 
     # Plan gate (Phase 5): enforce monthly generation limits
     allowed, limit_msg = billing_check_generation(current_user.org_id)
@@ -2784,6 +3505,38 @@ def project_generate(project_id):
     return redirect(url_for("job_status_page", job_id=job.id))
 
 
+def _load_org_templates(org_id, vertical) -> dict | None:
+    """The org's uploaded templates for a generation, keyed by template_type.
+
+    Priority per type: user upload for the vertical, then the admin-set company
+    default for the vertical, then the 'general' equivalents — so an org that
+    only uploaded a General template still gets it when the RFP resolves to a
+    specific vertical. Files are pulled from object storage when the local copy
+    is missing."""
+    tiers = [
+        {"vertical": vertical, "is_company_default": False},
+        {"vertical": vertical, "is_company_default": True},
+    ]
+    if vertical != "general":
+        tiers += [
+            {"vertical": "general", "is_company_default": False},
+            {"vertical": "general", "is_company_default": True},
+        ]
+    picked = {}
+    for tier in tiers:
+        for t in UserVerticalTemplate.query.filter_by(org_id=org_id, **tier).all():
+            if t.template_type not in picked:
+                picked[t.template_type] = t
+    templates = {}
+    for ttype, t in picked.items():
+        try:
+            storage.ensure_local(t.file_path)
+            templates[ttype] = parse_document(t.file_path)
+        except Exception:
+            continue
+    return templates or None
+
+
 def _perform_generation(project_id, user, vertical, output_format, cost_options, set_progress):
     """Gather posture context and run proposal generation. Returns a dict with
     a 'redirect' key. Runs inside a background job (no request context)."""
@@ -2793,17 +3546,31 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
 
     set_progress("reading", "Reading uploaded documents…")
     documents = ProjectDocument.query.filter_by(project_id=project_id).all()
-    rfp_docs = [d for d in documents if d.file_type in ("rfp", "supporting")]
+    # Legal/contract docs carry terms the proposal must honor — include them.
+    # (Drawings stay out: image-heavy PDFs parse to noise; rate sheets are
+    # folded into the pricing context below instead.)
+    rfp_docs = [d for d in documents if d.file_type in ("rfp", "supporting", "legal")]
     combined_text = ""
     for doc in rfp_docs:
         try:
             storage.ensure_local(doc.file_path)
-            text = parse_document(doc.file_path)
+            text = parse_document(doc.file_path, ocr=True)
             combined_text += f"\n\n--- Document: {doc.original_filename} ---\n\n{text}"
         except Exception:
             continue
     if not combined_text.strip():
         raise RuntimeError("Could not extract text from the uploaded documents.")
+
+    # Resolve "auto" BEFORE loading templates. The template queries below match
+    # on the vertical key, so resolving after them (as before) meant the
+    # default Auto-Detect path silently skipped every org-uploaded template.
+    scope = ProjectScope.query.filter_by(project_id=project_id).first()
+    if vertical == "auto":
+        if scope and scope.status == "approved" and scope.vertical:
+            vertical = scope.vertical
+        else:
+            from document_parser import detect_vertical
+            vertical = detect_vertical(combined_text)
 
     org_id = user.org_id
     include_staff_types = cost_options.get("include_staff_types")
@@ -2858,42 +3625,35 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
                 for t in rates
             ]
 
-    # Load user rate sheets (Excel uploads)
-    rate_sheet_data = None
-    active_sheets = UserRateSheet.query.filter_by(org_id=org_id, is_active=True).all()
-    if active_sheets:
-        rate_sheet_data = {}
-        for sheet in active_sheets:
-            try:
-                rate_sheet_data[sheet.sheet_type] = parse_rate_sheet(sheet.file_path)
-            except Exception:
-                continue
+    # Load org rate sheets (posture uploads). Multiple sheets of the same type
+    # are MERGED — previously each one silently overwrote the last.
+    rate_sheet_data = {}
+    for sheet in UserRateSheet.query.filter_by(org_id=org_id, is_active=True).all():
+        try:
+            storage.ensure_local(sheet.file_path)
+            parsed = parse_rate_sheet(sheet.file_path)
+        except Exception:
+            continue
+        entry = rate_sheet_data.setdefault(sheet.sheet_type, {"raw_text": ""})
+        raw = parsed.get("raw_text", "")
+        if raw:
+            entry["raw_text"] += (("\n\n" if entry["raw_text"] else "") + raw)
 
-    # Auto-select templates: user custom first, then company defaults as fallback
-    user_templates = None
-    user_tmpls = UserVerticalTemplate.query.filter_by(
-        org_id=org_id, vertical=vertical, is_company_default=False
-    ).all()
-    if user_tmpls:
-        user_templates = {}
-        for t in user_tmpls:
-            try:
-                user_templates[t.template_type] = parse_document(t.file_path)
-            except Exception:
-                continue
+    # Project documents uploaded as type 'rate_sheet' were previously ignored
+    # entirely — fold their content into the pricing context too.
+    for doc in documents:
+        if doc.file_type != "rate_sheet":
+            continue
+        try:
+            storage.ensure_local(doc.file_path)
+            raw = parse_document(doc.file_path)
+        except Exception:
+            continue
+        if raw.strip():
+            rate_sheet_data[f"project sheet {doc.original_filename[:60]}"] = {"raw_text": raw}
+    rate_sheet_data = rate_sheet_data or None
 
-    # Fall back to company defaults for any missing template types
-    co_tmpls = UserVerticalTemplate.query.filter_by(
-        vertical=vertical, is_company_default=True, org_id=org_id
-    ).all()
-    if co_tmpls:
-        user_templates = user_templates or {}
-        for t in co_tmpls:
-            if t.template_type not in user_templates:
-                try:
-                    user_templates[t.template_type] = parse_document(t.file_path)
-                except Exception:
-                    continue
+    user_templates = _load_org_templates(org_id, vertical)
 
     # Load past corrections for AI learning
     past_corrections = ProposalCorrection.query.filter_by(
@@ -2924,15 +3684,25 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
 
     # Human-approved Scope of Work guides the draft when present
     approved_scope_items = None
-    scope = ProjectScope.query.filter_by(project_id=project_id).first()
     if scope and scope.status == "approved":
         included = ScopeItem.query.filter_by(scope_id=scope.id, status="included").order_by(
             ScopeItem.sort_order, ScopeItem.created_at
         ).all()
         if included:
             approved_scope_items = [i.item_text for i in included]
-            if vertical == "auto" and scope.vertical:
-                vertical = scope.vertical
+
+    # Feed previously answered clarification questions back to the AI so a
+    # regeneration actually incorporates the user's answers (and doesn't
+    # re-ask them).
+    answered_rows = ProposalQuestion.query.filter_by(
+        project_id=project_id, status="answered"
+    ).order_by(ProposalQuestion.answered_at).all()
+    answered_questions = [
+        {"question": r.question, "answer": r.answer}
+        for r in answered_rows if (r.answer or "").strip()
+    ]
+
+    _gen_org = db.session.get(Organization, org_id) if org_id else None
 
     set_progress("drafting", "Claude is drafting your proposal…")
     result = generate_proposal(
@@ -2940,9 +3710,10 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
         vertical=vertical,
         rate_sheet_data=rate_sheet_data,
         user_templates=user_templates,
-        company_name=user.company_name,
+        company_name=(_gen_org.name if _gen_org else "") or "",
         user_api_key=decrypt_api_key(user.api_key_encrypted) or None,
         user_model=user.llm_model or None,
+        answered_questions=answered_questions or None,
         cost_options=cost_options,
         staff_roles_data=staff_roles_data,
         equipment_data=equipment_data,
@@ -2951,14 +3722,29 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
         company_standards=company_standards_data,
         approved_scope=approved_scope_items,
         request_type=project.request_type or "",
+        include_global_boilerplate=SELF_HOSTED,
     )
 
     billing_record_generation(org_id)
 
-    # If the agent needs clarification, record questions and stop here
+    # If the agent needs clarification, record the questions and stop — but
+    # only for questions we haven't asked before on this project. Re-asked
+    # duplicates (already answered/skipped) must not re-open the loop or
+    # duplicate register rows; if nothing is genuinely new, fall through and
+    # save the proposal.
+    new_questions = []
     if result.get("questions"):
+        already_asked = {
+            (q.question or "").strip().lower()
+            for q in ProposalQuestion.query.filter_by(project_id=project_id).all()
+        }
+        new_questions = [
+            q for q in result["questions"]
+            if (q.get("question") or "").strip().lower() not in already_asked
+        ]
+    if new_questions:
         set_progress("questions", "Clarification questions detected…")
-        for q in result["questions"]:
+        for q in new_questions:
             db.session.add(ProposalQuestion(
                 project_id=project_id,
                 question=q["question"],
@@ -2980,7 +3766,7 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
         project.clarification_sub_status = "clarification_pending"
         db.session.commit()
         _log_activity_for(user, "proposal_questions",
-                          f"{len(result['questions'])} clarification question(s)", project_id)
+                          f"{len(new_questions)} clarification question(s)", project_id)
         return {"redirect": url_for("project_questions", project_id=project_id)}
 
     set_progress("saving", "Formatting and saving your proposal…")
@@ -2996,9 +3782,28 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
     markdown_to_docx(
         result["proposal_markdown"],
         str(docx_path),
-        **_logo_docx_kwargs(_brand_user),
+        **_project_brand_kwargs(project, _brand_user),
     )
     storage.sync_up(docx_path)
+
+    # Honor the requested output format: pre-render the PDF for pdf/both so the
+    # download is instant. (The field was previously stored and ignored.)
+    pdf_filename = ""
+    if (output_format or "").lower() in ("pdf", "both"):
+        try:
+            pdf_filename = f"proposal_{job_slug}.pdf"
+            pdf_path = GENERATED_DIR / pdf_filename
+            _pdf_logo = None
+            if _gen_org and _gen_org.logo_path and _gen_org.logo_use_in_proposals:
+                storage.ensure_local(_gen_org.logo_path)
+                if Path(_gen_org.logo_path).exists():
+                    _pdf_logo = _gen_org.logo_path
+            markdown_to_pdf(result["proposal_markdown"], str(pdf_path),
+                            logo_path=_pdf_logo,
+                            company_name=(_gen_org.name if _gen_org else "") or "")
+            storage.sync_up(pdf_path)
+        except Exception:
+            pdf_filename = ""  # PDF failure never blocks the proposal
 
     project.vertical = result["vertical"]
     project.vertical_label = result["vertical_label"]
@@ -3014,7 +3819,7 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
         action_items_count=len(result["action_items"]),
         md_file=md_filename,
         docx_file=docx_filename,
-        pdf_file="",
+        pdf_file=pdf_filename,
         review_status="draft",
     )
     db.session.add(proposal)
@@ -3037,6 +3842,14 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
     db.session.commit()
     _log_activity_for(user, "proposal_generate",
                       f"Generated {result['vertical_label']} proposal", project_id)
+    # Notify the person who started the job too — they may have navigated away
+    # during the multi-minute generation.
+    _notify(
+        user.id, "proposal_generated",
+        f"Your proposal is ready: {project.name}",
+        f"{result['vertical_label']} draft generated (confidence {result['confidence_score']}%).",
+        link=f"/proposal/{proposal.id}",
+    )
     _notify_role_org(
         org_id, "sales", "proposal_generated",
         f"Proposal generated: {project.name}",
@@ -3084,6 +3897,24 @@ def job_status_page(job_id):
     return render_template("job_status.html", job=job)
 
 
+@app.route("/jobs/<job_id>/cancel", methods=["POST"])
+@login_required
+def job_cancel(job_id):
+    """Cancel a queued/running job. A queued job never starts; a running one
+    finishes server-side but its result is discarded (see jobs._run_job) and it
+    stops counting toward quota."""
+    job = db.session.get(BackgroundJob, job_id)
+    if not job or job.user_id != current_user.id:
+        abort(404)
+    if job.status in ("queued", "running"):
+        job.status = "canceled"
+        job.error = "Canceled by user."
+        job.finished_at = datetime.now(timezone.utc)
+        db.session.commit()
+        flash("Job canceled.", "success")
+    return redirect(url_for("job_status_page", job_id=job_id))
+
+
 @app.route("/jobs/<job_id>/status.json")
 @login_required
 def job_status_json(job_id):
@@ -3117,7 +3948,8 @@ def _project_rfp_text(project_id: str) -> str:
     combined = ""
     for doc in rfp_docs:
         try:
-            text = parse_document(doc.file_path)
+            storage.ensure_local(doc.file_path)
+            text = parse_document(doc.file_path, ocr=True)
             combined += f"\n\n--- Document: {doc.original_filename} ---\n\n{text}"
         except Exception:
             continue
@@ -3141,6 +3973,9 @@ def project_scope(project_id):
         ScopeItem.sort_order, ScopeItem.created_at
     ).all()
     included_count = sum(1 for i in items if i.status == "included")
+    ai_kept = sum(1 for i in items if i.source == "ai" and i.status == "included")
+    ai_struck = sum(1 for i in items if i.source == "ai" and i.status == "removed")
+    human_added = sum(1 for i in items if i.source == "human" and i.status == "included")
 
     latest_prop = (
         Proposal.query.filter_by(project_id=project_id)
@@ -3155,6 +3990,9 @@ def project_scope(project_id):
         scope=scope,
         items=items,
         included_count=included_count,
+        ai_kept=ai_kept,
+        ai_struck=ai_struck,
+        human_added=human_added,
         phases=phases,
         latest_prop=latest_prop,
     )
@@ -3163,36 +4001,66 @@ def project_scope(project_id):
 @app.route("/projects/<project_id>/scope/generate", methods=["POST"])
 @login_required
 def generate_scope(project_id):
-    """AI-draft (or re-draft) the Scope of Work from the uploaded documents."""
+    """AI-draft (or re-draft) the Scope of Work — runs as a background job so
+    the minutes-long AI call doesn't hold a web worker or time out at the LB."""
     project = db.session.get(Project, project_id)
     if not _can_access_project(project):
         abort(404)
 
-    combined_text = _project_rfp_text(project_id)
-    if not combined_text:
+    ok, msg = _platform_ai_gate()
+    if not ok:
+        flash(msg, "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    has_docs = ProjectDocument.query.filter_by(project_id=project_id).filter(
+        ProjectDocument.file_type.in_(("rfp", "supporting", "legal"))
+    ).count() > 0
+    if not has_docs:
         flash("Upload an RFP/RFQ document before drafting the scope of work.", "error")
         return redirect(url_for("project_upload", project_id=project_id))
 
-    vertical = request.form.get("vertical", "auto")
+    job = jobs.enqueue(
+        "draft_scope",
+        {"project_id": project_id, "vertical": request.form.get("vertical", "auto")},
+        user_id=current_user.id,
+        org_id=current_user.org_id,
+    )
+    return redirect(url_for("job_status_page", job_id=job.id))
 
-    try:
-        result = draft_scope_of_work(
-            combined_text,
-            vertical=vertical,
-            company_name=current_user.company_name,
-            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
-            user_model=current_user.llm_model or None,
-        )
-    except RuntimeError as e:
-        flash(str(e), "error")
-        return redirect(url_for("project_upload", project_id=project_id))
-    except Exception as e:
-        flash(f"Scope drafting failed: {friendly_api_error(e)}", "error")
-        return redirect(url_for("project_upload", project_id=project_id))
 
-    # Replace any existing scope (regeneration starts fresh)
+def _perform_scope_draft(project_id, user, vertical, set_progress):
+    """Draft/re-draft the scope inside a background job. Items the TEAM added
+    by hand survive a re-draft — only AI-proposed items are replaced."""
+    project = db.session.get(Project, project_id)
+    if not project:
+        raise RuntimeError("Project no longer exists.")
+
+    set_progress("reading", "Reading uploaded documents…")
+    combined_text = _project_rfp_text(project_id)
+    if not combined_text:
+        raise RuntimeError("Could not extract text from the uploaded documents.")
+
+    org = db.session.get(Organization, user.org_id) if user.org_id else None
+
+    set_progress("drafting", "Claude is drafting the scope of work…")
+    result = draft_scope_of_work(
+        combined_text,
+        vertical=vertical,
+        company_name=(org.name if org else "") or "",
+        user_api_key=decrypt_api_key(user.api_key_encrypted) or None,
+        user_model=user.llm_model or None,
+    )
+
+    set_progress("saving", "Saving scope items…")
+    # Preserve team-added items across re-drafts; replace only AI items.
+    human_items = []
     existing = ProjectScope.query.filter_by(project_id=project_id).first()
     if existing:
+        human_items = [
+            {"text": i.item_text, "category": i.category, "status": i.status}
+            for i in ScopeItem.query.filter_by(scope_id=existing.id, source="human")
+            .order_by(ScopeItem.sort_order, ScopeItem.created_at).all()
+        ]
         ScopeItem.query.filter_by(scope_id=existing.id).delete()
         db.session.delete(existing)
         db.session.flush()
@@ -3207,7 +4075,8 @@ def generate_scope(project_id):
     db.session.add(scope)
     db.session.flush()
 
-    for idx, entry in enumerate(result["items"]):
+    idx = 0
+    for entry in result["items"]:
         db.session.add(ScopeItem(
             scope_id=scope.id,
             project_id=project_id,
@@ -3217,12 +4086,63 @@ def generate_scope(project_id):
             status="included",
             sort_order=idx,
         ))
+        idx += 1
+    for h in human_items:
+        db.session.add(ScopeItem(
+            scope_id=scope.id,
+            project_id=project_id,
+            item_text=h["text"],
+            category=h["category"],
+            source="human",
+            status=h["status"],
+            sort_order=idx,
+        ))
+        idx += 1
 
     project.vertical = result["vertical"]
     project.vertical_label = result["vertical_label"]
     db.session.commit()
-    _log_activity("scope_generate", f"AI drafted {len(result['items'])} scope item(s)", project_id)
-    flash(f"AI proposed {len(result['items'])} scope item(s). Review and approve below.", "success")
+    _log_activity_for(user, "scope_generate",
+                      f"AI drafted {len(result['items'])} scope item(s)"
+                      + (f", kept {len(human_items)} team item(s)" if human_items else ""),
+                      project_id)
+    return {"redirect": url_for("project_scope", project_id=project_id)}
+
+
+@jobs.register("draft_scope")
+def _job_draft_scope(payload, job):
+    user = db.session.get(User, job.user_id)
+    def _sp(phase, message=""):
+        jobs.set_progress(job, phase, message)
+    return _perform_scope_draft(payload["project_id"], user, payload["vertical"], _sp)
+
+
+@app.route("/projects/<project_id>/scope/batch-update", methods=["POST"])
+@login_required
+def batch_update_scope(project_id):
+    """Apply all include/strike checkbox states in ONE submit — the old
+    per-checkbox form posted a full page reload for every single item."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    scope = ProjectScope.query.filter_by(project_id=project_id).first()
+    if not scope:
+        abort(404)
+
+    included_ids = set(request.form.getlist("included"))
+    changed = 0
+    for item in ScopeItem.query.filter_by(scope_id=scope.id).all():
+        new_status = "included" if item.id in included_ids else "removed"
+        if item.status != new_status:
+            item.status = new_status
+            changed += 1
+    if changed and scope.status == "approved":
+        scope.status = "draft"
+        flash("Scope modified — re-approve it before generating.", "success")
+    db.session.commit()
+    if changed:
+        _log_activity("scope_batch_update", f"Updated {changed} scope item(s)", project_id)
+    flash(f"{changed} item(s) updated." if changed else "No scope changes to save.", "success")
     return redirect(url_for("project_scope", project_id=project_id))
 
 
@@ -3286,6 +4206,32 @@ def add_scope_item(project_id):
     db.session.commit()
     _log_activity("scope_item_add", f"Added scope item: {text[:80]}", project_id)
     flash("Scope item added.", "success")
+    return redirect(url_for("project_scope", project_id=project_id))
+
+
+@app.route("/projects/<project_id>/scope/items/<item_id>/edit", methods=["POST"])
+@login_required
+def edit_scope_item(project_id, item_id):
+    """Edit a scope item's text inline — core to actually negotiating the
+    scope with the AI (previously items could only be kept or struck)."""
+    project = db.session.get(Project, project_id)
+    if not _can_access_project(project):
+        abort(404)
+    item = db.session.get(ScopeItem, item_id)
+    if not item or item.project_id != project_id:
+        abort(404)
+    text = request.form.get("item_text", "").strip()
+    if not text:
+        flash("Scope item text is required.", "error")
+        return redirect(url_for("project_scope", project_id=project_id))
+    item.item_text = text
+    scope = db.session.get(ProjectScope, item.scope_id)
+    if scope and scope.status == "approved":
+        scope.status = "draft"
+        flash("Scope modified — re-approve it before generating.", "success")
+    db.session.commit()
+    _log_activity("scope_item_edit", f"Edited scope item: {text[:80]}", project_id)
+    flash("Scope item updated.", "success")
     return redirect(url_for("project_scope", project_id=project_id))
 
 
@@ -3541,12 +4487,11 @@ def view_proposal(proposal_id):
         abort(404)
     project = db.session.get(Project, proposal.project_id)
 
-    md_path = GENERATED_DIR / proposal.md_file
-    if not md_path.exists():
-        flash("Proposal file not found.", "error")
+    proposal_md = _proposal_markdown(proposal)
+    if not proposal_md:
+        flash("Proposal content not found.", "error")
         return redirect(url_for("dashboard"))
 
-    proposal_md = md_path.read_text(encoding="utf-8")
     action_items = re.findall(r"\[ACTION REQUIRED:\s*(.+?)\]", proposal_md)
 
     # Version history for the viewer dropdown
@@ -3675,17 +4620,18 @@ def _ensure_proposal_pdf(proposal, project):
         md_path = GENERATED_DIR / proposal.md_file
         md_text = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
 
-    owner = project.owner or db.session.get(User, project.user_id)
+    org = _org_for_project(project)
     pdf_filename = proposal.pdf_file or f"proposal_{proposal.job_id}.pdf"
     pdf_path = GENERATED_DIR / pdf_filename
 
     logo_path = None
     company_name = ""
-    if owner:
-        company_name = owner.company_name or ""
-        if (owner.company_logo_path and getattr(owner, "company_logo_use_in_proposals", False)
-                and Path(owner.company_logo_path).exists()):
-            logo_path = owner.company_logo_path
+    if org:
+        company_name = org.name or ""
+        if org.logo_path and org.logo_use_in_proposals:
+            storage.ensure_local(org.logo_path)
+            if Path(org.logo_path).exists():
+                logo_path = org.logo_path
 
     markdown_to_pdf(md_text, str(pdf_path), logo_path=logo_path, company_name=company_name)
     storage.sync_up(pdf_path)
@@ -3740,7 +4686,7 @@ def proposal_estimate(proposal_id):
 @app.route("/proposal/<proposal_id>/estimate/draft", methods=["POST"])
 @login_required
 def draft_proposal_estimate(proposal_id):
-    """AI-draft a structured estimate from the RFP + the org's rates."""
+    """AI-draft a structured estimate — runs as a background job."""
     proposal = db.session.get(Proposal, proposal_id)
     if not proposal:
         abort(404)
@@ -3748,7 +4694,27 @@ def draft_proposal_estimate(proposal_id):
     if not _can_access_project(project):
         abort(404)
 
-    org_id = current_user.org_id
+    ok, msg = _platform_ai_gate()
+    if not ok:
+        flash(msg, "error")
+        return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
+
+    job = jobs.enqueue(
+        "draft_estimate",
+        {"proposal_id": proposal_id},
+        user_id=current_user.id,
+        org_id=current_user.org_id,
+    )
+    return redirect(url_for("job_status_page", job_id=job.id))
+
+
+def _perform_estimate_draft(proposal_id, user, set_progress):
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        raise RuntimeError("Proposal no longer exists.")
+    project = db.session.get(Project, proposal.project_id)
+
+    org_id = user.org_id
     staff = [{"role_name": r.role_name, "category": r.category, "hourly_rate": r.hourly_rate,
               "overtime_rate": r.overtime_rate}
              for r in StaffRole.query.filter_by(org_id=org_id, is_active=True).all()]
@@ -3763,21 +4729,18 @@ def draft_proposal_estimate(proposal_id):
         scope_items = [i.item_text for i in ScopeItem.query.filter_by(
             scope_id=scope.id, status="included").all()]
 
+    set_progress("reading", "Reading project documents and rates…")
     rfp_text = _project_rfp_text(project.id)
-    try:
-        result = draft_estimate(
-            rfp_text, staff_roles=staff, equipment=equip, travel=travel,
-            approved_scope=scope_items,
-            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
-            user_model=current_user.llm_model or None,
-        )
-    except RuntimeError as e:
-        flash(str(e), "error")
-        return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
-    except Exception as e:
-        flash(f"Estimate drafting failed: {friendly_api_error(e)}", "error")
-        return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
 
+    set_progress("drafting", "Claude is drafting the estimate…")
+    result = draft_estimate(
+        rfp_text, staff_roles=staff, equipment=equip, travel=travel,
+        approved_scope=scope_items,
+        user_api_key=decrypt_api_key(user.api_key_encrypted) or None,
+        user_model=user.llm_model or None,
+    )
+
+    set_progress("saving", "Saving line items…")
     existing = ProposalEstimate.query.filter_by(proposal_id=proposal_id).first()
     if existing:
         db.session.delete(existing)
@@ -3794,9 +4757,17 @@ def draft_proposal_estimate(proposal_id):
             quantity=it["quantity"], unit=it["unit"], unit_cost=it["unit_cost"], sort_order=idx,
         ))
     db.session.commit()
-    _log_activity("estimate_draft", f"AI drafted {len(result['items'])} estimate line(s)", project.id)
-    flash(f"AI drafted {len(result['items'])} line item(s). Review and adjust below.", "success")
-    return redirect(url_for("proposal_estimate", proposal_id=proposal_id))
+    _log_activity_for(user, "estimate_draft",
+                      f"AI drafted {len(result['items'])} estimate line(s)", project.id)
+    return {"redirect": url_for("proposal_estimate", proposal_id=proposal_id)}
+
+
+@jobs.register("draft_estimate")
+def _job_draft_estimate(payload, job):
+    user = db.session.get(User, job.user_id)
+    def _sp(phase, message=""):
+        jobs.set_progress(job, phase, message)
+    return _perform_estimate_draft(payload["proposal_id"], user, _sp)
 
 
 @app.route("/proposal/<proposal_id>/estimate/save", methods=["POST"])
@@ -3953,7 +4924,7 @@ def insert_estimate_into_proposal(proposal_id):
     if proposal.docx_file:
         docx_path = GENERATED_DIR / proposal.docx_file
         _brand_user = project.owner or current_user
-        markdown_to_docx(updated_md, str(docx_path), **_logo_docx_kwargs(_brand_user))
+        markdown_to_docx(updated_md, str(docx_path), **_project_brand_kwargs(project, _brand_user))
         storage.sync_up(docx_path)
     project.dollar_amount = _estimate_totals(estimate)["grand_total"]
     db.session.commit()
@@ -3984,11 +4955,34 @@ def edit_proposal(proposal_id):
             flash("Proposal content cannot be empty.", "error")
             return redirect(url_for("edit_proposal", proposal_id=proposal_id))
 
-        # Get current version number
         latest = ProposalVersion.query.filter_by(proposal_id=proposal_id).order_by(
             ProposalVersion.version_number.desc()
         ).first()
-        next_version = (latest.version_number + 1) if latest else 1
+        current_num = latest.version_number if latest else 0
+
+        # Edit-conflict guard: if someone saved a newer version while this
+        # editor was open, refuse the silent last-write-wins clobber and
+        # re-render with the submitted text preserved (never discard work).
+        base_version = request.form.get("base_version", "").strip()
+        if base_version and base_version != str(current_num):
+            flash(
+                f"Save blocked: v{current_num} was saved by someone else while you "
+                "were editing. Your text is preserved below — review and save again.",
+                "error",
+            )
+            versions = ProposalVersion.query.filter_by(proposal_id=proposal_id).order_by(
+                ProposalVersion.version_number.desc()
+            ).all()
+            return render_template(
+                "proposal_edit.html",
+                proposal=proposal,
+                project=project,
+                current_content=new_content,
+                versions=versions,
+                base_version=current_num,
+            )
+
+        next_version = current_num + 1
 
         # Save new version
         version = ProposalVersion(
@@ -4001,9 +4995,11 @@ def edit_proposal(proposal_id):
         )
         db.session.add(version)
 
-        # Update the markdown file on disk
+        # Update the markdown file on disk (and mirror to object storage so the
+        # edit survives redeploys / reaches other instances)
         md_path = GENERATED_DIR / proposal.md_file
         md_path.write_text(new_content, encoding="utf-8")
+        storage.sync_up(md_path)
 
         # Regenerate DOCX from new content
         if proposal.docx_file:
@@ -4012,8 +5008,9 @@ def edit_proposal(proposal_id):
             markdown_to_docx(
                 new_content,
                 str(docx_path),
-                **_logo_docx_kwargs(_brand_user),
+                **_project_brand_kwargs(project, _brand_user),
             )
+            storage.sync_up(docx_path)
 
         # Update action items count
         action_items = re.findall(r"\[ACTION REQUIRED:\s*(.+?)\]", new_content)
@@ -4024,9 +5021,8 @@ def edit_proposal(proposal_id):
         flash(f"Proposal saved as version {next_version}.", "success")
         return redirect(url_for("edit_proposal", proposal_id=proposal_id))
 
-    # Load current content
-    md_path = GENERATED_DIR / proposal.md_file
-    current_content = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+    # Load current content (DB version first; file fallback)
+    current_content = _proposal_markdown(proposal)
 
     # Load version history
     versions = ProposalVersion.query.filter_by(proposal_id=proposal_id).order_by(
@@ -4039,6 +5035,7 @@ def edit_proposal(proposal_id):
         project=project,
         current_content=current_content,
         versions=versions,
+        base_version=(versions[0].version_number if versions else 0),
     )
 
 
@@ -4076,6 +5073,9 @@ def ai_assist(proposal_id):
     if not text:
         return {"error": "Select some text first."}, 400
 
+    if _ai_rate_limited(f"assist:{current_user.id}", max_calls=10):
+        return {"error": "Too many AI edits at once — wait a minute and try again."}, 429
+
     instructions = {
         "tighten": "Rewrite this passage to be more concise and punchy without losing meaning.",
         "formal": "Rewrite this passage in a more formal, professional business tone.",
@@ -4090,8 +5090,9 @@ def ai_assist(proposal_id):
     if not key:
         return {"error": "No API key configured. Add one in Settings."}, 400
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=key, timeout=45, max_retries=1)
+        # Metered client: records token usage and enforces the org's monthly AI
+        # budget (raw clients here previously bypassed both).
+        client = proposal_agent._make_client(key)
         import platform_config
         resp = client.messages.create(
             model=current_user.llm_model or platform_config.get("llm_model", "claude-opus-4-8"),
@@ -4162,9 +5163,10 @@ def restore_version(proposal_id, version_id):
     )
     db.session.add(restored)
 
-    # Update file on disk
+    # Update file on disk (mirrored to object storage)
     md_path = GENERATED_DIR / proposal.md_file
     md_path.write_text(version.markdown_content, encoding="utf-8")
+    storage.sync_up(md_path)
 
     if proposal.docx_file:
         docx_path = GENERATED_DIR / proposal.docx_file
@@ -4172,8 +5174,9 @@ def restore_version(proposal_id, version_id):
         markdown_to_docx(
             version.markdown_content,
             str(docx_path),
-            **_logo_docx_kwargs(_brand_user),
+            **_project_brand_kwargs(project, _brand_user),
         )
+        storage.sync_up(docx_path)
 
     db.session.commit()
     _log_activity("proposal_restore", f"Restored proposal to v{version.version_number}", project.id)
@@ -4498,8 +5501,7 @@ def proposal_review_page(proposal_id):
         return redirect(url_for("view_proposal", proposal_id=proposal_id))
 
     version = latest_version(proposal_id)
-    md_path = GENERATED_DIR / proposal.md_file
-    proposal_md = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+    proposal_md = _proposal_markdown(proposal)
     proposal_html = htmlsafe.sanitize(md.markdown(proposal_md, extensions=["tables", "fenced_code"]))
 
     # My pending/existing revision requests on this proposal
@@ -4728,32 +5730,65 @@ def apply_feedback(proposal_id):
             lifecycle_labels=LIFECYCLE_LABELS,
         )
 
-    # POST — collect selected request ids & edited directives
+    # POST — validate the selection, then hand the minutes-long AI revision to a
+    # background job (previously ran inline, holding a web worker and risking a
+    # load-balancer timeout on the largest AI call in the app).
     selected_ids = request.form.getlist("apply_request_id")
     if not selected_ids:
         flash("Please select at least one revision request to apply.", "error")
         return redirect(url_for("apply_feedback", proposal_id=proposal_id))
 
-    selected_requests = []
+    valid_ids = []
+    directives = {}
     for rid in selected_ids:
         req = db.session.get(RevisionRequest, rid)
         if not req or req.proposal_id != proposal_id or req.status != "pending":
             continue
+        valid_ids.append(rid)
         # Allow owner to edit the directive inline before the AI sees it
         edited = request.form.get(f"directive_{rid}", "").strip()
         if edited:
-            req.directive = edited
-        selected_requests.append(req)
+            directives[rid] = edited
 
-    if not selected_requests:
+    if not valid_ids:
         flash("No valid requests selected.", "error")
         return redirect(url_for("apply_feedback", proposal_id=proposal_id))
 
-    # Build the AI payload
-    current_version = latest_version(proposal_id)
-    if not current_version:
+    if not latest_version(proposal_id):
         flash("Proposal has no version to revise.", "error")
         return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
+    job = jobs.enqueue(
+        "revise_proposal",
+        {"proposal_id": proposal_id, "request_ids": valid_ids, "directives": directives},
+        user_id=current_user.id,
+        org_id=current_user.org_id,
+    )
+    return redirect(url_for("job_status_page", job_id=job.id))
+
+
+def _perform_revision(proposal_id, user, request_ids, directives, set_progress):
+    """Apply a batch of revision requests with AI. Runs inside a background job."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        raise RuntimeError("Proposal no longer exists.")
+    project = db.session.get(Project, proposal.project_id)
+
+    set_progress("reading", "Collecting revision requests and context…")
+    selected_requests = []
+    for rid in request_ids:
+        req = db.session.get(RevisionRequest, rid)
+        if not req or req.proposal_id != proposal_id or req.status != "pending":
+            continue
+        if directives.get(rid):
+            req.directive = directives[rid]
+        selected_requests.append(req)
+    if not selected_requests:
+        raise RuntimeError("The selected revision requests are no longer pending.")
+
+    current_version = latest_version(proposal_id)
+    if not current_version:
+        raise RuntimeError("Proposal has no version to revise.")
 
     ai_payload = []
     for r in selected_requests:
@@ -4768,9 +5803,7 @@ def apply_feedback(proposal_id):
             "author_label": f"{author_label} — {role_label}",
         })
 
-    # Load supporting context
-    owner = _proposal_owner(proposal)
-    owner_id = owner.id if owner else current_user.id
+    org = _org_for_project(project)
     standards = CompanyStandard.query.filter_by(org_id=_owner_org_id(project), is_active=True).all()
     standards_data = [
         {"category": s.category, "title": s.title, "content": s.content}
@@ -4791,43 +5824,40 @@ def apply_feedback(proposal_id):
         for c in corrections
     ] if corrections else None
 
-    try:
-        result = revise_proposal(
-            current_markdown=current_version.markdown_content,
-            revision_requests=ai_payload,
-            vertical=proposal.vertical,
-            company_name=current_user.company_name,
-            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
-            user_model=current_user.llm_model or None,
-            company_standards=standards_data,
-            past_corrections=corrections_data,
-        )
-    except RuntimeError as e:
-        flash(str(e), "error")
-        return redirect(url_for("apply_feedback", proposal_id=proposal_id))
-    except Exception as e:
-        flash(f"AI revision failed: {friendly_api_error(e)}", "error")
-        return redirect(url_for("apply_feedback", proposal_id=proposal_id))
+    set_progress("drafting", "Claude is applying the revision requests…")
+    result = revise_proposal(
+        current_markdown=current_version.markdown_content,
+        revision_requests=ai_payload,
+        vertical=proposal.vertical,
+        company_name=(org.name if org else "") or "",
+        user_api_key=decrypt_api_key(user.api_key_encrypted) or None,
+        user_model=user.llm_model or None,
+        company_standards=standards_data,
+        past_corrections=corrections_data,
+    )
 
-    # Create the new version
+    set_progress("saving", "Formatting and saving the new version…")
     latest_num = current_version.version_number
     new_version = ProposalVersion(
         proposal_id=proposal_id,
         version_number=latest_num + 1,
         markdown_content=result["revised_markdown"],
         edit_source="ai",
-        editor_id=current_user.id,
+        editor_id=user.id,
         change_summary=f"AI revision: {result['ai_summary']}",
     )
     db.session.add(new_version)
     db.session.flush()
 
-    # Write the new markdown/docx to disk
+    # Write the new markdown/docx to disk (mirrored to object storage)
     md_path = GENERATED_DIR / proposal.md_file
     md_path.write_text(result["revised_markdown"], encoding="utf-8")
+    storage.sync_up(md_path)
     if proposal.docx_file:
         docx_path = GENERATED_DIR / proposal.docx_file
-        markdown_to_docx(result["revised_markdown"], str(docx_path))
+        markdown_to_docx(result["revised_markdown"], str(docx_path),
+                         **_project_brand_kwargs(project, project.owner or user))
+        storage.sync_up(docx_path)
 
     # Update action items count
     proposal.action_items_count = len(
@@ -4839,7 +5869,7 @@ def apply_feedback(proposal_id):
         proposal_id=proposal_id,
         from_version_id=current_version.id,
         to_version_id=new_version.id,
-        triggered_by=current_user.id,
+        triggered_by=user.id,
         request_count=len(selected_requests),
         ai_change_summary=json.dumps({
             "summary": result["ai_summary"],
@@ -4860,7 +5890,7 @@ def apply_feedback(proposal_id):
             "revision_requested", "in_review", "internally_approved", "customer_feedback"
         ):
             lifecycle_transition(
-                proposal, "in_review", current_user.id,
+                proposal, "in_review", user.id,
                 note=f"AI generated v{new_version.version_number} from {len(selected_requests)} request(s)."
             )
     except LifecycleError:
@@ -4869,7 +5899,7 @@ def apply_feedback(proposal_id):
     # Notify reviewers a new version needs their attention
     reviewers = ProposalReviewer.query.filter_by(proposal_id=proposal_id).all()
     for rv in reviewers:
-        if rv.user_id == current_user.id:
+        if rv.user_id == user.id:
             continue
         _notify(
             rv.user_id,
@@ -4880,16 +5910,22 @@ def apply_feedback(proposal_id):
         )
 
     db.session.commit()
-    _log_activity(
+    _log_activity_for(
+        user,
         "proposal_revise",
         f"AI-revised proposal to v{new_version.version_number} ({len(selected_requests)} requests applied)",
         project.id,
     )
-    flash(
-        f"Version {new_version.version_number} generated. {len(selected_requests)} request(s) applied.",
-        "success",
-    )
-    return redirect(url_for("view_proposal", proposal_id=proposal_id))
+    return {"redirect": url_for("view_proposal", proposal_id=proposal_id)}
+
+
+@jobs.register("revise_proposal")
+def _job_revise_proposal(payload, job):
+    user = db.session.get(User, job.user_id)
+    def _sp(phase, message=""):
+        jobs.set_progress(job, phase, message)
+    return _perform_revision(payload["proposal_id"], user, payload["request_ids"],
+                             payload.get("directives") or {}, _sp)
 
 
 @app.route("/proposal/<proposal_id>/submit-to-customer", methods=["POST"])
@@ -4900,6 +5936,13 @@ def submit_to_customer(proposal_id):
     if not proposal or not _is_proposal_owner(proposal):
         abort(404)
     project = db.session.get(Project, proposal.project_id)
+
+    # Send gate: open [ACTION REQUIRED] markers mean the document still has
+    # unresolved placeholders — require an explicit acknowledgement.
+    if (proposal.action_items_count or 0) > 0 and request.form.get("ack_action_items") != "1":
+        flash(f"{proposal.action_items_count} [ACTION REQUIRED] item(s) are still open. "
+              "Resolve them, or tick the acknowledgement box to send anyway.", "error")
+        return redirect(url_for("view_proposal", proposal_id=proposal_id))
 
     try:
         lifecycle_transition(
@@ -4939,6 +5982,12 @@ def create_share(proposal_id):
         abort(404)
     project = db.session.get(Project, proposal.project_id)
 
+    # Same send gate as submit_to_customer: sharing IS sending.
+    if (proposal.action_items_count or 0) > 0 and request.form.get("ack_action_items") != "1":
+        flash(f"{proposal.action_items_count} [ACTION REQUIRED] item(s) are still open. "
+              "Resolve them, or tick the acknowledgement box to share anyway.", "error")
+        return redirect(url_for("view_proposal", proposal_id=proposal_id))
+
     customer_email = request.form.get("customer_email", "").strip()
     allow_comments = request.form.get("allow_comments", "1") == "1"
     allow_decision = request.form.get("allow_decision", "1") == "1"
@@ -4962,6 +6011,9 @@ def create_share(proposal_id):
     share.allow_comments = allow_comments
     share.allow_decision = allow_decision
     share.version_number = version.version_number if version else 0
+    # Share links carry accept/decline authority — they must not live forever.
+    # Every (re)share extends the window rather than leaving it open-ended.
+    share.expires_at = datetime.now(timezone.utc) + timedelta(days=90)
     db.session.flush()
 
     # Advance lifecycle if we're at the internally-approved gate
@@ -4981,8 +6033,9 @@ def create_share(proposal_id):
         except Exception:
             pdf_path = None
         import mailer
+        _share_org = _org_for_project(project)
         body = (
-            f"Hello,\n\n{current_user.company_name or 'We'} have prepared a proposal for "
+            f"Hello,\n\n{(_share_org.name if _share_org else '') or 'We'} have prepared a proposal for "
             f"{project.name}. You can review it online here:\n\n{share_url}\n\n"
         )
         if share.allow_decision:
@@ -5030,6 +6083,25 @@ def _valid_share(token):
     return share
 
 
+def _share_version(share, proposal):
+    """The version pinned at share time (latest only for legacy unpinned shares)."""
+    version = None
+    if share.version_number:
+        version = ProposalVersion.query.filter_by(
+            proposal_id=proposal.id, version_number=share.version_number
+        ).first()
+    return version or latest_version(proposal.id)
+
+
+def _customer_markdown(version) -> str:
+    """Customer-facing markdown: internal-only markers stripped (DOTALL /
+    IGNORECASE so multi-line markers can't leak onto the public portal)."""
+    md_text = version.markdown_content if version else ""
+    md_text = re.sub(r"\[ACTION REQUIRED:.*?\]", "", md_text, flags=re.DOTALL | re.IGNORECASE)
+    md_text = re.sub(r"\[ASSUMED:.*?\]", "", md_text, flags=re.DOTALL | re.IGNORECASE)
+    return md_text
+
+
 @app.route("/p/<token>")
 def customer_portal(token):
     """Public, read-only branded proposal view for a customer. No login."""
@@ -5039,7 +6111,7 @@ def customer_portal(token):
 
     proposal = db.session.get(Proposal, share.proposal_id)
     project = db.session.get(Project, share.project_id)
-    owner = db.session.get(User, project.user_id) if project else None
+    brand_org = _org_for_project(project)
 
     # Record the view (dedupe rapid reloads within 60s from same IP)
     ip = request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()
@@ -5062,21 +6134,32 @@ def customer_portal(token):
         share.view_count = (share.view_count or 0) + 1
         share.last_viewed_at = now
         db.session.commit()
+        # Tell the owner the FIRST time the customer opens it (further views
+        # show on the share card without notification spam).
+        if share.view_count == 1 and project:
+            _notify(
+                project.user_id, "share_viewed",
+                f"Customer opened your proposal: {project.name}",
+                "First view of the share link just now.",
+                link=f"/proposal/{proposal.id}",
+            )
+            _notify_via_integrations(
+                project.org_id,
+                f"\U0001F440 Customer opened the proposal for *{project.name}*.")
 
-    version = latest_version(proposal.id)
-    md_text = version.markdown_content if version else ""
-    # Strip internal-only markers from the customer-facing view
-    # DOTALL/IGNORECASE so multi-line internal markers are also stripped and can't
-    # leak onto the public customer portal.
-    md_text = re.sub(r"\[ACTION REQUIRED:.*?\]", "", md_text, flags=re.DOTALL | re.IGNORECASE)
-    md_text = re.sub(r"\[ASSUMED:.*?\]", "", md_text, flags=re.DOTALL | re.IGNORECASE)
+    # Render the version that was SHARED, not whatever is latest — internal
+    # edits made after submission must not silently change what the customer
+    # sees (or what they accepted).
+    version = _share_version(share, proposal)
+    md_text = _customer_markdown(version)
     proposal_html = htmlsafe.sanitize(md.markdown(md_text, extensions=["tables", "fenced_code"]))
 
-    company_name = (owner.company_name if owner else "") or ""
-    logo_url = url_for("portal_logo", token=token) if (
-        owner and owner.company_logo_path and getattr(owner, "company_logo_use_in_proposals", False)
-        and Path(owner.company_logo_path).exists()
-    ) else ""
+    company_name = (brand_org.name if brand_org else "") or ""
+    logo_url = ""
+    if brand_org and brand_org.logo_path and brand_org.logo_use_in_proposals:
+        storage.ensure_local(brand_org.logo_path)
+        if Path(brand_org.logo_path).exists():
+            logo_url = url_for("portal_logo", token=token)
 
     return render_template(
         "portal.html",
@@ -5094,11 +6177,47 @@ def portal_logo(token):
     share = _valid_share(token)
     if not share:
         abort(404)
-    project = db.session.get(Project, share.project_id)
-    owner = db.session.get(User, project.user_id) if project else None
-    if not owner or not owner.company_logo_path or not Path(owner.company_logo_path).exists():
+    org = _org_for_project(db.session.get(Project, share.project_id))
+    if not org or not org.logo_path:
         abort(404)
-    return send_file(owner.company_logo_path, mimetype="image/png")
+    storage.ensure_local(org.logo_path)
+    if not Path(org.logo_path).exists():
+        abort(404)
+    return send_file(org.logo_path, mimetype="image/png")
+
+
+@app.route("/p/<token>/download.pdf")
+def portal_pdf(token):
+    """Customer-facing PDF of the SHARED (pinned) version, internal markers
+    stripped — the portal previously offered no way to save the document."""
+    share = _valid_share(token)
+    if not share:
+        abort(404)
+    proposal = db.session.get(Proposal, share.proposal_id)
+    project = db.session.get(Project, share.project_id)
+    version = _share_version(share, proposal)
+    md_text = _customer_markdown(version)
+    if not md_text.strip():
+        abort(404)
+
+    org = _org_for_project(project)
+    logo_path = None
+    company_name = ""
+    if org:
+        company_name = org.name or ""
+        if org.logo_path and org.logo_use_in_proposals:
+            storage.ensure_local(org.logo_path)
+            if Path(org.logo_path).exists():
+                logo_path = org.logo_path
+
+    pdf_path = GENERATED_DIR / f"portal_{share.id}.pdf"
+    try:
+        markdown_to_pdf(md_text, str(pdf_path), logo_path=logo_path, company_name=company_name)
+    except Exception:
+        abort(404)
+    safe_name = secure_filename(project.name if project else "proposal") or "proposal"
+    return send_file(str(pdf_path), mimetype="application/pdf",
+                     as_attachment=True, download_name=f"Proposal - {safe_name}.pdf")
 
 
 @app.route("/p/<token>/comment", methods=["POST"])
@@ -5155,12 +6274,21 @@ def portal_decision(token):
 
     decision = request.form.get("decision", "").strip()
     note = request.form.get("note", "").strip()
+    decider_name = request.form.get("decider_name", "").strip()[:200]
+    decider_title = request.form.get("decider_title", "").strip()[:200]
     if decision not in ("accepted", "declined"):
         flash("Invalid decision.", "error")
+        return redirect(url_for("customer_portal", token=token))
+    # Acceptance is a commitment — require a typed name as a lightweight
+    # signature record (declines may stay anonymous).
+    if decision == "accepted" and not decider_name:
+        flash("Please type your name to accept the proposal.", "error")
         return redirect(url_for("customer_portal", token=token))
 
     share.decision = decision
     share.decision_note = note
+    share.decided_by_name = decider_name
+    share.decided_by_title = decider_title
     share.decided_at = datetime.now(timezone.utc)
 
     try:
@@ -5178,8 +6306,10 @@ def portal_decision(token):
 
     if project:
         verb = "accepted" if decision == "accepted" else "declined"
+        by = f"by {decider_name}" + (f" ({decider_title})" if decider_title else "") if decider_name else ""
         _notify(project.user_id, "customer_decision",
-                f"Customer {verb}: {project.name}", note[:160],
+                f"Customer {verb}: {project.name}",
+                " ".join(x for x in (by, note[:140]) if x),
                 link=f"/proposal/{proposal.id}")
         _notify_via_integrations(project.org_id,
                                  f"{'✅' if decision=='accepted' else '❌'} Customer *{verb}* the proposal for *{project.name}*.")
@@ -5497,31 +6627,45 @@ def admin_panel():
 
     from sqlalchemy import func
 
-    # Per-user stats
+    # Per-user stats — bulk group-bys (previously 6 queries per member)
+    user_ids = [u.id for u in users]
+    proj_counts = _counts_by(Project.user_id, Project.id,
+                             Project.user_id.in_(user_ids)) if user_ids else {}
+    won_counts = _counts_by(Project.user_id, Project.id,
+                            Project.user_id.in_(user_ids),
+                            Project.status == "won") if user_ids else {}
+    lost_counts = _counts_by(Project.user_id, Project.id,
+                             Project.user_id.in_(user_ids),
+                             Project.status == "lost") if user_ids else {}
+    dollar_sums = dict(db.session.query(
+        Project.user_id, func.sum(Project.dollar_amount)
+    ).filter(Project.user_id.in_(user_ids), Project.dollar_amount > 0)
+     .group_by(Project.user_id).all()) if user_ids else {}
+    prop_counts = dict(db.session.query(
+        Project.user_id, func.count(Proposal.id)
+    ).join(Proposal, Proposal.project_id == Project.id)
+     .filter(Project.user_id.in_(user_ids))
+     .group_by(Project.user_id).all()) if user_ids else {}
+    last_activity = dict(db.session.query(
+        ActivityLog.user_id, func.max(ActivityLog.created_at)
+    ).filter(ActivityLog.user_id.in_(user_ids))
+     .group_by(ActivityLog.user_id).all()) if user_ids else {}
+
     user_stats = []
     for user in users:
-        total = Project.query.filter_by(user_id=user.id).count()
-        won = Project.query.filter_by(user_id=user.id, status="won").count()
-        lost = Project.query.filter_by(user_id=user.id, status="lost").count()
+        won = won_counts.get(user.id, 0)
+        lost = lost_counts.get(user.id, 0)
         decided = won + lost
-        total_dollar = db.session.query(func.sum(Project.dollar_amount)).filter(
-            Project.user_id == user.id, Project.dollar_amount > 0
-        ).scalar() or 0
-        proposal_count = Proposal.query.join(Project).filter(Project.user_id == user.id).count()
-
-        # Last activity timestamp
-        last_log = ActivityLog.query.filter_by(user_id=user.id).order_by(ActivityLog.created_at.desc()).first()
-        last_active = last_log.created_at.strftime('%Y-%m-%d') if last_log else None
-
+        last_ts = last_activity.get(user.id)
         user_stats.append({
             "user": user,
-            "total_projects": total,
-            "proposal_count": proposal_count,
+            "total_projects": proj_counts.get(user.id, 0),
+            "proposal_count": prop_counts.get(user.id, 0),
             "won": won,
             "lost": lost,
             "win_rate": round((won / decided) * 100) if decided > 0 else 0,
-            "total_dollar": total_dollar,
-            "last_active": last_active,
+            "total_dollar": dollar_sums.get(user.id, 0) or 0,
+            "last_active": last_ts.strftime('%Y-%m-%d') if last_ts else None,
         })
 
     # Organization-wide totals
@@ -5590,6 +6734,7 @@ def admin_panel():
         "admin.html",
         users=users,
         org=org,
+        sso_configured=sso.configured(),
         pending_invitations=pending_invitations,
         user_stats=user_stats,
         company_stats=company_stats,
@@ -5634,7 +6779,7 @@ def create_invitation():
         return redirect(url_for("admin_panel"))
 
     # Don't invite existing members
-    existing = _org_users_query().filter(User.email.ilike(email)).first()
+    existing = _org_users_query().filter(_email_matches(email)).first()
     if existing:
         flash(f"{email} is already a member of this workspace.", "error")
         return redirect(url_for("admin_panel"))
@@ -5698,6 +6843,36 @@ def revoke_invitation(invite_id):
     db.session.commit()
     flash(f"Invitation for {inv.email} revoked.", "success")
     return redirect(url_for("admin_panel"))
+
+
+@app.route("/admin/sso", methods=["POST"])
+@login_required
+def update_sso_domain():
+    """Claim an email domain for this workspace so its users sign in via the
+    org's IdP, optionally auto-provisioning first-time members (JIT)."""
+    if not current_user.is_admin or not current_user.org_id:
+        abort(403)
+    org = db.session.get(Organization, current_user.org_id)
+    domain = request.form.get("sso_domain", "").strip().lower().lstrip("@")
+    if domain and (
+        "." not in domain or "@" in domain or "/" in domain or " " in domain
+    ):
+        flash("Enter a bare domain like acme.com.", "error")
+        return redirect(url_for("admin_panel") + "#sso")
+    if domain:
+        clash = Organization.query.filter(
+            db.func.lower(Organization.sso_domain) == domain,
+            Organization.id != org.id,
+        ).first()
+        if clash:
+            flash("That domain is already claimed by another workspace.", "error")
+            return redirect(url_for("admin_panel") + "#sso")
+    org.sso_domain = domain
+    org.sso_jit = bool(request.form.get("sso_jit"))
+    db.session.commit()
+    _log_activity("sso_config", f"Set SSO domain to {domain or '(none)'}")
+    flash("Single sign-on settings saved.", "success")
+    return redirect(url_for("admin_panel") + "#sso")
 
 
 @app.route("/admin/integrations", methods=["POST"])
@@ -5856,6 +7031,9 @@ def billing_page():
         usage=usage,
         stripe_enabled=billing.stripe_enabled(),
         is_admin=current_user.is_admin,
+        trial_active=billing.trial_active(org),
+        trial_days=billing.trial_days_left(org),
+        trial_ends=(org.trial_ends_at if org else None),
     )
 
 
@@ -6059,6 +7237,48 @@ def toggle_admin(user_id):
     return redirect(url_for("admin_panel"))
 
 
+@app.route("/admin/deactivate-user/<user_id>", methods=["POST"])
+@login_required
+def deactivate_user(user_id):
+    """Offboard a member: they can no longer sign in, existing sessions die on
+    next request, and their seat is freed. Their projects/data stay visible to
+    the org. Reversible via reactivate."""
+    if not current_user.is_admin:
+        abort(403)
+    if user_id == current_user.id:
+        flash("You cannot deactivate your own account.", "error")
+        return redirect(url_for("admin_panel"))
+    user = db.session.get(User, user_id)
+    if not user or not _same_org(user):
+        abort(404)
+    user.is_active = False
+    db.session.commit()
+    _log_activity("user_deactivate", f"Deactivated {user.username}")
+    flash(f"{user.display_name or user.username} deactivated. "
+          "They can no longer sign in; their seat is freed.", "success")
+    return redirect(url_for("admin_panel"))
+
+
+@app.route("/admin/reactivate-user/<user_id>", methods=["POST"])
+@login_required
+def reactivate_user(user_id):
+    if not current_user.is_admin:
+        abort(403)
+    user = db.session.get(User, user_id)
+    if not user or not _same_org(user):
+        abort(404)
+    # Reactivation consumes a seat again — enforce the plan limit.
+    ok, msg = billing_check_seat(current_user.org_id)
+    if not ok:
+        flash(msg, "error")
+        return redirect(url_for("billing_page"))
+    user.is_active = True
+    db.session.commit()
+    _log_activity("user_reactivate", f"Reactivated {user.username}")
+    flash(f"{user.display_name or user.username} reactivated.", "success")
+    return redirect(url_for("admin_panel"))
+
+
 @app.route("/admin/update-role/<user_id>", methods=["POST"])
 @login_required
 def update_user_role(user_id):
@@ -6153,7 +7373,16 @@ def document_library():
     else:
         doc_query = doc_query.order_by(ProjectDocument.uploaded_at.desc())
 
-    documents = doc_query.all()
+    # SQL-side pagination — the library previously loaded every document row
+    try:
+        page = max(int(request.args.get("page", 1)), 1)
+    except (TypeError, ValueError):
+        page = 1
+    per_page = 50
+    filtered_count = doc_query.count()
+    total_pages = max((filtered_count + per_page - 1) // per_page, 1)
+    page = min(page, total_pages)
+    documents = doc_query.offset((page - 1) * per_page).limit(per_page).all()
 
     # Build project lookup
     project_map = {p.id: p for p in all_projects}
@@ -6170,15 +7399,20 @@ def document_library():
     ).scalar() or 0
     total_docs = ProjectDocument.query.filter(ProjectDocument.project_id.in_(project_ids)).count()
 
-    # Per-project stats
-    project_stats = []
-    for p in all_projects:
-        p_docs = ProjectDocument.query.filter_by(project_id=p.id).count()
-        p_size = db.session.query(func.sum(ProjectDocument.file_size)).filter(
-            ProjectDocument.project_id == p.id
-        ).scalar() or 0
-        if p_docs > 0:
-            project_stats.append({"project": p, "doc_count": p_docs, "total_size": p_size})
+    # Per-project stats in one group-by (was 2 queries per project)
+    per_project = {
+        pid: (cnt, size or 0)
+        for pid, cnt, size in db.session.query(
+            ProjectDocument.project_id,
+            func.count(ProjectDocument.id),
+            func.sum(ProjectDocument.file_size),
+        ).filter(ProjectDocument.project_id.in_(project_ids))
+         .group_by(ProjectDocument.project_id).all()
+    } if project_ids else {}
+    project_stats = [
+        {"project": p, "doc_count": per_project[p.id][0], "total_size": per_project[p.id][1]}
+        for p in all_projects if p.id in per_project
+    ]
 
     # Generated proposals
     proposals = Proposal.query.filter(
@@ -6209,6 +7443,9 @@ def document_library():
         filter_status=filter_status,
         sort_by=sort_by,
         show_reference=show_reference,
+        page=page,
+        total_pages=total_pages,
+        filtered_count=filtered_count,
     )
 
 
@@ -6222,7 +7459,7 @@ def download_document(doc_id):
     project = db.session.get(Project, doc.project_id)
     if not _can_access_project(project):
         abort(404)
-    return send_file(doc.file_path, as_attachment=True, download_name=doc.original_filename)
+    return _send_stored_file(doc.file_path, as_attachment=True, download_name=doc.original_filename)
 
 
 @app.route("/documents/<doc_id>/preview")
@@ -6235,7 +7472,107 @@ def preview_document(doc_id):
     project = db.session.get(Project, doc.project_id)
     if not _can_access_project(project):
         abort(404)
-    return send_file(doc.file_path, as_attachment=False)
+    return _send_stored_file(doc.file_path, as_attachment=False)
+
+
+@app.route("/documents/<doc_id>/delete", methods=["POST"])
+@login_required
+def delete_document(doc_id):
+    """Delete an uploaded document (row, tags, local file, and object-storage
+    copy). Previously there was no way to remove a mis-uploaded file at all."""
+    doc = db.session.get(ProjectDocument, doc_id)
+    if not doc:
+        abort(404)
+    project = db.session.get(Project, doc.project_id)
+    if not _can_access_project(project):
+        abort(404)
+    name = doc.original_filename
+    DocumentTag.query.filter_by(document_id=doc.id).delete()
+    try:
+        storage.delete(doc.file_path)
+        storage.delete(str(doc.file_path) + ".ocr.txt")  # OCR sidecar cache
+    except Exception:
+        pass
+    db.session.delete(doc)
+    db.session.commit()
+    _log_activity("document_delete", f"Deleted document: {name}", project.id)
+    flash(f"'{name}' deleted.", "success")
+    return redirect(request.referrer or url_for("project_upload", project_id=project.id))
+
+
+@app.route("/projects/<project_id>/delete", methods=["POST"])
+@login_required
+def delete_project(project_id):
+    """Permanently delete a project and everything under it (documents,
+    proposals, versions, scope, estimates, shares…), including files on disk
+    and in object storage. Owner or org admin only."""
+    project = db.session.get(Project, project_id)
+    if not project:
+        abort(404)
+    is_owner = project.user_id == current_user.id
+    is_org_admin = current_user.is_admin and _same_org(project.org_id or _owner_org_id(project))
+    if not (is_owner or is_org_admin):
+        abort(404)
+    if request.form.get("confirm_name", "").strip() != project.name:
+        flash("Type the project's exact name to confirm deletion.", "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    name = project.name
+    proposal_ids = [p.id for p in Proposal.query.filter_by(project_id=project_id).all()]
+
+    # Generated proposal files (md/docx/pdf)
+    for prop in Proposal.query.filter_by(project_id=project_id).all():
+        for fname in (prop.md_file, prop.docx_file, prop.pdf_file):
+            if fname:
+                try:
+                    storage.delete(GENERATED_DIR / fname)
+                except Exception:
+                    pass
+
+    # Uploaded document files + tags
+    docs = ProjectDocument.query.filter_by(project_id=project_id).all()
+    for doc in docs:
+        try:
+            storage.delete(doc.file_path)
+            storage.delete(str(doc.file_path) + ".ocr.txt")  # OCR sidecar cache
+        except Exception:
+            pass
+        DocumentTag.query.filter_by(document_id=doc.id).delete()
+
+    if proposal_ids:
+        # Children of proposals, leaves first (FKs are not ON DELETE CASCADE)
+        share_ids = [s.id for s in ProposalShare.query.filter(
+            ProposalShare.proposal_id.in_(proposal_ids)).all()]
+        if share_ids:
+            ShareView.query.filter(ShareView.share_id.in_(share_ids)).delete(synchronize_session=False)
+        ProposalShare.query.filter(ProposalShare.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        ProposalApproval.query.filter(ProposalApproval.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        ProposalReviewer.query.filter(ProposalReviewer.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        ProposalRevisionBatch.query.filter(ProposalRevisionBatch.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        RevisionRequest.query.filter(RevisionRequest.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        ProposalStatusHistory.query.filter(ProposalStatusHistory.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        ProposalComment.query.filter(ProposalComment.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        ReviewComment.query.filter(ReviewComment.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        ReviewCycle.query.filter(ReviewCycle.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        ProposalCorrection.query.filter(ProposalCorrection.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        est_ids = [e.id for e in ProposalEstimate.query.filter(
+            ProposalEstimate.proposal_id.in_(proposal_ids)).all()]
+        if est_ids:
+            EstimateLineItem.query.filter(EstimateLineItem.estimate_id.in_(est_ids)).delete(synchronize_session=False)
+        ProposalEstimate.query.filter(ProposalEstimate.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+        ProposalVersion.query.filter(ProposalVersion.proposal_id.in_(proposal_ids)).delete(synchronize_session=False)
+
+    ClarificationItem.query.filter_by(project_id=project_id).delete(synchronize_session=False)
+    ProposalQuestion.query.filter_by(project_id=project_id).delete(synchronize_session=False)
+    ScopeItem.query.filter_by(project_id=project_id).delete(synchronize_session=False)
+    ProjectScope.query.filter_by(project_id=project_id).delete(synchronize_session=False)
+    ProjectDocument.query.filter_by(project_id=project_id).delete(synchronize_session=False)
+    Proposal.query.filter_by(project_id=project_id).delete(synchronize_session=False)
+    db.session.delete(project)
+    db.session.commit()
+    _log_activity("project_delete", f"Deleted project: {name}")
+    flash(f"Project '{name}' and all its data were permanently deleted.", "success")
+    return redirect(url_for("proposals_list"))
 
 
 @app.route("/documents/<doc_id>/tags", methods=["POST"])
@@ -6388,6 +7725,7 @@ def bulk_download_documents():
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
     with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
         for doc in docs:
+            storage.ensure_local(doc.file_path)
             src = Path(doc.file_path)
             if src.exists():
                 zf.write(str(src), doc.original_filename)
@@ -6745,27 +8083,40 @@ def search():
     )
     results["documents"] = doc_query.order_by(ProjectDocument.uploaded_at.desc()).limit(25).all()
 
-    # Proposals — search within markdown content of their latest version
-    prop_query = Proposal.query.filter(Proposal.project_id.in_(accessible_project_ids))
+    # Proposals — match within the LATEST version's markdown, SQL-side.
+    # (Previously loaded up to 200 proposals' full content into Python per
+    # search request.)
+    from sqlalchemy import func as _f
+    latest_v = db.session.query(
+        ProposalVersion.proposal_id,
+        _f.max(ProposalVersion.version_number).label("maxv"),
+    ).group_by(ProposalVersion.proposal_id).subquery()
+    version_hits = (
+        db.session.query(ProposalVersion, Proposal)
+        .join(latest_v, db.and_(
+            ProposalVersion.proposal_id == latest_v.c.proposal_id,
+            ProposalVersion.version_number == latest_v.c.maxv,
+        ))
+        .join(Proposal, Proposal.id == ProposalVersion.proposal_id)
+        .filter(Proposal.project_id.in_(accessible_project_ids),
+                ProposalVersion.markdown_content.ilike(like))
+        .limit(25)
+        .all()
+    )
     proposal_matches = []
-    for prop in prop_query.limit(200).all():
-        latest = ProposalVersion.query.filter_by(proposal_id=prop.id).order_by(
-            ProposalVersion.version_number.desc()
-        ).first()
-        if latest and q.lower() in (latest.markdown_content or "").lower():
-            # Extract a small snippet around the match
-            content = latest.markdown_content
-            lower = content.lower()
-            idx = lower.find(q.lower())
-            start = max(0, idx - 60)
-            end = min(len(content), idx + len(q) + 60)
-            snippet = content[start:end].replace("\n", " ")
-            if start > 0:
-                snippet = "…" + snippet
-            if end < len(content):
-                snippet = snippet + "…"
-            proposal_matches.append({"proposal": prop, "snippet": snippet})
-    results["proposals"] = proposal_matches[:25]
+    for version, prop in version_hits:
+        content = version.markdown_content or ""
+        idx = content.lower().find(q.lower())
+        idx = max(idx, 0)
+        start = max(0, idx - 60)
+        end = min(len(content), idx + len(q) + 60)
+        snippet = content[start:end].replace("\n", " ")
+        if start > 0:
+            snippet = "…" + snippet
+        if end < len(content):
+            snippet = snippet + "…"
+        proposal_matches.append({"proposal": prop, "snippet": snippet})
+    results["proposals"] = proposal_matches
 
     # Comments — always scoped to accessible (org) proposals
     if True:
@@ -7077,7 +8428,10 @@ def update_clarification(item_id):
     ci.resolution_path = request.form.get("resolution_path", ci.resolution_path)
     ci.assigned_to_user_id = request.form.get("assigned_to_user_id") or ci.assigned_to_user_id
     ci.assigned_to_role = request.form.get("assigned_to_role", ci.assigned_to_role)
-    ci.confidence_impact = int(request.form.get("confidence_impact", ci.confidence_impact) or 0)
+    try:
+        ci.confidence_impact = int(request.form.get("confidence_impact", ci.confidence_impact) or 0)
+    except (TypeError, ValueError):
+        pass  # non-numeric input keeps the existing value instead of a 500
     db.session.commit()
 
     flash("Clarification updated.", "success")
@@ -7126,13 +8480,11 @@ def proposal_reviews(proposal_id):
     approvals = sum(1 for c in comments if c.comment_type == "approval")
 
     # Extract section headings from proposal for dropdown
-    md_path = GENERATED_DIR / proposal.md_file
     sections = []
-    if md_path.exists():
-        for line in md_path.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if stripped.startswith("## ") or stripped.startswith("### "):
-                sections.append(stripped)
+    for line in _proposal_markdown(proposal).splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## ") or stripped.startswith("### "):
+            sections.append(stripped)
 
     users = _org_users_query().order_by(User.display_name).all()
 
@@ -7335,7 +8687,8 @@ def generate_rfi_letter(project_id):
     db.session.commit()
 
     # Generate DOCX
-    company_name = current_user.company_name or "Our Company"
+    _rfi_org = _org_for_project(project)
+    company_name = (_rfi_org.name if _rfi_org else "") or "Our Company"
     rfi_filename = f"rfi_letter_{project_id[:8]}_{datetime.now(timezone.utc).strftime('%Y%m%d')}.docx"
     rfi_path = GENERATED_DIR / rfi_filename
 
@@ -7407,24 +8760,22 @@ def addendum_analysis(project_id):
     for doc in rfp_docs:
         if doc.id != addendum_doc_id:
             try:
+                storage.ensure_local(doc.file_path)
                 original_rfp_text += parse_document(doc.file_path) + "\n"
             except Exception:
                 continue
 
     # Get addendum text
     try:
+        storage.ensure_local(addendum_doc.file_path)
         addendum_text = parse_document(addendum_doc.file_path)
     except Exception:
         flash("Could not parse addendum document.", "error")
         return redirect(url_for("project_upload", project_id=project_id))
 
-    # Get current proposal
+    # Get current proposal (DB version first; file fallback)
     proposal = Proposal.query.filter_by(project_id=project_id).order_by(Proposal.generated_at.desc()).first()
-    current_md = ""
-    if proposal:
-        md_path = GENERATED_DIR / proposal.md_file
-        if md_path.exists():
-            current_md = md_path.read_text(encoding="utf-8")
+    current_md = _proposal_markdown(proposal) if proposal else ""
 
     if not current_md:
         flash("No existing proposal to analyze against.", "error")
@@ -7489,26 +8840,28 @@ def regenerate_proposal_section(proposal_id):
         flash("Section heading and clarification info are required.", "error")
         return redirect(url_for("edit_proposal", proposal_id=proposal_id))
 
-    # Get current proposal content
+    # Get current proposal content (DB version first; file fallback)
     md_path = GENERATED_DIR / proposal.md_file
-    current_md = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+    current_md = _proposal_markdown(proposal)
 
     # Get original RFP text for context
     rfp_docs = ProjectDocument.query.filter_by(project_id=proposal.project_id, file_type="rfp").all()
     rfp_text = ""
     for doc in rfp_docs:
         try:
+            storage.ensure_local(doc.file_path)
             rfp_text += parse_document(doc.file_path) + "\n"
         except Exception:
             continue
 
     try:
+        _sec_org = _org_for_project(project)
         result = regenerate_section(
             full_proposal_md=current_md,
             section_heading=section_heading,
             clarification_answer=clarification_answer,
             original_rfp_text=rfp_text,
-            company_name=current_user.company_name,
+            company_name=(_sec_org.name if _sec_org else ""),
             user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
             user_model=current_user.llm_model or None,
         )
@@ -7540,11 +8893,15 @@ def regenerate_proposal_section(proposal_id):
         )
         db.session.add(version)
 
-        # Update file on disk
+        # Update file on disk (mirrored to object storage)
         md_path.write_text(updated_md, encoding="utf-8")
+        storage.sync_up(md_path)
         if proposal.docx_file:
             docx_path = GENERATED_DIR / proposal.docx_file
-            markdown_to_docx(updated_md, str(docx_path))
+            _brand_user = project.owner or current_user
+            markdown_to_docx(updated_md, str(docx_path),
+                             **_project_brand_kwargs(project, _brand_user))
+            storage.sync_up(docx_path)
 
         # Update action items count
         action_items = re.findall(r"\[ACTION REQUIRED:\s*(.+?)\]", updated_md)
@@ -7724,6 +9081,9 @@ def chat_help():
     if not message:
         return {"reply": "Please type a question and I'll do my best to help!"}
 
+    if _ai_rate_limited(f"chat:{current_user.id}", max_calls=20):
+        return {"reply": "You're sending messages very quickly — give me a minute to catch up."}
+
     def _record(reply, answered_by):
         # Store the Q&A for platform-owner analytics (best-effort).
         try:
@@ -7740,8 +9100,9 @@ def chat_help():
     effective_key = api_key or platform_config.get("anthropic_api_key")
     if effective_key:
         try:
-            import anthropic
-            client = anthropic.Anthropic(api_key=effective_key, timeout=30, max_retries=1)
+            # Metered client: chat usage counts toward the org's AI budget and
+            # is recorded like every other LLM call.
+            client = proposal_agent._make_client(effective_key)
             resp = client.messages.create(
                 model=current_user.llm_model or platform_config.get("llm_model", "claude-opus-4-8"),
                 max_tokens=400,

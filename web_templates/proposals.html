@@ -191,6 +191,13 @@
         {% endfor %}
     </tbody>
 </table>
+{% set pg_args = {'filter': active_filter, 'q': q, 'status': f_status,
+                  'vertical': f_vertical, 'sort': sort, 'dir': direction,
+                  'view': view} %}
+{% include "_pagination.html" %}
+{% if total_rows > per_page %}
+<p class="form-hint" style="text-align:center; margin-top:4px;">Showing {{ rows | length }} of {{ total_rows }} proposals</p>
+{% endif %}
 {% else %}
 <div class="empty-state">
     <p>No proposals match this view. <a href="{{ url_for('new_project') }}">Start a new proposal</a> or <a href="{{ url_for('proposals_list') }}">clear filters</a>.</p>

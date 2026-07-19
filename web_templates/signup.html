@@ -36,21 +36,21 @@
                 <div class="form-row">
                     <div class="form-group">
                         <label for="username">Username *</label>
-                        <input type="text" id="username" name="username" required autofocus autocomplete="username">
+                        <input type="text" id="username" name="username" required autofocus autocomplete="username" value="{{ form.get('username', '') if form else '' }}">
                     </div>
                     <div class="form-group">
                         <label for="display_name">Display Name</label>
-                        <input type="text" id="display_name" name="display_name" placeholder="Your full name" autocomplete="name">
+                        <input type="text" id="display_name" name="display_name" placeholder="Your full name" autocomplete="name" value="{{ form.get('display_name', '') if form else '' }}">
                     </div>
                 </div>
                 <div class="form-group">
                     <label for="email">Email Address *</label>
-                    <input type="email" id="email" name="email" required autocomplete="email" value="{{ invitation.email if invitation else '' }}">
+                    <input type="email" id="email" name="email" required autocomplete="email" value="{{ invitation.email if invitation else (form.get('email', '') if form else '') }}">
                 </div>
                 <div class="form-group">
                     <label for="company_name">{% if invitation %}Workspace{% else %}Company Name{% endif %}</label>
                     <input type="text" id="company_name" name="company_name" autocomplete="organization"
-                           value="{{ invite_org.name if invite_org else '' }}"{% if invitation %} readonly{% endif %}>
+                           value="{{ invite_org.name if invite_org else (form.get('company_name', '') if form else '') }}"{% if invitation %} readonly{% endif %}>
                 </div>
                 <div class="form-group">
                     <label for="password">Password * <span class="form-hint">(min 8 characters)</span></label>

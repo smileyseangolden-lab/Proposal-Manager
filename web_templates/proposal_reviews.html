@@ -156,7 +156,7 @@
                 <span style="color:var(--gray-500);font-size:12px;">{{ c.section_heading }}</span>
                 {% endif %}
                 <span style="margin-left:auto;color:var(--gray-500);font-size:12px;">
-                    {{ c.author.display_name or c.author.username }} &mdash; {{ c.created_at.strftime('%Y-%m-%d %H:%M') }}
+                    {{ c.author.display_name or c.author.username }} &mdash; {{ c.created_at | localtime('full') }}
                 </span>
             </div>
 
@@ -177,7 +177,7 @@
                 <strong>Resolution:</strong> {{ c.resolution_note }}
                 <span style="color:var(--gray-500);font-size:12px;">
                     &mdash; {{ c.resolver.display_name or c.resolver.username if c.resolver else '' }}
-                    {{ c.resolved_at.strftime('%Y-%m-%d %H:%M') if c.resolved_at else '' }}
+                    {% if c.resolved_at %}{{ c.resolved_at | localtime('full') }}{% endif %}
                 </span>
             </div>
             {% endif %}

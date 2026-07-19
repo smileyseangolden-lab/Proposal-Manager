@@ -10,6 +10,7 @@
 </head>
 <body{% if not current_user.is_authenticated %} class="auth-page"{% endif %}>
     {% if current_user.is_authenticated %}
+    <a class="skip-link" href="#main-content">Skip to main content</a>
     <aside class="sidebar">
         <div class="sidebar-brand">
             <a href="{{ url_for('dashboard') }}">
@@ -18,11 +19,19 @@
             </a>
         </div>
 
-        {% set workspace_name = current_user.company_name or (current_user.display_name or current_user.username) %}
+        {% set workspace_name = nav_org_name or current_user.company_name or (current_user.display_name or current_user.username) %}
         <a class="workspace-chip" href="{{ url_for('settings') }}" title="Workspace settings">
             <span class="workspace-chip-avatar">{{ workspace_name[:1] | upper }}</span>
             <span class="workspace-chip-name">{{ workspace_name }}</span>
         </a>
+
+        {% if nav_trial_days and nav_trial_days > 0 %}
+        <a class="setup-nav-link" href="{{ url_for('billing_page') }}" title="Pro trial — {{ nav_trial_days }} day(s) left">
+            <span class="sidebar-icon">&#9201;</span>
+            <span>Pro trial</span>
+            <span class="nav-count-badge">{{ nav_trial_days }}d left</span>
+        </a>
+        {% endif %}
 
         {% if setup_progress and not setup_progress.complete %}
         <a class="setup-nav-link" href="{{ url_for('setup_wizard') }}">
@@ -32,7 +41,7 @@
         </a>
         {% endif %}
 
-        <nav class="sidebar-nav">
+        <nav class="sidebar-nav" aria-label="Primary">
             <span class="side-group-label">Work</span>
             <a href="{{ url_for('dashboard') }}" class="sidebar-link{% if request.endpoint == 'dashboard' %} active{% endif %}">
                 <span class="sidebar-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></span>
@@ -87,7 +96,7 @@
         <div class="sidebar-footer">
             <div class="sidebar-user">
                 <span class="sidebar-user-name">{{ current_user.display_name or current_user.username }}</span>
-                <span class="sidebar-user-company">{{ current_user.company_name or '' }}</span>
+                <span class="sidebar-user-company">{{ nav_org_name or '' }}</span>
             </div>
             <form method="POST" action="{{ url_for('logout') }}" style="margin:0">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -102,7 +111,7 @@
     <div class="main-wrapper">
         <header class="topbar">
             <button class="sidebar-toggle" id="sidebar-toggle" type="button" aria-label="Toggle sidebar">&#9776;</button>
-            <nav class="breadcrumb">
+            <nav class="breadcrumb" aria-label="Breadcrumb">
                 {% block breadcrumb %}<span class="crumb-current">Workspace</span>{% endblock %}
             </nav>
             <form class="topbar-search" method="get" action="{{ url_for('search') }}">
@@ -144,7 +153,7 @@
                 </div>
             </div>
         </header>
-        <main class="main-content">
+        <main class="main-content" id="main-content">
             {% if current_user.is_authenticated and not current_user.email_verified %}
             <div class="flash flash-info verify-banner">
                 Please verify your email address ({{ current_user.email }}).
@@ -158,7 +167,7 @@
             {% if messages %}
             <div class="flash-messages">
                 {% for category, message in messages %}
-                <div class="flash flash-{{ category }}">{{ message }}</div>
+                <div class="flash flash-{{ category }}" role="alert">{{ message }}</div>
                 {% endfor %}
             </div>
             {% endif %}
@@ -207,6 +216,41 @@
     {% block scripts %}{% endblock %}
     {% if current_user.is_authenticated %}
     <script>
+    (function(){
+        // Flash messages: dismiss button + auto-fade for successes (errors stay)
+        document.querySelectorAll(".flash-messages .flash").forEach(function(el){
+            var btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "flash-close";
+            btn.setAttribute("aria-label", "Dismiss message");
+            btn.innerHTML = "&times;";
+            btn.addEventListener("click", function(){ el.remove(); });
+            el.appendChild(btn);
+            if (el.classList.contains("flash-success")) {
+                setTimeout(function(){
+                    el.style.transition = "opacity 0.6s";
+                    el.style.opacity = "0";
+                    setTimeout(function(){ el.remove(); }, 700);
+                }, 6000);
+            }
+        });
+    })();
+    (function(){
+        // Localize <time data-utc> elements to the viewer's timezone.
+        document.querySelectorAll("time[data-utc]").forEach(function(el){
+            var d = new Date(el.getAttribute("data-utc"));
+            if (isNaN(d)) return;
+            var style = el.getAttribute("data-style") || "dt";
+            var opts;
+            if (style === "date") opts = {month:"short", day:"numeric", year:"numeric"};
+            else if (style === "full") opts = {month:"short", day:"numeric", year:"numeric", hour:"2-digit", minute:"2-digit"};
+            else opts = {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"};
+            try {
+                el.textContent = d.toLocaleString(undefined, opts);
+                el.title = d.toLocaleString();
+            } catch (e) { /* keep UTC fallback */ }
+        });
+    })();
     (function(){
         // CSRF: inject token into every same-origin POST form and fetch call
         var csrfToken = (document.querySelector('meta[name="csrf-token"]') || {}).content || "";
