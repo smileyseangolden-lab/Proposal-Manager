@@ -87,6 +87,10 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # P3: typed-name acceptance on the customer portal
     ("proposal_shares", "decided_by_name", "VARCHAR(200) DEFAULT ''"),
     ("proposal_shares", "decided_by_title", "VARCHAR(200) DEFAULT ''"),
+    # Two-factor auth (TOTP)
+    ("users", "totp_secret_encrypted", "TEXT DEFAULT ''"),
+    ("users", "totp_enabled", "BOOLEAN DEFAULT FALSE"),
+    ("users", "totp_backup_codes", "TEXT DEFAULT ''"),
 ]
 
 # Indexes on hot filter / foreign-key columns. CREATE INDEX IF NOT EXISTS is

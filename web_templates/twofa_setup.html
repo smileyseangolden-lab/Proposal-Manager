@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Set up Two-Factor &mdash; {{ app_name }}{% endblock %}
+{% block breadcrumb %}
+<a href="{{ url_for('settings') }}">Profile &amp; AI Settings</a>
+<span class="crumb-sep">&rsaquo;</span>
+<span class="crumb-current">Two-Factor Setup</span>
+{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <h1>Set up two-factor authentication</h1>
+    <p class="page-subtitle">Scan the QR code with an authenticator app (Google Authenticator, Authy, 1Password&hellip;), then enter the 6-digit code it shows to confirm.</p>
+</section>
+
+<div class="card" style="max-width: 560px;">
+    <div style="text-align:center; margin-bottom: 16px;">
+        <img src="{{ qr }}" alt="Two-factor QR code" width="220" height="220"
+             style="border:1px solid var(--line); border-radius:12px; padding:8px; background:#fff;">
+    </div>
+    <p class="form-hint" style="text-align:center;">Can't scan? Enter this key manually:</p>
+    <p style="text-align:center; font-family: monospace; font-size: 15px; letter-spacing: 2px; word-break: break-all;">{{ secret }}</p>
+
+    <form method="post" action="{{ url_for('twofa_enable') }}" style="margin-top: 18px;">
+        <div class="form-group">
+            <label for="code">6-digit code from your app</label>
+            <input type="text" id="code" name="code" required autofocus autocomplete="one-time-code"
+                   inputmode="numeric" placeholder="123456" style="letter-spacing:2px;">
+        </div>
+        <button type="submit" class="btn btn-primary">Confirm &amp; turn on 2FA</button>
+        <a href="{{ url_for('settings') }}" class="btn btn-secondary">Cancel</a>
+    </form>
+</div>
+{% endblock %}

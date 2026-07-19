@@ -71,6 +71,7 @@ import jobs
 import ocr
 import proposal_agent
 import storage
+import twofa
 from document_parser import parse_document
 from models import (
     ActivityLog,
@@ -1129,10 +1130,77 @@ def login():
         user.failed_login_count = 0
         user.lockout_until = None
         db.session.commit()
+
+    # Two-factor gate: password was correct, but don't authenticate yet — stash
+    # a short-lived "pending" marker (NOT a login) and require the TOTP step.
+    if user.totp_enabled:
+        session["pending_2fa_user"] = user.id
+        session["pending_2fa_at"] = time.time()
+        return redirect(url_for("login_2fa"))
+
     session.permanent = True  # apply PERMANENT_SESSION_LIFETIME idle expiry
     login_user(user)
     _log_activity("login")
     return redirect(url_for("dashboard"))
+
+
+# Pending-2FA marker is valid for this long between password and code steps.
+_TWOFA_PENDING_TTL = 600
+
+
+def _complete_login(user):
+    session.pop("pending_2fa_user", None)
+    session.pop("pending_2fa_at", None)
+    session.permanent = True
+    login_user(user)
+    _log_activity("login")
+
+
+@app.route("/login/2fa", methods=["GET", "POST"])
+def login_2fa():
+    """Second login step for accounts with TOTP enabled. Reached only after a
+    correct password sets the pending marker — never a standalone entry point."""
+    if current_user.is_authenticated:
+        return redirect(url_for("dashboard"))
+    uid = session.get("pending_2fa_user")
+    started = session.get("pending_2fa_at", 0)
+    if not uid or (time.time() - float(started or 0)) > _TWOFA_PENDING_TTL:
+        session.pop("pending_2fa_user", None)
+        session.pop("pending_2fa_at", None)
+        flash("Your sign-in timed out. Please enter your password again.", "error")
+        return redirect(url_for("login"))
+    user = db.session.get(User, uid)
+    if not user or not user.totp_enabled or user.is_active is False:
+        session.pop("pending_2fa_user", None)
+        return redirect(url_for("login"))
+
+    if request.method == "GET":
+        return render_template("login_2fa.html")
+
+    rl_key = f"2fa:{request.remote_addr}:{uid}"
+    if _login_rate_limited(rl_key):
+        flash("Too many attempts. Please wait a few minutes and try again.", "error")
+        return render_template("login_2fa.html")
+
+    code = request.form.get("code", "").strip()
+    secret = crypto_util.decrypt(user.totp_secret_encrypted)
+    if twofa.verify_code(secret, code):
+        _complete_login(user)
+        return redirect(url_for("dashboard"))
+
+    # Fall back to a single-use backup code
+    ok, new_json = twofa.consume_backup_code(user.totp_backup_codes, code)
+    if ok:
+        user.totp_backup_codes = new_json
+        db.session.commit()
+        left = twofa.backup_codes_remaining(new_json)
+        _complete_login(user)
+        flash(f"Backup code accepted — {left} backup code(s) remaining.", "success")
+        return redirect(url_for("dashboard"))
+
+    _record_login_attempt(rl_key)
+    flash("Invalid code. Try again, or use one of your backup codes.", "error")
+    return render_template("login_2fa.html")
 
 
 # ---------------------------------------------------------------------------
@@ -2281,6 +2349,8 @@ def settings():
     return render_template(
         "settings.html",
         org=db.session.get(Organization, current_user.org_id) if current_user.org_id else None,
+        twofa_enabled=current_user.totp_enabled,
+        backup_codes_left=twofa.backup_codes_remaining(current_user.totp_backup_codes),
         rate_sheets=rate_sheets,
         user_templates=user_templates,
         staff_roles=staff_roles,
@@ -2315,6 +2385,91 @@ def change_password():
     _log_activity("password_change", "Changed account password")
     flash("Password updated.", "success")
     return redirect(url_for("settings"))
+
+
+# ---------------------------------------------------------------------------
+# Two-factor authentication (TOTP)
+# ---------------------------------------------------------------------------
+
+def _twofa_setup_page(secret):
+    """Render the enrollment page for a freshly generated (unconfirmed) secret."""
+    uri = twofa.provisioning_uri(secret, current_user.email or current_user.username, issuer=APP_NAME)
+    return render_template("twofa_setup.html", secret=secret, qr=twofa.qr_data_uri(uri))
+
+
+@app.route("/settings/2fa/start", methods=["POST"])
+@login_required
+def twofa_start():
+    """Generate an (unconfirmed) secret and show the QR to scan. 2FA is not
+    active until the user confirms with a code from their authenticator."""
+    if current_user.totp_enabled:
+        flash("Two-factor authentication is already on.", "error")
+        return redirect(url_for("settings"))
+    secret = twofa.new_secret()
+    current_user.totp_secret_encrypted = crypto_util.encrypt(secret)
+    db.session.commit()
+    return _twofa_setup_page(secret)
+
+
+@app.route("/settings/2fa/enable", methods=["POST"])
+@login_required
+def twofa_enable():
+    if current_user.totp_enabled:
+        return redirect(url_for("settings"))
+    secret = crypto_util.decrypt(current_user.totp_secret_encrypted)
+    if not secret:
+        flash("Start the two-factor setup first.", "error")
+        return redirect(url_for("settings"))
+    if not twofa.verify_code(secret, request.form.get("code", "")):
+        flash("That code didn't match — check your authenticator's clock and try again.", "error")
+        return _twofa_setup_page(secret)
+    plaintext, hashes = twofa.generate_backup_codes()
+    current_user.totp_enabled = True
+    current_user.totp_backup_codes = hashes
+    db.session.commit()
+    _log_activity("2fa_enable", "Enabled two-factor authentication")
+    return render_template("twofa_backup_codes.html", codes=plaintext, first_time=True)
+
+
+@app.route("/settings/2fa/disable", methods=["POST"])
+@login_required
+def twofa_disable():
+    """Turn 2FA off. Requires re-proving identity (current password or a valid
+    code) so a hijacked open session can't silently strip the second factor."""
+    if not current_user.totp_enabled:
+        return redirect(url_for("settings"))
+    pw = request.form.get("password", "")
+    code = request.form.get("code", "").strip()
+    secret = crypto_util.decrypt(current_user.totp_secret_encrypted)
+    ok = bool(pw) and current_user.check_password(pw)
+    if not ok and code:
+        ok = twofa.verify_code(secret, code)
+    if not ok:
+        flash("Enter your current password (or a valid code) to turn off two-factor.", "error")
+        return redirect(url_for("settings"))
+    current_user.totp_enabled = False
+    current_user.totp_secret_encrypted = ""
+    current_user.totp_backup_codes = ""
+    db.session.commit()
+    _log_activity("2fa_disable", "Disabled two-factor authentication")
+    flash("Two-factor authentication is off.", "success")
+    return redirect(url_for("settings"))
+
+
+@app.route("/settings/2fa/backup-codes", methods=["POST"])
+@login_required
+def twofa_regenerate_codes():
+    if not current_user.totp_enabled:
+        return redirect(url_for("settings"))
+    secret = crypto_util.decrypt(current_user.totp_secret_encrypted)
+    if not twofa.verify_code(secret, request.form.get("code", "")):
+        flash("Enter a current code from your authenticator to regenerate backup codes.", "error")
+        return redirect(url_for("settings"))
+    plaintext, hashes = twofa.generate_backup_codes()
+    current_user.totp_backup_codes = hashes
+    db.session.commit()
+    _log_activity("2fa_backup_regen", "Regenerated 2FA backup codes")
+    return render_template("twofa_backup_codes.html", codes=plaintext, first_time=False)
 
 
 @app.route("/settings/upload-rate-sheet", methods=["POST"])

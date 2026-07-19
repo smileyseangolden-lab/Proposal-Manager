@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Backup Codes &mdash; {{ app_name }}{% endblock %}
+{% block breadcrumb %}
+<a href="{{ url_for('settings') }}">Profile &amp; AI Settings</a>
+<span class="crumb-sep">&rsaquo;</span>
+<span class="crumb-current">Backup Codes</span>
+{% endblock %}
+
+{% block content %}
+<section class="page-header">
+    <h1>{% if first_time %}Two-factor is on &mdash; save your backup codes{% else %}Your new backup codes{% endif %}</h1>
+    <p class="page-subtitle">Each code works once if you lose access to your authenticator. Store them somewhere safe &mdash; <strong>they won't be shown again.</strong></p>
+</section>
+
+<div class="card" style="max-width: 520px;">
+    <ul style="columns: 2; list-style: none; padding: 0; font-family: monospace; font-size: 16px; letter-spacing: 1px;">
+        {% for code in codes %}
+        <li style="padding: 6px 0;">{{ code }}</li>
+        {% endfor %}
+    </ul>
+    <div class="form-actions" style="margin-top: 8px;">
+        <button type="button" class="btn btn-secondary" onclick="navigator.clipboard.writeText({{ codes | tojson }}.join('\n'))">Copy all</button>
+        <a href="{{ url_for('settings') }}" class="btn btn-primary">I've saved them &rarr;</a>
+    </div>
+</div>
+{% endblock %}

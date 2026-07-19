@@ -107,6 +107,39 @@
     </form>
 </div>
 
+<div class="card" style="max-width: 760px;">
+    <h2>Two-Factor Authentication</h2>
+    {% if twofa_enabled %}
+    <p class="card-desc">
+        <span class="chip chip-ok"><span class="chip-dot"></span>On</span>
+        Your account asks for a code from your authenticator app at sign-in.
+        {{ backup_codes_left }} backup code(s) remaining.
+    </p>
+    <div style="display:flex; gap:20px; flex-wrap:wrap; margin-top:12px;">
+        <form method="post" action="{{ url_for('twofa_regenerate_codes') }}" style="flex:1; min-width:240px;">
+            <div class="form-group">
+                <label>Regenerate backup codes <span class="form-hint">(invalidates old ones)</span></label>
+                <input type="text" name="code" placeholder="Current 6-digit code" inputmode="numeric" required>
+            </div>
+            <button type="submit" class="btn btn-secondary">Regenerate codes</button>
+        </form>
+        <form method="post" action="{{ url_for('twofa_disable') }}" style="flex:1; min-width:240px;"
+              onsubmit="return confirm('Turn off two-factor authentication?');">
+            <div class="form-group">
+                <label>Turn off 2FA <span class="form-hint">(confirm your password)</span></label>
+                <input type="password" name="password" placeholder="Current password" autocomplete="current-password" required>
+            </div>
+            <button type="submit" class="btn btn-danger">Disable 2FA</button>
+        </form>
+    </div>
+    {% else %}
+    <p class="card-desc">Add a second step at sign-in using an authenticator app (Google Authenticator, Authy, 1Password&hellip;). Strongly recommended for admins.</p>
+    <form method="post" action="{{ url_for('twofa_start') }}">
+        <button type="submit" class="btn btn-primary">Set up two-factor authentication</button>
+    </form>
+    {% endif %}
+</div>
+
 <div class="posture-callout" style="max-width: 760px;">
     <span>&#128737;</span>
     <div>

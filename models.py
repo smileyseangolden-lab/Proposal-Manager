@@ -136,6 +136,13 @@ class User(UserMixin, db.Model):
     failed_login_count = db.Column(db.Integer, default=0)
     lockout_until = db.Column(db.DateTime, nullable=True)
 
+    # Two-factor auth (TOTP). Secret is encrypted at rest; backup codes are a
+    # JSON array of single-use SHA-256 hashes. totp_enabled gates the login
+    # second step (an unconfirmed enrollment stores a secret but stays False).
+    totp_secret_encrypted = db.Column(db.Text, default="")
+    totp_enabled = db.Column(db.Boolean, default=False, nullable=False)
+    totp_backup_codes = db.Column(db.Text, default="")
+
     # LLM settings — per-user overrides
     llm_provider = db.Column(db.String(50), default="anthropic")
     llm_model = db.Column(db.String(100), default="claude-opus-4-8")
