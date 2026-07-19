@@ -118,6 +118,7 @@ from models import (
 )
 from proposal_agent import (
     analyze_addendum_impact,
+    classify_vertical,
     draft_estimate,
     draft_scope_of_work,
     extract_rates_from_sheet,
@@ -3671,8 +3672,11 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
         if scope and scope.status == "approved" and scope.vertical:
             vertical = scope.vertical
         else:
-            from document_parser import detect_vertical
-            vertical = detect_vertical(combined_text)
+            set_progress("reading", "Detecting the industry vertical…")
+            vertical = classify_vertical(
+                combined_text,
+                user_api_key=decrypt_api_key(user.api_key_encrypted) or None,
+            )
 
     org_id = user.org_id
     include_staff_types = cost_options.get("include_staff_types")

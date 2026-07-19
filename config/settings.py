@@ -44,6 +44,9 @@ DEFAULT_VERTICAL = "general"
 # Anthropic
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-8")
+# Small/fast model for the vertical classifier — it runs inside generation and
+# scope drafting, so latency and cost matter more than depth there.
+CLAUDE_CLASSIFIER_MODEL = os.getenv("CLAUDE_CLASSIFIER_MODEL", "claude-haiku-4-5")
 
 # Database — Postgres in production via DATABASE_URL; SQLite fallback for dev.
 _raw_db_url = os.getenv("DATABASE_URL", "").strip()

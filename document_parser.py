@@ -79,10 +79,12 @@ def _parse_docx(path: Path) -> str:
 
 
 def detect_vertical(text: str) -> str:
-    """Auto-detect the industry vertical from RFP/RFQ text content.
+    """Keyword-scoring vertical detection — the FALLBACK classifier.
 
-    Returns the vertical key (e.g., 'data_center', 'life_science', etc.).
-    Falls back to 'general' if no strong match is found.
+    proposal_agent.classify_vertical() is the primary path (a fast LLM call);
+    it delegates here when no API key is configured or the call fails, so this
+    must stay dependency-free and never raise. Returns the vertical key
+    (e.g. 'data_center'), or 'general' if no strong match is found.
     """
     text_lower = text.lower()
 
