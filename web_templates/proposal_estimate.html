@@ -22,7 +22,8 @@
 
 <form method="post" action="{{ url_for('save_proposal_estimate', proposal_id=proposal.id) }}" id="estimate-form">
     <div class="card">
-        <table class="proposals-table" id="estimate-grid">
+        <div class="table-scroll">
+<table class="proposals-table" id="estimate-grid">
             <thead>
                 <tr>
                     <th style="width:120px;">Type</th>
@@ -56,6 +57,7 @@
                 {% endfor %}
             </tbody>
         </table>
+</div>
         <button type="button" class="btn btn-small btn-secondary" id="add-row">+ Add line</button>
 
         <div class="estimate-summary">

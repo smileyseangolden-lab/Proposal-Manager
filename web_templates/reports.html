@@ -71,7 +71,8 @@
 <div class="card">
     <h2>Performance by Vertical</h2>
     {% if vertical_stats %}
-    <table class="proposals-table">
+    <div class="table-scroll">
+<table class="proposals-table">
         <thead>
             <tr>
                 <th>Vertical</th>
@@ -102,6 +103,7 @@
             {% endfor %}
         </tbody>
     </table>
+</div>
     {% else %}
     <p class="empty-state">No projects yet.</p>
     {% endif %}
@@ -165,7 +167,8 @@
 {% if top_competitors %}
 <div class="card">
     <h2>Top Competitors</h2>
-    <table class="proposals-table">
+    <div class="table-scroll">
+<table class="proposals-table">
         <thead>
             <tr>
                 <th>Competitor</th>
@@ -193,6 +196,7 @@
         </tbody>
     </table>
 </div>
+</div>
 {% endif %}
 
 <!-- Missing details call-to-action -->
@@ -200,7 +204,8 @@
 <div class="card card-highlight">
     <h2>Fill in Missing Close Details</h2>
     <p class="card-desc">These closed projects are missing win/loss reasons or competitor info. Add context to strengthen reports.</p>
-    <table class="proposals-table">
+    <div class="table-scroll">
+<table class="proposals-table">
         <thead>
             <tr>
                 <th>Project</th>
@@ -217,14 +222,14 @@
                 <td>{{ "${:,.0f}".format(p.dollar_amount) if p.dollar_amount else '—' }}</td>
                 <td>
                     <form method="post" action="{{ url_for('update_close_details', project_id=p.id) }}" class="close-details-inline-form">
-                        <select name="close_category" class="status-select">
+                        <select name="close_category" class="status-select" aria-label="Close category for {{ p.name }}">
                             <option value="">Category…</option>
                             {% for key, label in category_labels.items() %}
                             <option value="{{ key }}" {{ 'selected' if p.close_category == key }}>{{ label }}</option>
                             {% endfor %}
                         </select>
-                        <input type="text" name="competitor_name" placeholder="Competitor" value="{{ p.competitor_name }}" class="inline-text">
-                        <input type="text" name="close_reason" placeholder="Reason / notes" value="{{ p.close_reason }}" class="inline-text inline-text-wide">
+                        <input type="text" name="competitor_name" placeholder="Competitor" value="{{ p.competitor_name }}" class="inline-text" aria-label="Competitor for {{ p.name }}">
+                        <input type="text" name="close_reason" placeholder="Reason / notes" value="{{ p.close_reason }}" class="inline-text inline-text-wide" aria-label="Close reason for {{ p.name }}">
                         <button type="submit" class="btn btn-small btn-primary">Save</button>
                     </form>
                 </td>
@@ -232,6 +237,7 @@
             {% endfor %}
         </tbody>
     </table>
+</div>
 </div>
 {% endif %}
 {% endblock %}

@@ -108,6 +108,7 @@
 {% endif %}
 {% else %}
 {% if rows %}
+<div class="table-scroll">
 <table class="proposals-table">
     <thead>
         <tr>
@@ -191,6 +192,7 @@
         {% endfor %}
     </tbody>
 </table>
+</div>
 {% set pg_args = {'filter': active_filter, 'q': q, 'status': f_status,
                   'vertical': f_vertical, 'sort': sort, 'dir': direction,
                   'view': view} %}

@@ -39,7 +39,8 @@
     </form>
 
     {% if pending_invitations %}
-    <table class="mini-table" style="margin-top:16px;">
+    <div class="table-scroll">
+<table class="mini-table" style="margin-top:16px;">
         <thead><tr><th>Pending invitation</th><th>Role</th><th>Invited</th><th></th></tr></thead>
         <tbody>
         {% for inv in pending_invitations %}
@@ -56,6 +57,7 @@
         {% endfor %}
         </tbody>
     </table>
+</div>
     {% endif %}
 </div>
 
@@ -124,7 +126,8 @@
 <div class="card">
     <h2>Rep Performance</h2>
     <p class="card-desc">Track each user's project pipeline, win/loss record, and proposal generation activity.</p>
-    <table class="proposals-table">
+    <div class="table-scroll">
+<table class="proposals-table">
         <thead>
             <tr>
                 <th>Rep Name</th>
@@ -186,6 +189,7 @@
             {% endfor %}
         </tbody>
     </table>
+</div>
 </div>
 
 <!-- Single sign-on -->
@@ -251,7 +255,8 @@
             </span>
         </div>
     </div>
-    <table class="mini-table">
+    <div class="table-scroll">
+<table class="mini-table">
         <thead><tr><th>User</th><th>Role</th><th>Action</th><th>Detail</th><th>Time</th></tr></thead>
         <tbody>
         {% for log in recent_activity %}
@@ -265,5 +270,6 @@
         {% endfor %}
         </tbody>
     </table>
+</div>
 </div>
 {% endblock %}
