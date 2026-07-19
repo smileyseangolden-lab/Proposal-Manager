@@ -1,0 +1,46 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+# A superseded push cancels the older in-flight run for the same ref.
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"  # matches the python:3.12-slim Docker base
+          cache: pip
+
+      - name: Install Tesseract OCR
+        # test_ocr's real-recognition checks SKIP gracefully without it;
+        # installing it makes CI exercise the full OCR path like production.
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run all test suites
+        # Every suite is a standalone script (python test_X.py, exit code 0/1).
+        # Run them ALL even after a failure so one broken suite doesn't hide
+        # the state of the others; fail the job if any failed.
+        run: |
+          rc=0
+          for t in test_*.py; do
+            echo "::group::$t"
+            if ! python "$t"; then
+              rc=1
+              echo "::error title=$t failed::$t exited non-zero"
+            fi
+            echo "::endgroup::"
+          done
+          exit $rc

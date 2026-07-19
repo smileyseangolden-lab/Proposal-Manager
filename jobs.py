@@ -164,10 +164,23 @@ def reap_stale_jobs():
         logger.warning("Reaped %d stale running job(s)", len(stale))
 
 
+def _job_context():
+    """Execution context for jobs running outside the request cycle.
+
+    A *request* context (not a bare app context): handlers finish by building
+    their redirect with url_for(), which raises outside a request context
+    unless SERVER_NAME is configured — and it isn't. Under a bare app_context
+    every handler would do all its work, commit, then die on the final
+    url_for and mark the job "failed". Inline runs (tests / JOBS_INLINE)
+    execute inside the enqueuing request and never hit this.
+    """
+    return _app.test_request_context()
+
+
 def _worker_loop():
     while True:
         try:
-            with _app.app_context():
+            with _job_context():
                 reap_stale_jobs()
                 job_id = _claim()
                 if job_id:

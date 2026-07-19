@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Working… — {{ app_name }}{% endblock %}
-{% block breadcrumb %}<span class="crumb-current">Generating proposal</span>{% endblock %}
+{% block breadcrumb %}<span class="crumb-current">{{ kind_label or "Working" }}</span>{% endblock %}
 
 {% block content %}
 <div class="page-narrow">
@@ -72,7 +72,7 @@
           stopElapsed();
           if (cancelForm) cancelForm.style.display = "none";
           titleEl.textContent = "Done!";
-          phaseEl.textContent = "Redirecting to your proposal…";
+          phaseEl.textContent = "Redirecting…";
           window.location.href = d.redirect;
           return;
         }

@@ -118,6 +118,7 @@ from models import (
 )
 from proposal_agent import (
     analyze_addendum_impact,
+    classify_vertical,
     draft_estimate,
     draft_scope_of_work,
     extract_rates_from_sheet,
@@ -433,6 +434,27 @@ def _signup_rate_limited(ip: str) -> bool:
 
 def _record_signup(ip: str):
     _SIGNUP_ATTEMPTS.setdefault(ip, []).append(time.time())
+
+
+# Forgot-password throttle: the endpoint is unauthenticated and sends email,
+# which makes it both an inbox-bombing vector (spam a victim with reset mail)
+# and an SMTP-budget drain. Limited per requesting IP and per target email;
+# throttled requests still get the same generic response so a prober can't
+# tell the difference.
+_RESET_REQUESTS: dict[str, list[float]] = {}
+_RESET_MAX_PER_WINDOW = 5
+_RESET_WINDOW_SECONDS = 3600
+
+
+def _reset_rate_limited(key: str) -> bool:
+    now = time.time()
+    attempts = [t for t in _RESET_REQUESTS.get(key, []) if now - t < _RESET_WINDOW_SECONDS]
+    _RESET_REQUESTS[key] = attempts
+    return len(attempts) >= _RESET_MAX_PER_WINDOW
+
+
+def _record_reset_request(key: str):
+    _RESET_REQUESTS.setdefault(key, []).append(time.time())
 
 
 # In-process AI-endpoint throttle (chat / editor assist) per user.
@@ -1392,6 +1414,16 @@ def forgot_password():
     email = request.form.get("email", "").strip().lower()
     # Always show the same message to avoid leaking which emails exist
     generic = "If an account exists for that email, a reset link has been sent."
+    if not app.testing and (
+        _reset_rate_limited(f"ip:{request.remote_addr}")
+        or (email and _reset_rate_limited(f"em:{email}"))
+    ):
+        # Same response as success — no token issued, no email sent
+        flash(generic, "success")
+        return redirect(url_for("login"))
+    _record_reset_request(f"ip:{request.remote_addr}")
+    if email:
+        _record_reset_request(f"em:{email}")
     user = User.query.filter(_email_matches(email)).first() if email else None
     if user:
         raw = _issue_token(user, "reset", hours=2)
@@ -2621,7 +2653,9 @@ _INGEST_TARGETS = {
 @app.route("/posture/ingest-rates", methods=["POST"])
 @login_required
 def ingest_rates():
-    """Parse an uploaded rate sheet and AI-map it into structured rows for review."""
+    """Accept a rate-sheet upload and hand the AI extraction to a background
+    job — the Claude mapping call takes long enough to hold a web worker.
+    The review screen then reads the extracted rows from the job's result."""
     file = request.files.get("ingest_file")
     target = request.form.get("target_type", "labor_rates")
     if target not in _INGEST_TARGETS:
@@ -2633,7 +2667,32 @@ def ingest_rates():
         flash("Please upload an Excel, CSV, PDF, or Word file.", "error")
         return redirect(url_for("posture"))
 
+    # Abuse gate: platform-key AI requires a verified email
+    ok, msg = _platform_ai_gate()
+    if not ok:
+        flash(msg, "error")
+        return redirect(url_for("posture") + _INGEST_TARGETS[target]["anchor"])
+
     safe, path, size = _save_upload(file, f"ingest/{current_user.org_id}")
+    job = jobs.enqueue(
+        "ingest_rates",
+        {"path": path, "source_name": safe, "target": target},
+        user_id=current_user.id,
+        org_id=current_user.org_id,
+    )
+    return redirect(url_for("job_status_page", job_id=job.id))
+
+
+def _perform_rates_ingest(payload, job, set_progress):
+    """Parse an uploaded rate sheet and AI-map it into structured rows for
+    review. Runs inside a background job; rows land in job.result and the
+    /posture/ingest-review/<job_id> page renders them for confirmation."""
+    path = payload["path"]
+    target = payload["target"]
+    user = db.session.get(User, job.user_id)
+
+    set_progress("reading", "Reading the uploaded file…")
+    storage.ensure_local(path)
     try:
         if path.lower().endswith((".xlsx", ".xls")):
             parsed = parse_rate_sheet(path)
@@ -2641,33 +2700,41 @@ def ingest_rates():
         elif path.lower().endswith(".csv"):
             raw_text = Path(path).read_text(encoding="utf-8", errors="replace")
         else:
-            raw_text = parse_document(path)
+            # Scanned PDFs are fair game here — OCR is allowed inside jobs.
+            raw_text = parse_document(path, ocr=True)
     except Exception as e:
-        flash(f"Could not read the file: {e}", "error")
-        return redirect(url_for("posture") + _INGEST_TARGETS[target]["anchor"])
+        raise RuntimeError(f"Could not read the file: {e}")
 
+    set_progress("drafting", "Claude is mapping rows for your review…")
     try:
         rows = extract_rates_from_sheet(
             raw_text, target,
-            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
-            user_model=current_user.llm_model or None,
+            user_api_key=decrypt_api_key(user.api_key_encrypted) or None,
+            user_model=user.llm_model or None,
         )
-    except RuntimeError as e:
-        flash(str(e), "error")
-        return redirect(url_for("posture") + _INGEST_TARGETS[target]["anchor"])
+    except RuntimeError:
+        raise
     except Exception as e:
-        flash(f"Extraction failed: {friendly_api_error(e)}", "error")
-        return redirect(url_for("posture") + _INGEST_TARGETS[target]["anchor"])
+        raise RuntimeError(f"Extraction failed: {friendly_api_error(e)}")
 
     if not rows:
-        flash("The AI couldn't find any rows to import. You can still add rates manually.", "error")
-        return redirect(url_for("posture") + _INGEST_TARGETS[target]["anchor"])
+        raise RuntimeError(
+            "The AI couldn't find any rows to import. You can still add rates manually."
+        )
+    set_progress("saving", "Preparing the review table…")
+    return {
+        "redirect": url_for("ingest_review", job_id=job.id),
+        "rows": rows,
+        "target": target,
+        "source_name": payload.get("source_name", ""),
+    }
 
-    return render_template(
-        "ingest_review.html",
-        mode="rates", target=target, meta=_INGEST_TARGETS[target],
-        rows=rows, source_name=safe,
-    )
+
+@jobs.register("ingest_rates")
+def _job_ingest_rates(payload, job):
+    def _sp(phase, message=""):
+        jobs.set_progress(job, phase, message)
+    return _perform_rates_ingest(payload, job, _sp)
 
 
 @app.route("/posture/ingest-rates/confirm", methods=["POST"])
@@ -2733,7 +2800,8 @@ def ingest_rates_confirm():
 @app.route("/posture/ingest-standards", methods=["POST"])
 @login_required
 def ingest_standards():
-    """Parse a document and propose reusable company standard blocks for review."""
+    """Accept a standards-document upload and hand the AI extraction to a
+    background job, mirroring the rates ingest flow."""
     file = request.files.get("standards_file")
     if not file or not file.filename:
         flash("Please choose a document to import.", "error")
@@ -2741,28 +2809,94 @@ def ingest_standards():
     if not _allowed_file(file.filename, INGEST_STANDARDS_EXTENSIONS):
         flash("Please upload a PDF, Word, or text document.", "error")
         return redirect(url_for("posture") + "#standards")
-    safe, path, size = _save_upload(file, f"ingest/{current_user.org_id}")
-    try:
-        text = parse_document(path)
-    except Exception as e:
-        flash(f"Could not read the document: {e}", "error")
+
+    # Abuse gate: platform-key AI requires a verified email
+    ok, msg = _platform_ai_gate()
+    if not ok:
+        flash(msg, "error")
         return redirect(url_for("posture") + "#standards")
+
+    safe, path, size = _save_upload(file, f"ingest/{current_user.org_id}")
+    job = jobs.enqueue(
+        "ingest_standards",
+        {"path": path, "source_name": safe},
+        user_id=current_user.id,
+        org_id=current_user.org_id,
+    )
+    return redirect(url_for("job_status_page", job_id=job.id))
+
+
+def _perform_standards_ingest(payload, job, set_progress):
+    """Parse a document and propose reusable company standard blocks. Runs
+    inside a background job; blocks land in job.result for the review page."""
+    path = payload["path"]
+    user = db.session.get(User, job.user_id)
+
+    set_progress("reading", "Reading the document…")
+    storage.ensure_local(path)
+    try:
+        text = parse_document(path, ocr=True)
+    except Exception as e:
+        raise RuntimeError(f"Could not read the document: {e}")
+
+    set_progress("drafting", "Claude is extracting reusable standards…")
     try:
         blocks = extract_standards(
             text,
-            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
-            user_model=current_user.llm_model or None,
+            user_api_key=decrypt_api_key(user.api_key_encrypted) or None,
+            user_model=user.llm_model or None,
         )
-    except RuntimeError as e:
-        flash(str(e), "error")
-        return redirect(url_for("posture") + "#standards")
+    except RuntimeError:
+        raise
     except Exception as e:
-        flash(f"Extraction failed: {friendly_api_error(e)}", "error")
-        return redirect(url_for("posture") + "#standards")
+        raise RuntimeError(f"Extraction failed: {friendly_api_error(e)}")
+
     if not blocks:
-        flash("The AI couldn't extract standards from that document.", "error")
-        return redirect(url_for("posture") + "#standards")
-    return render_template("ingest_review.html", mode="standards", blocks=blocks, source_name=safe)
+        raise RuntimeError("The AI couldn't extract standards from that document.")
+    set_progress("saving", "Preparing the review list…")
+    return {
+        "redirect": url_for("ingest_review", job_id=job.id),
+        "blocks": blocks,
+        "source_name": payload.get("source_name", ""),
+    }
+
+
+@jobs.register("ingest_standards")
+def _job_ingest_standards(payload, job):
+    def _sp(phase, message=""):
+        jobs.set_progress(job, phase, message)
+    return _perform_standards_ingest(payload, job, _sp)
+
+
+@app.route("/posture/ingest-review/<job_id>")
+@login_required
+def ingest_review(job_id):
+    """Review screen for a finished AI import job (rates or standards). The
+    extracted rows live in the job's result; the confirm POST (unchanged)
+    imports whatever the user keeps after editing."""
+    job = db.session.get(BackgroundJob, job_id)
+    if not job or job.user_id != current_user.id:
+        abort(404)
+    if job.kind not in ("ingest_rates", "ingest_standards") or job.status != "done":
+        abort(404)
+    try:
+        result = json.loads(job.result or "{}")
+    except ValueError:
+        result = {}
+    if job.kind == "ingest_rates":
+        target = result.get("target")
+        if target not in _INGEST_TARGETS:
+            abort(404)
+        return render_template(
+            "ingest_review.html",
+            mode="rates", target=target, meta=_INGEST_TARGETS[target],
+            rows=result.get("rows") or [], source_name=result.get("source_name", ""),
+        )
+    return render_template(
+        "ingest_review.html",
+        mode="standards", blocks=result.get("blocks") or [],
+        source_name=result.get("source_name", ""),
+    )
 
 
 @app.route("/posture/ingest-standards/confirm", methods=["POST"])
@@ -3569,8 +3703,11 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
         if scope and scope.status == "approved" and scope.vertical:
             vertical = scope.vertical
         else:
-            from document_parser import detect_vertical
-            vertical = detect_vertical(combined_text)
+            set_progress("reading", "Detecting the industry vertical…")
+            vertical = classify_vertical(
+                combined_text,
+                user_api_key=decrypt_api_key(user.api_key_encrypted) or None,
+            )
 
     org_id = user.org_id
     include_staff_types = cost_options.get("include_staff_types")
@@ -3888,13 +4025,27 @@ def _job_generate_proposal(payload, job):
     )
 
 
+# Human labels for the progress page, keyed by BackgroundJob.kind
+_JOB_KIND_LABELS = {
+    "generate_proposal": "Generating proposal",
+    "draft_scope": "Drafting scope of work",
+    "draft_estimate": "Drafting estimate",
+    "revise_proposal": "Applying revisions",
+    "analyze_addendum": "Analyzing addendum",
+    "regenerate_section": "Regenerating section",
+    "ingest_rates": "AI rate import",
+    "ingest_standards": "AI standards import",
+}
+
+
 @app.route("/jobs/<job_id>")
 @login_required
 def job_status_page(job_id):
     job = db.session.get(BackgroundJob, job_id)
     if not job or job.user_id != current_user.id:
         abort(404)
-    return render_template("job_status.html", job=job)
+    return render_template("job_status.html", job=job,
+                           kind_label=_JOB_KIND_LABELS.get(job.kind, "Working"))
 
 
 @app.route("/jobs/<job_id>/cancel", methods=["POST"])
@@ -7892,64 +8043,92 @@ def calendar_view():
 @app.route("/reports")
 @login_required
 def reports():
-    """Win/loss analysis, pipeline trends, vertical performance."""
-    from sqlalchemy import func
-    from collections import OrderedDict, Counter
+    """Win/loss analysis, pipeline trends, vertical performance.
+
+    Every section aggregates in SQL (grouped counts/sums, like _counts_by and
+    the admin panel) so the page stays flat-cost as a tenant's history grows —
+    previously every project row was loaded into Python and bucketed there,
+    which degraded linearly and would eventually blow the request out of
+    memory on a large org."""
+    from sqlalchemy import case, func
+    from collections import OrderedDict
 
     # Admins see company-wide; other users see own + assigned
     if current_user.is_admin:
-        base_query = Project.query.filter_by(org_id=current_user.org_id)
+        scope = [Project.org_id == current_user.org_id]
     else:
-        base_query = Project.query.filter(_my_projects_filter())
+        scope = [_my_projects_filter()]
+    decided = Project.status.in_(("won", "lost"))
+    amount = func.coalesce(func.sum(Project.dollar_amount), 0.0)
 
-    all_projects = base_query.all()
-
-    # Overall stats
-    won_projects = [p for p in all_projects if p.status == "won"]
-    lost_projects = [p for p in all_projects if p.status == "lost"]
-    total_won = len(won_projects)
-    total_lost = len(lost_projects)
+    # Overall stats: one pass grouped by status
+    by_status = {
+        status: {"count": count, "value": value or 0}
+        for status, count, value in (
+            db.session.query(Project.status, func.count(Project.id), amount)
+            .filter(*scope).group_by(Project.status).all()
+        )
+    }
+    total_won = by_status.get("won", {}).get("count", 0)
+    total_lost = by_status.get("lost", {}).get("count", 0)
     total_decided = total_won + total_lost
-    overall_win_rate = round((total_won / total_decided) * 100) if total_decided else 0
-    won_value = sum(p.dollar_amount or 0 for p in won_projects)
-    lost_value = sum(p.dollar_amount or 0 for p in lost_projects)
+    stats = {
+        "total_projects": sum(e["count"] for e in by_status.values()),
+        "total_active": by_status.get("active", {}).get("count", 0),
+        "total_submitted": by_status.get("submitted", {}).get("count", 0),
+        "total_won": total_won,
+        "total_lost": total_lost,
+        "win_rate": round((total_won / total_decided) * 100) if total_decided else 0,
+        "won_value": by_status.get("won", {}).get("value", 0),
+        "lost_value": by_status.get("lost", {}).get("value", 0),
+    }
 
-    # Win/loss by vertical
+    # Win/loss by vertical: grouped by (label, status). NULL and "" both
+    # collapse to "General", matching the old `label or "General"`.
+    label_col = func.coalesce(func.nullif(Project.vertical_label, ""), "General")
     vertical_stats = {}
-    for p in all_projects:
-        label = p.vertical_label or "General"
-        vs = vertical_stats.setdefault(label, {"won": 0, "lost": 0, "won_value": 0, "lost_value": 0, "active": 0})
-        if p.status == "won":
-            vs["won"] += 1
-            vs["won_value"] += p.dollar_amount or 0
-        elif p.status == "lost":
-            vs["lost"] += 1
-            vs["lost_value"] += p.dollar_amount or 0
-        elif p.status == "active":
-            vs["active"] += 1
-
-    for label, vs in vertical_stats.items():
-        decided = vs["won"] + vs["lost"]
-        vs["win_rate"] = round((vs["won"] / decided) * 100) if decided else 0
+    for label, status, count, value in (
+        db.session.query(label_col, Project.status, func.count(Project.id), amount)
+        .filter(*scope).group_by(label_col, Project.status).all()
+    ):
+        vs = vertical_stats.setdefault(
+            label, {"won": 0, "lost": 0, "won_value": 0, "lost_value": 0, "active": 0}
+        )
+        if status == "won":
+            vs["won"], vs["won_value"] = count, value or 0
+        elif status == "lost":
+            vs["lost"], vs["lost_value"] = count, value or 0
+        elif status == "active":
+            vs["active"] = count
+    for vs in vertical_stats.values():
+        vertical_decided = vs["won"] + vs["lost"]
+        vs["win_rate"] = round((vs["won"] / vertical_decided) * 100) if vertical_decided else 0
         vs["total_value"] = vs["won_value"] + vs["lost_value"]
+    # Biggest book of business first (was arbitrary iteration order)
+    vertical_stats = dict(
+        sorted(vertical_stats.items(), key=lambda kv: (-kv[1]["total_value"], kv[0]))
+    )
 
-    # Top competitors
-    competitor_counter = Counter()
-    competitor_wins = Counter()
-    for p in won_projects + lost_projects:
-        if p.competitor_name:
-            competitor_counter[p.competitor_name] += 1
-            if p.status == "won":
-                competitor_wins[p.competitor_name] += 1
+    # Top competitors: grouped, capped in SQL
     top_competitors = []
-    for name, total in competitor_counter.most_common(10):
-        wins = competitor_wins.get(name, 0)
-        losses = total - wins
+    for name, total, wins in (
+        db.session.query(
+            Project.competitor_name,
+            func.count(Project.id),
+            func.sum(case((Project.status == "won", 1), else_=0)),
+        )
+        .filter(*scope, decided,
+                Project.competitor_name.isnot(None), Project.competitor_name != "")
+        .group_by(Project.competitor_name)
+        .order_by(func.count(Project.id).desc(), Project.competitor_name.asc())
+        .limit(10).all()
+    ):
+        wins = int(wins or 0)
         top_competitors.append({
             "name": name,
             "total": total,
             "wins": wins,
-            "losses": losses,
+            "losses": total - wins,
             "win_rate": round((wins / total) * 100) if total else 0,
         })
 
@@ -7965,60 +8144,60 @@ def reports():
     }
     won_category_counts = {k: 0 for k in category_labels}
     lost_category_counts = {k: 0 for k in category_labels}
-    for p in won_projects:
-        key = p.close_category or "other"
-        if key in won_category_counts:
-            won_category_counts[key] += 1
-    for p in lost_projects:
-        key = p.close_category or "other"
-        if key in lost_category_counts:
-            lost_category_counts[key] += 1
+    cat_col = func.coalesce(func.nullif(Project.close_category, ""), "other")
+    for status, key, count in (
+        db.session.query(Project.status, cat_col, func.count(Project.id))
+        .filter(*scope, decided).group_by(Project.status, cat_col).all()
+    ):
+        target = won_category_counts if status == "won" else lost_category_counts
+        if key in target:  # unknown categories are dropped, as before
+            target[key] += count
 
-    # Monthly trend (last 6 months of closures)
-    from datetime import timedelta
+    # Monthly trend (last 6 calendar months of closures), bucketed in SQL
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     trend = OrderedDict()
     for i in range(5, -1, -1):
-        # Approximate by calendar month
         m = now.month - i
         y = now.year
         while m <= 0:
             m += 12
             y -= 1
-        key = f"{y}-{m:02d}"
-        trend[key] = {"won": 0, "lost": 0, "won_value": 0, "lost_value": 0}
+        trend[f"{y}-{m:02d}"] = {"won": 0, "lost": 0, "won_value": 0, "lost_value": 0}
+    oldest_year, oldest_month = (int(x) for x in next(iter(trend)).split("-"))
+    window_start = datetime(oldest_year, oldest_month, 1)
 
-    for p in won_projects + lost_projects:
-        when = p.closed_at or p.submitted_at or p.updated_at
-        if not when:
+    closed_when = func.coalesce(Project.closed_at, Project.submitted_at, Project.updated_at)
+    if db.engine.dialect.name == "postgresql":
+        month_col = func.to_char(closed_when, "YYYY-MM")
+    else:  # sqlite
+        month_col = func.strftime("%Y-%m", closed_when)
+    for key, status, count, value in (
+        db.session.query(month_col, Project.status, func.count(Project.id), amount)
+        .filter(*scope, decided, closed_when >= window_start)
+        .group_by(month_col, Project.status).all()
+    ):
+        if key not in trend:
             continue
-        when = when.replace(tzinfo=None) if when.tzinfo else when
-        key = f"{when.year}-{when.month:02d}"
-        if key in trend:
-            if p.status == "won":
-                trend[key]["won"] += 1
-                trend[key]["won_value"] += p.dollar_amount or 0
-            else:
-                trend[key]["lost"] += 1
-                trend[key]["lost_value"] += p.dollar_amount or 0
+        if status == "won":
+            trend[key]["won"], trend[key]["won_value"] = count, value or 0
+        else:
+            trend[key]["lost"], trend[key]["lost_value"] = count, value or 0
 
-    # Recently closed projects with missing details (prompt user to fill in)
-    missing_details = [
-        p for p in (won_projects + lost_projects)
-        if not (p.close_reason or p.close_category or p.competitor_name)
-    ]
-    missing_details.sort(key=lambda p: p.closed_at or p.updated_at or now, reverse=True)
+    # Recently closed projects with missing details (prompt user to fill in) —
+    # filtered, ordered, and capped in SQL instead of materializing every row.
+    def _blank(col):
+        return db.or_(col.is_(None), col == "")
 
-    stats = {
-        "total_projects": len(all_projects),
-        "total_active": sum(1 for p in all_projects if p.status == "active"),
-        "total_submitted": sum(1 for p in all_projects if p.status == "submitted"),
-        "total_won": total_won,
-        "total_lost": total_lost,
-        "win_rate": overall_win_rate,
-        "won_value": won_value,
-        "lost_value": lost_value,
-    }
+    missing_details = (
+        Project.query.filter(
+            *scope, decided,
+            _blank(Project.close_reason),
+            _blank(Project.close_category),
+            _blank(Project.competitor_name),
+        )
+        .order_by(func.coalesce(Project.closed_at, Project.updated_at).desc())
+        .limit(10).all()
+    )
 
     return render_template(
         "reports.html",
@@ -8029,7 +8208,7 @@ def reports():
         lost_category_counts=lost_category_counts,
         category_labels=category_labels,
         trend=trend,
-        missing_details=missing_details[:10],
+        missing_details=missing_details,
     )
 
 
@@ -8743,79 +8922,125 @@ def record_rfi_response(project_id, item_id):
 @app.route("/projects/<project_id>/addendum-analysis", methods=["POST"])
 @login_required
 def addendum_analysis(project_id):
-    """Analyze a newly uploaded addendum against existing proposal."""
+    """Analyze a newly uploaded addendum against the existing proposal — the
+    document parsing (possibly OCR) plus the AI comparison take minutes, so
+    the work runs as a background job. Cheap validations happen here first so
+    the user gets an immediate error instead of a failed job."""
     project = db.session.get(Project, project_id)
     if not _can_access_project(project):
         abort(404)
 
-    addendum_doc_id = request.form.get("addendum_doc_id")
-    addendum_doc = db.session.get(ProjectDocument, addendum_doc_id)
-    if not addendum_doc:
+    # Abuse gate: platform-key AI requires a verified email
+    ok, msg = _platform_ai_gate()
+    if not ok:
+        flash(msg, "error")
+        return redirect(url_for("project_upload", project_id=project_id))
+
+    addendum_doc_id = request.form.get("addendum_doc_id") or ""
+    addendum_doc = db.session.get(ProjectDocument, addendum_doc_id) if addendum_doc_id else None
+    # The doc must belong to THIS project — a foreign id would otherwise pull
+    # another tenant's document into the analysis.
+    if not addendum_doc or addendum_doc.project_id != project_id:
         flash("Addendum document not found.", "error")
         return redirect(url_for("project_upload", project_id=project_id))
 
-    # Get original RFP text
-    rfp_docs = ProjectDocument.query.filter_by(project_id=project_id, file_type="rfp").all()
-    original_rfp_text = ""
-    for doc in rfp_docs:
-        if doc.id != addendum_doc_id:
-            try:
-                storage.ensure_local(doc.file_path)
-                original_rfp_text += parse_document(doc.file_path) + "\n"
-            except Exception:
-                continue
-
-    # Get addendum text
-    try:
-        storage.ensure_local(addendum_doc.file_path)
-        addendum_text = parse_document(addendum_doc.file_path)
-    except Exception:
-        flash("Could not parse addendum document.", "error")
-        return redirect(url_for("project_upload", project_id=project_id))
-
-    # Get current proposal (DB version first; file fallback)
-    proposal = Proposal.query.filter_by(project_id=project_id).order_by(Proposal.generated_at.desc()).first()
-    current_md = _proposal_markdown(proposal) if proposal else ""
-
-    if not current_md:
+    proposal = (
+        Proposal.query.filter_by(project_id=project_id)
+        .order_by(Proposal.generated_at.desc()).first()
+    )
+    if not proposal or not _proposal_markdown(proposal):
         flash("No existing proposal to analyze against.", "error")
         return redirect(url_for("project_upload", project_id=project_id))
 
+    job = jobs.enqueue(
+        "analyze_addendum",
+        {"project_id": project_id, "addendum_doc_id": addendum_doc_id},
+        user_id=current_user.id,
+        org_id=current_user.org_id,
+    )
+    return redirect(url_for("job_status_page", job_id=job.id))
+
+
+def _perform_addendum_analysis(project_id, addendum_doc_id, user, set_progress):
+    """Parse the addendum + original RFP, run the AI impact comparison, and
+    file each impact into the clarification register. Runs inside a job."""
+    project = db.session.get(Project, project_id)
+    if not project:
+        raise RuntimeError("Project no longer exists.")
+    addendum_doc = db.session.get(ProjectDocument, addendum_doc_id)
+    if not addendum_doc or addendum_doc.project_id != project_id:
+        raise RuntimeError("Addendum document not found.")
+
+    set_progress("reading", "Reading the addendum and original RFP…")
+    original_rfp_text = ""
+    for doc in ProjectDocument.query.filter_by(project_id=project_id, file_type="rfp").all():
+        if doc.id == addendum_doc_id:
+            continue
+        try:
+            storage.ensure_local(doc.file_path)
+            original_rfp_text += parse_document(doc.file_path, ocr=True) + "\n"
+        except Exception:
+            continue
+
+    try:
+        storage.ensure_local(addendum_doc.file_path)
+        addendum_text = parse_document(addendum_doc.file_path, ocr=True)
+    except Exception:
+        raise RuntimeError("Could not parse the addendum document.")
+
+    # Current proposal content (DB-canonical)
+    proposal = (
+        Proposal.query.filter_by(project_id=project_id)
+        .order_by(Proposal.generated_at.desc()).first()
+    )
+    current_md = _proposal_markdown(proposal) if proposal else ""
+    if not current_md:
+        raise RuntimeError("No existing proposal to analyze against.")
+
+    set_progress("drafting", "Claude is comparing the addendum against your proposal…")
     try:
         result = analyze_addendum_impact(
             original_rfp_text, addendum_text, current_md,
-            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
-            user_model=current_user.llm_model or None,
+            user_api_key=decrypt_api_key(user.api_key_encrypted) or None,
+            user_model=user.llm_model or None,
         )
-
-        # Create ClarificationItems for each identified change
-        for change in result.get("changes", []):
-            ci = ClarificationItem(
-                project_id=project_id,
-                proposal_id=proposal.id if proposal else None,
-                source="addendum",
-                resolution_path="internal" if change.get("can_ai_resolve") else "internal",
-                category="scope",
-                priority=change.get("severity", "medium"),
-                question=change.get("addendum_item", ""),
-                context=change.get("impact_description", ""),
-                ai_suggestion=change.get("suggested_resolution", ""),
-                proposal_section=", ".join(change.get("affected_sections", [])),
-                status="open",
-                created_by=current_user.id,
-            )
-            db.session.add(ci)
-
-        project.clarification_sub_status = "clarification_pending"
-        db.session.commit()
-
-        _log_activity("addendum_analysis", f"Analyzed addendum: {len(result.get('changes', []))} impacts found", project_id)
-        flash(f"Addendum analysis complete: {len(result.get('changes', []))} impact(s) identified and added to clarification register.", "success")
-
+    except RuntimeError:
+        raise
     except Exception as e:
-        flash(f"Error analyzing addendum: {friendly_api_error(e)}", "error")
+        raise RuntimeError(friendly_api_error(e))
 
-    return redirect(url_for("clarification_register", project_id=project_id))
+    set_progress("saving", "Filing impacts in the clarification register…")
+    changes = result.get("changes", [])
+    for change in changes:
+        db.session.add(ClarificationItem(
+            project_id=project_id,
+            proposal_id=proposal.id,
+            source="addendum",
+            resolution_path="internal",
+            category="scope",
+            priority=change.get("severity", "medium"),
+            question=change.get("addendum_item", ""),
+            context=change.get("impact_description", ""),
+            ai_suggestion=change.get("suggested_resolution", ""),
+            proposal_section=", ".join(change.get("affected_sections", [])),
+            status="open",
+            created_by=user.id,
+        ))
+    project.clarification_sub_status = "clarification_pending"
+    db.session.commit()
+
+    _log_activity_for(user, "addendum_analysis",
+                      f"Analyzed addendum: {len(changes)} impacts found", project_id)
+    return {"redirect": url_for("clarification_register", project_id=project_id)}
+
+
+@jobs.register("analyze_addendum")
+def _job_analyze_addendum(payload, job):
+    user = db.session.get(User, job.user_id)
+    def _sp(phase, message=""):
+        jobs.set_progress(job, phase, message)
+    return _perform_addendum_analysis(
+        payload["project_id"], payload["addendum_doc_id"], user, _sp)
 
 
 # ---------------------------------------------------------------------------
@@ -8825,7 +9050,10 @@ def addendum_analysis(project_id):
 @app.route("/proposal/<proposal_id>/regenerate-section", methods=["POST"])
 @login_required
 def regenerate_proposal_section(proposal_id):
-    """Regenerate a specific section of the proposal with new clarification info."""
+    """Regenerate a specific section of the proposal with new clarification
+    info — the AI rewrite runs as a background job. Validations that need no
+    AI (missing fields, heading not present) fail fast here instead of
+    burning a job and tokens."""
     proposal = db.session.get(Proposal, proposal_id)
     if not proposal:
         abort(404)
@@ -8833,88 +9061,131 @@ def regenerate_proposal_section(proposal_id):
     if not _can_access_project(project):
         abort(404)
 
+    # Abuse gate: platform-key AI requires a verified email
+    ok, msg = _platform_ai_gate()
+    if not ok:
+        flash(msg, "error")
+        return redirect(url_for("edit_proposal", proposal_id=proposal_id))
+
     section_heading = request.form.get("section_heading", "").strip()
     clarification_answer = request.form.get("clarification_answer", "").strip()
-
     if not section_heading or not clarification_answer:
         flash("Section heading and clarification info are required.", "error")
         return redirect(url_for("edit_proposal", proposal_id=proposal_id))
 
-    # Get current proposal content (DB version first; file fallback)
-    md_path = GENERATED_DIR / proposal.md_file
     current_md = _proposal_markdown(proposal)
+    if not current_md:
+        flash("Proposal has no content to regenerate.", "error")
+        return redirect(url_for("edit_proposal", proposal_id=proposal_id))
+    if section_heading not in current_md:
+        # The replacement regex matches the heading literally — a typo would
+        # previously spend the AI call and then silently save an unchanged copy.
+        flash(f"Couldn't find '{section_heading}' in the proposal. "
+              "Copy the heading exactly as it appears in the document.", "error")
+        return redirect(url_for("edit_proposal", proposal_id=proposal_id))
 
-    # Get original RFP text for context
-    rfp_docs = ProjectDocument.query.filter_by(project_id=proposal.project_id, file_type="rfp").all()
+    job = jobs.enqueue(
+        "regenerate_section",
+        {"proposal_id": proposal_id, "section_heading": section_heading,
+         "clarification_answer": clarification_answer},
+        user_id=current_user.id,
+        org_id=current_user.org_id,
+    )
+    return redirect(url_for("job_status_page", job_id=job.id))
+
+
+def _perform_section_regeneration(proposal_id, user, section_heading,
+                                  clarification_answer, set_progress):
+    """AI-rewrite one section and save the result as a new version. Runs
+    inside a background job."""
+    proposal = db.session.get(Proposal, proposal_id)
+    if not proposal:
+        raise RuntimeError("Proposal no longer exists.")
+    project = db.session.get(Project, proposal.project_id)
+
+    current_md = _proposal_markdown(proposal)
+    if not current_md:
+        raise RuntimeError("Proposal has no content to regenerate.")
+
+    set_progress("reading", "Reading the RFP for context…")
     rfp_text = ""
-    for doc in rfp_docs:
+    for doc in ProjectDocument.query.filter_by(
+            project_id=proposal.project_id, file_type="rfp").all():
         try:
             storage.ensure_local(doc.file_path)
-            rfp_text += parse_document(doc.file_path) + "\n"
+            rfp_text += parse_document(doc.file_path, ocr=True) + "\n"
         except Exception:
             continue
 
+    _sec_org = _org_for_project(project)
+    set_progress("drafting", f"Claude is rewriting '{section_heading}'…")
     try:
-        _sec_org = _org_for_project(project)
         result = regenerate_section(
             full_proposal_md=current_md,
             section_heading=section_heading,
             clarification_answer=clarification_answer,
             original_rfp_text=rfp_text,
             company_name=(_sec_org.name if _sec_org else ""),
-            user_api_key=decrypt_api_key(current_user.api_key_encrypted) or None,
-            user_model=current_user.llm_model or None,
+            user_api_key=decrypt_api_key(user.api_key_encrypted) or None,
+            user_model=user.llm_model or None,
         )
-
-        # Replace the section in the full proposal
-        new_section = result["section_markdown"]
-        section_pattern = re.escape(section_heading)
-        updated_md = re.sub(
-            rf"({section_pattern}.*?)(?=\n## |\Z)",
-            new_section + "\n\n",
-            current_md,
-            count=1,
-            flags=re.DOTALL,
-        )
-
-        # Save as new version
-        latest = ProposalVersion.query.filter_by(proposal_id=proposal_id).order_by(
-            ProposalVersion.version_number.desc()
-        ).first()
-        next_version = (latest.version_number + 1) if latest else 1
-
-        version = ProposalVersion(
-            proposal_id=proposal_id,
-            version_number=next_version,
-            markdown_content=updated_md,
-            edit_source="ai",
-            editor_id=current_user.id,
-            change_summary=f"AI regenerated section: {section_heading}",
-        )
-        db.session.add(version)
-
-        # Update file on disk (mirrored to object storage)
-        md_path.write_text(updated_md, encoding="utf-8")
-        storage.sync_up(md_path)
-        if proposal.docx_file:
-            docx_path = GENERATED_DIR / proposal.docx_file
-            _brand_user = project.owner or current_user
-            markdown_to_docx(updated_md, str(docx_path),
-                             **_project_brand_kwargs(project, _brand_user))
-            storage.sync_up(docx_path)
-
-        # Update action items count
-        action_items = re.findall(r"\[ACTION REQUIRED:\s*(.+?)\]", updated_md)
-        proposal.action_items_count = len(action_items)
-
-        db.session.commit()
-        _log_activity("section_regenerate", f"Regenerated section: {section_heading}", project.id)
-        flash(f"Section '{section_heading}' regenerated and saved as v{next_version}.", "success")
-
+    except RuntimeError:
+        raise
     except Exception as e:
-        flash(f"Error regenerating section: {friendly_api_error(e)}", "error")
+        raise RuntimeError(friendly_api_error(e))
 
-    return redirect(url_for("edit_proposal", proposal_id=proposal_id))
+    set_progress("saving", "Saving the new version…")
+    # Replace the section in the full proposal
+    new_section = result["section_markdown"]
+    section_pattern = re.escape(section_heading)
+    updated_md = re.sub(
+        rf"({section_pattern}.*?)(?=\n## |\Z)",
+        new_section + "\n\n",
+        current_md,
+        count=1,
+        flags=re.DOTALL,
+    )
+
+    latest = ProposalVersion.query.filter_by(proposal_id=proposal_id).order_by(
+        ProposalVersion.version_number.desc()
+    ).first()
+    next_version = (latest.version_number + 1) if latest else 1
+    db.session.add(ProposalVersion(
+        proposal_id=proposal_id,
+        version_number=next_version,
+        markdown_content=updated_md,
+        edit_source="ai",
+        editor_id=user.id,
+        change_summary=f"AI regenerated section: {section_heading}",
+    ))
+
+    # Update file on disk (mirrored to object storage)
+    md_path = GENERATED_DIR / proposal.md_file
+    md_path.write_text(updated_md, encoding="utf-8")
+    storage.sync_up(md_path)
+    if proposal.docx_file:
+        docx_path = GENERATED_DIR / proposal.docx_file
+        markdown_to_docx(updated_md, str(docx_path),
+                         **_project_brand_kwargs(project, project.owner or user))
+        storage.sync_up(docx_path)
+
+    proposal.action_items_count = len(
+        re.findall(r"\[ACTION REQUIRED:\s*(.+?)\]", updated_md))
+    db.session.commit()
+    _log_activity_for(user, "section_regenerate",
+                      f"Regenerated section: {section_heading}",
+                      project.id if project else None)
+    return {"redirect": url_for("edit_proposal", proposal_id=proposal_id)}
+
+
+@jobs.register("regenerate_section")
+def _job_regenerate_section(payload, job):
+    user = db.session.get(User, job.user_id)
+    def _sp(phase, message=""):
+        jobs.set_progress(job, phase, message)
+    return _perform_section_regeneration(
+        payload["proposal_id"], user, payload["section_heading"],
+        payload["clarification_answer"], _sp)
 
 
 # ---------------------------------------------------------------------------

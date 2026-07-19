@@ -21,6 +21,7 @@ import anthropic
 
 from config.settings import (
     ANTHROPIC_API_KEY,
+    CLAUDE_CLASSIFIER_MODEL,
     CLAUDE_MODEL,
     REFERENCE_DIR,
     TEMPLATES_DIR,
@@ -230,6 +231,62 @@ def friendly_api_error(exc: BaseException) -> str:
             f"{getattr(exc, 'message', str(exc))}"
         )
     return str(exc) or exc.__class__.__name__
+
+
+# Only this much RFP text goes to the classifier — the opening pages carry the
+# project identity, and a small excerpt keeps the call fast and cheap.
+CLASSIFIER_MAX_CHARS = 8_000
+
+
+def classify_vertical(text: str, user_api_key: str = None) -> str:
+    """Classify RFP/RFQ text into an industry vertical with a fast LLM call.
+
+    The keyword scorer (document_parser.detect_vertical) misses RFPs that
+    paraphrase — a pharma cleanroom fit-out that never says "GMP" lands in
+    'general' and loses its vertical templates. A small Claude model reads an
+    excerpt instead. The keyword scorer remains the fallback for every failure
+    path (no API key, network/API error, model unavailable, budget exhausted,
+    nonsense answer) so generation never breaks on classification.
+    """
+    from document_parser import detect_vertical
+
+    api_key = user_api_key or ANTHROPIC_API_KEY
+    if not api_key or not (text or "").strip():
+        return detect_vertical(text)
+
+    options = "\n".join(
+        f"- {key}: {cfg.get('description', '')}" for key, cfg in VERTICALS.items()
+    )
+    system_prompt = f"""You classify construction/engineering RFP/RFQ documents into one industry vertical.
+
+Choose exactly one key:
+{options}
+
+Respond with ONLY the key, nothing else (e.g. data_center). Use general when no specific vertical clearly fits."""
+
+    try:
+        client = _make_client(api_key)
+        resp = client.messages.create(
+            model=CLAUDE_CLASSIFIER_MODEL,
+            max_tokens=16,
+            system=system_prompt,
+            messages=[{
+                "role": "user",
+                "content": f"---BEGIN RFP EXCERPT---\n{text[:CLASSIFIER_MAX_CHARS]}\n---END---",
+            }],
+        )
+        answer = "".join(
+            b.text for b in resp.content if getattr(b, "type", "") == "text"
+        )
+        # Tolerate quoting/punctuation around the key ('"Data_Center".' etc.)
+        answer = re.sub(r"[^a-z_]", "", answer.strip().lower())
+        if answer in VERTICALS:
+            return answer
+    except Exception:
+        # Includes AiBudgetExceeded on purpose: the main generation call runs
+        # its own budget check and surfaces that error where the user sees it.
+        pass
+    return detect_vertical(text)
 
 
 def _build_system_prompt(vertical_key: str, vertical_resources: dict,
@@ -580,8 +637,7 @@ def draft_scope_of_work(rfp_text: str, vertical: str = "auto",
         )
 
     if vertical == "auto":
-        from document_parser import detect_vertical
-        vertical = detect_vertical(rfp_text)
+        vertical = classify_vertical(rfp_text, user_api_key=user_api_key)
     vertical_label = VERTICALS.get(vertical, {}).get("label", "General")
 
     company_line = f"You are working on behalf of **{company_name}**.\n" if company_name else ""
@@ -719,9 +775,8 @@ def generate_proposal(rfp_text: str, vertical: str = "auto",
 
     # Resolve vertical
     if vertical == "auto":
-        from document_parser import detect_vertical
         _report("detection", "Analyzing document to detect industry vertical...")
-        vertical = detect_vertical(rfp_text)
+        vertical = classify_vertical(rfp_text, user_api_key=user_api_key)
 
     vertical_label = VERTICALS.get(vertical, {}).get("label", "General")
     _report("init", f"Loading {vertical_label} templates and reference documents...")

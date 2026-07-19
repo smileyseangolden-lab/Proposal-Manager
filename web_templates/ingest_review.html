@@ -12,10 +12,11 @@
 <form method="post" action="{{ url_for('ingest_rates_confirm') }}">
     <input type="hidden" name="target_type" value="{{ target }}">
     <div class="card">
-        <table class="proposals-table">
+        <div class="table-scroll">
+<table class="proposals-table">
             <thead>
                 <tr>
-                    <th style="width:40px;"><input type="checkbox" id="check-all" checked></th>
+                    <th style="width:40px;"><input type="checkbox" id="check-all" checked aria-label="Select all rows"></th>
                     {% for key, label in meta.cols %}<th>{{ label }}</th>{% endfor %}
                 </tr>
             </thead>
@@ -24,15 +25,17 @@
                 <tr>
                     <td>
                         <input type="hidden" name="row_marker" value="{{ loop.index0 }}">
-                        <input type="checkbox" name="include" value="{{ loop.index0 }}" checked class="row-check">
+                        <input type="checkbox" name="include" value="{{ loop.index0 }}" checked class="row-check" aria-label="Include row {{ loop.index }}">
                     </td>
+                    {% set row_num = loop.index %}
                     {% for key, label in meta.cols %}
-                    <td><input type="text" name="{{ key }}" value="{{ row.get(key, '') }}" style="width:100%;"></td>
+                    <td><input type="text" name="{{ key }}" value="{{ row.get(key, '') }}" style="width:100%;" aria-label="{{ label }} (row {{ row_num }})"></td>
                     {% endfor %}
                 </tr>
                 {% endfor %}
             </tbody>
         </table>
+</div>
         <div class="form-actions">
             <button type="submit" class="btn btn-primary">Import {{ meta.label }}</button>
             <a href="{{ url_for('posture') }}{{ meta.anchor }}" class="btn btn-secondary">Cancel</a>
