@@ -436,6 +436,27 @@ def _record_signup(ip: str):
     _SIGNUP_ATTEMPTS.setdefault(ip, []).append(time.time())
 
 
+# Forgot-password throttle: the endpoint is unauthenticated and sends email,
+# which makes it both an inbox-bombing vector (spam a victim with reset mail)
+# and an SMTP-budget drain. Limited per requesting IP and per target email;
+# throttled requests still get the same generic response so a prober can't
+# tell the difference.
+_RESET_REQUESTS: dict[str, list[float]] = {}
+_RESET_MAX_PER_WINDOW = 5
+_RESET_WINDOW_SECONDS = 3600
+
+
+def _reset_rate_limited(key: str) -> bool:
+    now = time.time()
+    attempts = [t for t in _RESET_REQUESTS.get(key, []) if now - t < _RESET_WINDOW_SECONDS]
+    _RESET_REQUESTS[key] = attempts
+    return len(attempts) >= _RESET_MAX_PER_WINDOW
+
+
+def _record_reset_request(key: str):
+    _RESET_REQUESTS.setdefault(key, []).append(time.time())
+
+
 # In-process AI-endpoint throttle (chat / editor assist) per user.
 _AI_CALLS: dict[str, list[float]] = {}
 
@@ -1393,6 +1414,16 @@ def forgot_password():
     email = request.form.get("email", "").strip().lower()
     # Always show the same message to avoid leaking which emails exist
     generic = "If an account exists for that email, a reset link has been sent."
+    if not app.testing and (
+        _reset_rate_limited(f"ip:{request.remote_addr}")
+        or (email and _reset_rate_limited(f"em:{email}"))
+    ):
+        # Same response as success — no token issued, no email sent
+        flash(generic, "success")
+        return redirect(url_for("login"))
+    _record_reset_request(f"ip:{request.remote_addr}")
+    if email:
+        _record_reset_request(f"em:{email}")
     user = User.query.filter(_email_matches(email)).first() if email else None
     if user:
         raw = _issue_token(user, "reset", hours=2)
