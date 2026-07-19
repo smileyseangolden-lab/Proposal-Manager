@@ -683,6 +683,24 @@ def _send_stored_file(path, **kwargs):
     return send_file(str(path), **kwargs)
 
 
+def _proposal_markdown(proposal) -> str:
+    """Canonical proposal content for reading.
+
+    The latest ProposalVersion row is the source of truth — it survives
+    redeploys and multi-instance deployments where the generated file on local
+    disk may be missing or stale. The generated .md file (pulled from object
+    storage if needed) is only a fallback for legacy proposals without a
+    version row. Returns "" when no content can be found."""
+    version = latest_version(proposal.id)
+    if version and (version.markdown_content or "").strip():
+        return version.markdown_content
+    md_path = GENERATED_DIR / proposal.md_file
+    storage.ensure_local(md_path)
+    if md_path.exists():
+        return md_path.read_text(encoding="utf-8")
+    return ""
+
+
 def _logo_docx_kwargs(user, company_name_override: str = "") -> dict:
     """Build the logo-related kwargs passed into markdown_to_docx so they
     respect the user's branding preferences."""
@@ -2784,6 +2802,38 @@ def project_generate(project_id):
     return redirect(url_for("job_status_page", job_id=job.id))
 
 
+def _load_org_templates(org_id, vertical) -> dict | None:
+    """The org's uploaded templates for a generation, keyed by template_type.
+
+    Priority per type: user upload for the vertical, then the admin-set company
+    default for the vertical, then the 'general' equivalents — so an org that
+    only uploaded a General template still gets it when the RFP resolves to a
+    specific vertical. Files are pulled from object storage when the local copy
+    is missing."""
+    tiers = [
+        {"vertical": vertical, "is_company_default": False},
+        {"vertical": vertical, "is_company_default": True},
+    ]
+    if vertical != "general":
+        tiers += [
+            {"vertical": "general", "is_company_default": False},
+            {"vertical": "general", "is_company_default": True},
+        ]
+    picked = {}
+    for tier in tiers:
+        for t in UserVerticalTemplate.query.filter_by(org_id=org_id, **tier).all():
+            if t.template_type not in picked:
+                picked[t.template_type] = t
+    templates = {}
+    for ttype, t in picked.items():
+        try:
+            storage.ensure_local(t.file_path)
+            templates[ttype] = parse_document(t.file_path)
+        except Exception:
+            continue
+    return templates or None
+
+
 def _perform_generation(project_id, user, vertical, output_format, cost_options, set_progress):
     """Gather posture context and run proposal generation. Returns a dict with
     a 'redirect' key. Runs inside a background job (no request context)."""
@@ -2804,6 +2854,17 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
             continue
     if not combined_text.strip():
         raise RuntimeError("Could not extract text from the uploaded documents.")
+
+    # Resolve "auto" BEFORE loading templates. The template queries below match
+    # on the vertical key, so resolving after them (as before) meant the
+    # default Auto-Detect path silently skipped every org-uploaded template.
+    scope = ProjectScope.query.filter_by(project_id=project_id).first()
+    if vertical == "auto":
+        if scope and scope.status == "approved" and scope.vertical:
+            vertical = scope.vertical
+        else:
+            from document_parser import detect_vertical
+            vertical = detect_vertical(combined_text)
 
     org_id = user.org_id
     include_staff_types = cost_options.get("include_staff_types")
@@ -2865,35 +2926,12 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
         rate_sheet_data = {}
         for sheet in active_sheets:
             try:
+                storage.ensure_local(sheet.file_path)
                 rate_sheet_data[sheet.sheet_type] = parse_rate_sheet(sheet.file_path)
             except Exception:
                 continue
 
-    # Auto-select templates: user custom first, then company defaults as fallback
-    user_templates = None
-    user_tmpls = UserVerticalTemplate.query.filter_by(
-        org_id=org_id, vertical=vertical, is_company_default=False
-    ).all()
-    if user_tmpls:
-        user_templates = {}
-        for t in user_tmpls:
-            try:
-                user_templates[t.template_type] = parse_document(t.file_path)
-            except Exception:
-                continue
-
-    # Fall back to company defaults for any missing template types
-    co_tmpls = UserVerticalTemplate.query.filter_by(
-        vertical=vertical, is_company_default=True, org_id=org_id
-    ).all()
-    if co_tmpls:
-        user_templates = user_templates or {}
-        for t in co_tmpls:
-            if t.template_type not in user_templates:
-                try:
-                    user_templates[t.template_type] = parse_document(t.file_path)
-                except Exception:
-                    continue
+    user_templates = _load_org_templates(org_id, vertical)
 
     # Load past corrections for AI learning
     past_corrections = ProposalCorrection.query.filter_by(
@@ -2924,15 +2962,23 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
 
     # Human-approved Scope of Work guides the draft when present
     approved_scope_items = None
-    scope = ProjectScope.query.filter_by(project_id=project_id).first()
     if scope and scope.status == "approved":
         included = ScopeItem.query.filter_by(scope_id=scope.id, status="included").order_by(
             ScopeItem.sort_order, ScopeItem.created_at
         ).all()
         if included:
             approved_scope_items = [i.item_text for i in included]
-            if vertical == "auto" and scope.vertical:
-                vertical = scope.vertical
+
+    # Feed previously answered clarification questions back to the AI so a
+    # regeneration actually incorporates the user's answers (and doesn't
+    # re-ask them).
+    answered_rows = ProposalQuestion.query.filter_by(
+        project_id=project_id, status="answered"
+    ).order_by(ProposalQuestion.answered_at).all()
+    answered_questions = [
+        {"question": r.question, "answer": r.answer}
+        for r in answered_rows if (r.answer or "").strip()
+    ]
 
     set_progress("drafting", "Claude is drafting your proposal…")
     result = generate_proposal(
@@ -2943,6 +2989,7 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
         company_name=user.company_name,
         user_api_key=decrypt_api_key(user.api_key_encrypted) or None,
         user_model=user.llm_model or None,
+        answered_questions=answered_questions or None,
         cost_options=cost_options,
         staff_roles_data=staff_roles_data,
         equipment_data=equipment_data,
@@ -2951,14 +2998,29 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
         company_standards=company_standards_data,
         approved_scope=approved_scope_items,
         request_type=project.request_type or "",
+        include_global_boilerplate=SELF_HOSTED,
     )
 
     billing_record_generation(org_id)
 
-    # If the agent needs clarification, record questions and stop here
+    # If the agent needs clarification, record the questions and stop — but
+    # only for questions we haven't asked before on this project. Re-asked
+    # duplicates (already answered/skipped) must not re-open the loop or
+    # duplicate register rows; if nothing is genuinely new, fall through and
+    # save the proposal.
+    new_questions = []
     if result.get("questions"):
+        already_asked = {
+            (q.question or "").strip().lower()
+            for q in ProposalQuestion.query.filter_by(project_id=project_id).all()
+        }
+        new_questions = [
+            q for q in result["questions"]
+            if (q.get("question") or "").strip().lower() not in already_asked
+        ]
+    if new_questions:
         set_progress("questions", "Clarification questions detected…")
-        for q in result["questions"]:
+        for q in new_questions:
             db.session.add(ProposalQuestion(
                 project_id=project_id,
                 question=q["question"],
@@ -2980,7 +3042,7 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
         project.clarification_sub_status = "clarification_pending"
         db.session.commit()
         _log_activity_for(user, "proposal_questions",
-                          f"{len(result['questions'])} clarification question(s)", project_id)
+                          f"{len(new_questions)} clarification question(s)", project_id)
         return {"redirect": url_for("project_questions", project_id=project_id)}
 
     set_progress("saving", "Formatting and saving your proposal…")
@@ -3117,6 +3179,7 @@ def _project_rfp_text(project_id: str) -> str:
     combined = ""
     for doc in rfp_docs:
         try:
+            storage.ensure_local(doc.file_path)
             text = parse_document(doc.file_path)
             combined += f"\n\n--- Document: {doc.original_filename} ---\n\n{text}"
         except Exception:
@@ -3541,12 +3604,11 @@ def view_proposal(proposal_id):
         abort(404)
     project = db.session.get(Project, proposal.project_id)
 
-    md_path = GENERATED_DIR / proposal.md_file
-    if not md_path.exists():
-        flash("Proposal file not found.", "error")
+    proposal_md = _proposal_markdown(proposal)
+    if not proposal_md:
+        flash("Proposal content not found.", "error")
         return redirect(url_for("dashboard"))
 
-    proposal_md = md_path.read_text(encoding="utf-8")
     action_items = re.findall(r"\[ACTION REQUIRED:\s*(.+?)\]", proposal_md)
 
     # Version history for the viewer dropdown
@@ -4001,9 +4063,11 @@ def edit_proposal(proposal_id):
         )
         db.session.add(version)
 
-        # Update the markdown file on disk
+        # Update the markdown file on disk (and mirror to object storage so the
+        # edit survives redeploys / reaches other instances)
         md_path = GENERATED_DIR / proposal.md_file
         md_path.write_text(new_content, encoding="utf-8")
+        storage.sync_up(md_path)
 
         # Regenerate DOCX from new content
         if proposal.docx_file:
@@ -4014,6 +4078,7 @@ def edit_proposal(proposal_id):
                 str(docx_path),
                 **_logo_docx_kwargs(_brand_user),
             )
+            storage.sync_up(docx_path)
 
         # Update action items count
         action_items = re.findall(r"\[ACTION REQUIRED:\s*(.+?)\]", new_content)
@@ -4024,9 +4089,8 @@ def edit_proposal(proposal_id):
         flash(f"Proposal saved as version {next_version}.", "success")
         return redirect(url_for("edit_proposal", proposal_id=proposal_id))
 
-    # Load current content
-    md_path = GENERATED_DIR / proposal.md_file
-    current_content = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+    # Load current content (DB version first; file fallback)
+    current_content = _proposal_markdown(proposal)
 
     # Load version history
     versions = ProposalVersion.query.filter_by(proposal_id=proposal_id).order_by(
@@ -4162,9 +4226,10 @@ def restore_version(proposal_id, version_id):
     )
     db.session.add(restored)
 
-    # Update file on disk
+    # Update file on disk (mirrored to object storage)
     md_path = GENERATED_DIR / proposal.md_file
     md_path.write_text(version.markdown_content, encoding="utf-8")
+    storage.sync_up(md_path)
 
     if proposal.docx_file:
         docx_path = GENERATED_DIR / proposal.docx_file
@@ -4174,6 +4239,7 @@ def restore_version(proposal_id, version_id):
             str(docx_path),
             **_logo_docx_kwargs(_brand_user),
         )
+        storage.sync_up(docx_path)
 
     db.session.commit()
     _log_activity("proposal_restore", f"Restored proposal to v{version.version_number}", project.id)
@@ -4498,8 +4564,7 @@ def proposal_review_page(proposal_id):
         return redirect(url_for("view_proposal", proposal_id=proposal_id))
 
     version = latest_version(proposal_id)
-    md_path = GENERATED_DIR / proposal.md_file
-    proposal_md = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+    proposal_md = _proposal_markdown(proposal)
     proposal_html = htmlsafe.sanitize(md.markdown(proposal_md, extensions=["tables", "fenced_code"]))
 
     # My pending/existing revision requests on this proposal
@@ -4822,12 +4887,16 @@ def apply_feedback(proposal_id):
     db.session.add(new_version)
     db.session.flush()
 
-    # Write the new markdown/docx to disk
+    # Write the new markdown/docx to disk (mirrored to object storage)
     md_path = GENERATED_DIR / proposal.md_file
     md_path.write_text(result["revised_markdown"], encoding="utf-8")
+    storage.sync_up(md_path)
     if proposal.docx_file:
         docx_path = GENERATED_DIR / proposal.docx_file
-        markdown_to_docx(result["revised_markdown"], str(docx_path))
+        _brand_user = project.owner or current_user
+        markdown_to_docx(result["revised_markdown"], str(docx_path),
+                         **_logo_docx_kwargs(_brand_user))
+        storage.sync_up(docx_path)
 
     # Update action items count
     proposal.action_items_count = len(
@@ -5063,7 +5132,17 @@ def customer_portal(token):
         share.last_viewed_at = now
         db.session.commit()
 
-    version = latest_version(proposal.id)
+    # Render the version that was SHARED, not whatever is latest — internal
+    # edits made after submission must not silently change what the customer
+    # sees (or what they accepted). Falls back to latest only for legacy
+    # shares created before version pinning.
+    version = None
+    if share.version_number:
+        version = ProposalVersion.query.filter_by(
+            proposal_id=proposal.id, version_number=share.version_number
+        ).first()
+    if version is None:
+        version = latest_version(proposal.id)
     md_text = version.markdown_content if version else ""
     # Strip internal-only markers from the customer-facing view
     # DOTALL/IGNORECASE so multi-line internal markers are also stripped and can't
@@ -6222,7 +6301,7 @@ def download_document(doc_id):
     project = db.session.get(Project, doc.project_id)
     if not _can_access_project(project):
         abort(404)
-    return send_file(doc.file_path, as_attachment=True, download_name=doc.original_filename)
+    return _send_stored_file(doc.file_path, as_attachment=True, download_name=doc.original_filename)
 
 
 @app.route("/documents/<doc_id>/preview")
@@ -6235,7 +6314,7 @@ def preview_document(doc_id):
     project = db.session.get(Project, doc.project_id)
     if not _can_access_project(project):
         abort(404)
-    return send_file(doc.file_path, as_attachment=False)
+    return _send_stored_file(doc.file_path, as_attachment=False)
 
 
 @app.route("/documents/<doc_id>/tags", methods=["POST"])
@@ -6388,6 +6467,7 @@ def bulk_download_documents():
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
     with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
         for doc in docs:
+            storage.ensure_local(doc.file_path)
             src = Path(doc.file_path)
             if src.exists():
                 zf.write(str(src), doc.original_filename)
@@ -7126,13 +7206,11 @@ def proposal_reviews(proposal_id):
     approvals = sum(1 for c in comments if c.comment_type == "approval")
 
     # Extract section headings from proposal for dropdown
-    md_path = GENERATED_DIR / proposal.md_file
     sections = []
-    if md_path.exists():
-        for line in md_path.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if stripped.startswith("## ") or stripped.startswith("### "):
-                sections.append(stripped)
+    for line in _proposal_markdown(proposal).splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## ") or stripped.startswith("### "):
+            sections.append(stripped)
 
     users = _org_users_query().order_by(User.display_name).all()
 
@@ -7407,24 +7485,22 @@ def addendum_analysis(project_id):
     for doc in rfp_docs:
         if doc.id != addendum_doc_id:
             try:
+                storage.ensure_local(doc.file_path)
                 original_rfp_text += parse_document(doc.file_path) + "\n"
             except Exception:
                 continue
 
     # Get addendum text
     try:
+        storage.ensure_local(addendum_doc.file_path)
         addendum_text = parse_document(addendum_doc.file_path)
     except Exception:
         flash("Could not parse addendum document.", "error")
         return redirect(url_for("project_upload", project_id=project_id))
 
-    # Get current proposal
+    # Get current proposal (DB version first; file fallback)
     proposal = Proposal.query.filter_by(project_id=project_id).order_by(Proposal.generated_at.desc()).first()
-    current_md = ""
-    if proposal:
-        md_path = GENERATED_DIR / proposal.md_file
-        if md_path.exists():
-            current_md = md_path.read_text(encoding="utf-8")
+    current_md = _proposal_markdown(proposal) if proposal else ""
 
     if not current_md:
         flash("No existing proposal to analyze against.", "error")
@@ -7489,15 +7565,16 @@ def regenerate_proposal_section(proposal_id):
         flash("Section heading and clarification info are required.", "error")
         return redirect(url_for("edit_proposal", proposal_id=proposal_id))
 
-    # Get current proposal content
+    # Get current proposal content (DB version first; file fallback)
     md_path = GENERATED_DIR / proposal.md_file
-    current_md = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
+    current_md = _proposal_markdown(proposal)
 
     # Get original RFP text for context
     rfp_docs = ProjectDocument.query.filter_by(project_id=proposal.project_id, file_type="rfp").all()
     rfp_text = ""
     for doc in rfp_docs:
         try:
+            storage.ensure_local(doc.file_path)
             rfp_text += parse_document(doc.file_path) + "\n"
         except Exception:
             continue
@@ -7540,11 +7617,15 @@ def regenerate_proposal_section(proposal_id):
         )
         db.session.add(version)
 
-        # Update file on disk
+        # Update file on disk (mirrored to object storage)
         md_path.write_text(updated_md, encoding="utf-8")
+        storage.sync_up(md_path)
         if proposal.docx_file:
             docx_path = GENERATED_DIR / proposal.docx_file
-            markdown_to_docx(updated_md, str(docx_path))
+            _brand_user = project.owner or current_user
+            markdown_to_docx(updated_md, str(docx_path),
+                             **_logo_docx_kwargs(_brand_user))
+            storage.sync_up(docx_path)
 
         # Update action items count
         action_items = re.findall(r"\[ACTION REQUIRED:\s*(.+?)\]", updated_md)

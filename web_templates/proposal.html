@@ -256,8 +256,17 @@
             </div>
             <ul class="share-stats">
                 <li><strong>{{ share.view_count or 0 }}</strong> view(s){% if share.last_viewed_at %} · last {{ share.last_viewed_at.strftime('%b %d, %H:%M') }}{% endif %}</li>
+                {% if share.version_number %}<li>Customer sees <strong>v{{ share.version_number }}</strong>{% if versions and share.version_number < versions[0].version_number %} · you're on v{{ versions[0].version_number }}{% endif %}</li>{% endif %}
                 {% if share.decision %}<li>Customer <strong>{{ share.decision }}</strong>{{ ' on ' + share.decided_at.strftime('%b %d') if share.decided_at }}</li>{% endif %}
             </ul>
+            {% if versions and share.version_number and share.version_number < versions[0].version_number and not share.decision %}
+            <form method="post" action="{{ url_for('create_share', proposal_id=proposal.id) }}" class="inline-form" style="margin-bottom:8px;">
+                <input type="hidden" name="customer_email" value="{{ share.customer_email or '' }}">
+                <input type="hidden" name="allow_comments" value="{{ '1' if share.allow_comments else '0' }}">
+                <input type="hidden" name="allow_decision" value="{{ '1' if share.allow_decision else '0' }}">
+                <button type="submit" class="btn btn-small btn-primary">Update customer view to v{{ versions[0].version_number }}</button>
+            </form>
+            {% endif %}
             <form method="post" action="{{ url_for('revoke_share', proposal_id=proposal.id) }}" class="inline-form">
                 <button type="submit" class="btn btn-small btn-secondary">Revoke link</button>
             </form>

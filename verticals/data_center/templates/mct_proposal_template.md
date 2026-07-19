@@ -1,4 +1,4 @@
-# MCT Proposal Template — E Tech Group Mission Critical Team
+# MCT Proposal Template — the Company Mission Critical Team
 
 ---
 
@@ -13,7 +13,7 @@ Re: [Project Name / Project Code] — [System Type: BMS / EPMS / BMS & EPMS]
 
 Dear [Client Contact Name],
 
-E Tech Group is pleased to present this proposal for the [Project Name] project. With over a decade of experience delivering mission critical automation and controls solutions for data center clients, E Tech Group brings proven expertise in Building Management Systems (BMS) and Electrical Power Monitoring Systems (EPMS) to meet the requirements outlined in your [RFP/RFQ].
+The Company is pleased to present this proposal for the [Project Name] project. With over a decade of experience delivering mission critical automation and controls solutions for data center clients, the Company brings proven expertise in Building Management Systems (BMS) and Electrical Power Monitoring Systems (EPMS) to meet the requirements outlined in your [RFP/RFQ].
 
 Our approach is grounded in our Zer0Defects™ Methodology — a rigorous quality framework that has enabled us to consistently deliver complex data center projects on time, within budget, and to the highest quality standards. We look forward to partnering with [Client/GC Name] on this important project.
 
@@ -44,7 +44,7 @@ The following documents were received as part of the bid package via [ACTION REQ
 |------|-------|-------|-------|
 | [ACTION REQUIRED: From RFP] | | | |
 
-### 1.4 E Tech Group Contacts
+### 1.4 The Company Contacts
 
 | Name | Title | Phone | Email |
 |------|-------|-------|-------|
@@ -56,13 +56,13 @@ The following documents were received as part of the bid package via [ACTION REQ
 
 ## Section 2: Executive Summary
 
-E Tech Group proposes to provide [BMS / EPMS / BMS and EPMS] services for the [Project Name] project located in [Project Location]. Our team of experienced mission critical professionals will deliver a comprehensive solution encompassing design, engineering, procurement, installation oversight, programming, commissioning, and project management.
+The Company proposes to provide [BMS / EPMS / BMS and EPMS] services for the [Project Name] project located in [Project Location]. Our team of experienced mission critical professionals will deliver a comprehensive solution encompassing design, engineering, procurement, installation oversight, programming, commissioning, and project management.
 
 ### Strategy for Project Completion
 
-E Tech Group's strategy for this project emphasizes [ACTION REQUIRED: BDM — Win theme: Quality / Experience / Value Engineering]. Our approach includes:
+The Company's strategy for this project emphasizes [ACTION REQUIRED: BDM — Win theme: Quality / Experience / Value Engineering]. Our approach includes:
 
-- **Proven Mission Critical Expertise** — E Tech Group has successfully delivered [controls/automation] solutions across hyperscale, colocation, and enterprise data center environments.
+- **Proven Mission Critical Expertise** — the Company has successfully delivered [controls/automation] solutions across hyperscale, colocation, and enterprise data center environments.
 - **Zer0Defects™ Methodology** — Our proprietary quality framework ensures rigorous QA/QC at every project milestone, minimizing rework and delivering systems that perform as designed from day one.
 - **Experienced Field Teams** — Our commissioning engineers and field technicians are trained specifically for mission critical environments, understanding the zero-tolerance nature of data center operations.
 
@@ -72,9 +72,9 @@ E Tech Group's strategy for this project emphasizes [ACTION REQUIRED: BDM — Wi
 
 ---
 
-## Section 3: E Tech Company Overview & Qualifications
+## Section 3: Company Overview & Qualifications
 
-[ACTION REQUIRED: Pull standard E Tech Company Overview boilerplate — includes:]
+[ACTION REQUIRED: Pull standard Company Overview boilerplate — includes:]
 - Company overview pages
 - Customer testimonial
 - Mission Critical Business Unit Overview
@@ -90,7 +90,7 @@ E Tech Group's strategy for this project emphasizes [ACTION REQUIRED: BDM — Wi
 
 ### 4.1 Scope Summary
 
-E Tech Group will provide the following services for the [Project Name] project:
+The Company will provide the following services for the [Project Name] project:
 
 [ACTION REQUIRED: AE — Derive from material takeoff. List major deliverables including:]
 - System type(s): [BMS / EPMS / both]
@@ -101,7 +101,7 @@ E Tech Group will provide the following services for the [Project Name] project:
 
 ### 4.2 Design, Documentation, and BIM Services
 
-E Tech Group will provide the following documentation deliverables:
+The Company will provide the following documentation deliverables:
 
 - As-built drawings and documentation
 - Panel shop drawings
@@ -116,7 +116,7 @@ E Tech Group will provide the following documentation deliverables:
 
 The following table summarizes material procurement responsibilities:
 
-| Category | E Tech Procured | Client/OFCI | LV Sub Procured |
+| Category | the Company Procured | Client/OFCI | LV Sub Procured |
 |----------|----------------|-------------|-----------------|
 | Instruments | [ACTION REQUIRED: AE] | | |
 | PLC Panels | [ACTION REQUIRED: AE] | | |
@@ -135,7 +135,7 @@ The following table summarizes material procurement responsibilities:
 
 ### 4.5 System Installation
 
-E Tech Group will engage [ACTION REQUIRED: Procurement — LV Sub partner name] as the Low Voltage Subcontractor for this project. The LV Sub scope includes:
+The Company will engage [ACTION REQUIRED: Procurement — LV Sub partner name] as the Low Voltage Subcontractor for this project. The LV Sub scope includes:
 
 - Procurement of raceways, conduit, and cables
 - Installation of conduit and accessories
@@ -143,7 +143,7 @@ E Tech Group will engage [ACTION REQUIRED: Procurement — LV Sub partner name] 
 - Physical mounting of EPMS control panels
 - Verification of proper wiring (continuity checks, labeling)
 
-E Tech Group retains responsibility for:
+The Company retains responsibility for:
 - Construction and field supervision
 - Programming
 - Point-to-point commissioning
@@ -152,7 +152,7 @@ E Tech Group retains responsibility for:
 
 ### 4.6 On-Site Support & Commissioning
 
-E Tech Group will provide on-site commissioning support including:
+The Company will provide on-site commissioning support including:
 
 - Point-to-point verification of all field devices
 - System functional testing
@@ -172,11 +172,11 @@ E Tech Group will provide on-site commissioning support including:
 
 ### 4.8 Change Management
 
-E Tech Group follows a formal Work Order Change Notice (WOCN) process for managing scope changes during project execution. All changes are documented, priced, and approved by the client before work proceeds.
+The Company follows a formal Work Order Change Notice (WOCN) process for managing scope changes during project execution. All changes are documented, priced, and approved by the client before work proceeds.
 
 ### 4.9 Safety & Security
 
-E Tech Group maintains a comprehensive safety program that meets or exceeds all OSHA requirements and client-specific safety standards. All field personnel are trained in site-specific safety protocols prior to mobilization.
+The Company maintains a comprehensive safety program that meets or exceeds all OSHA requirements and client-specific safety standards. All field personnel are trained in site-specific safety protocols prior to mobilization.
 
 [ACTION REQUIRED: AE — Note any client-specific safety requirements from the RFP, including safety staffing requirements]
 
@@ -222,7 +222,7 @@ E Tech Group maintains a comprehensive safety program that meets or exceeds all 
 
 ### Exclusions
 
-The following items are excluded from E Tech Group's scope unless specifically noted otherwise:
+The following items are excluded from the Company's scope unless specifically noted otherwise:
 
 [ACTION REQUIRED: AE — List exclusions. Common exclusions include:]
 - Life safety systems (fire alarm, fire suppression, hydrogen detection tied to life safety)
@@ -280,7 +280,7 @@ All pricing excludes applicable sales tax unless otherwise noted.
 
 ## Attachment: Terms and Conditions of Sale
 
-[ACTION REQUIRED: Insert standard E Tech Group Terms and Conditions of Sale boilerplate]
+[ACTION REQUIRED: Insert standard the Company Terms and Conditions of Sale boilerplate]
 
 ---
 

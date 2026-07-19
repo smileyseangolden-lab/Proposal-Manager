@@ -132,22 +132,28 @@ def _month_key(dt=None) -> str:
 
 
 def generations_this_month(org_id) -> int:
-    """Count generations for the org in the current calendar month.
+    """Count AI proposal generations for the org in the current calendar month.
 
-    Counts queued + running + done (everything except failed), keyed on
-    created_at, so in-flight jobs count against the limit too. This closes the
-    burst/parallel bypass where only completed jobs were counted, letting a user
-    enqueue many generations before any finished."""
-    from models import BackgroundJob
+    Counts in-flight jobs (queued/running — closes the burst/parallel bypass
+    where many generations could be enqueued before any finished) PLUS
+    proposals actually produced. A run that finished WITHOUT producing a
+    proposal — the AI stopped to ask clarification questions, or the job
+    failed — no longer consumes quota, so answering questions and regenerating
+    doesn't burn a second credit for the same proposal attempt."""
+    from models import BackgroundJob, Project, Proposal
     start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    return (
-        BackgroundJob.query.filter(
-            BackgroundJob.org_id == org_id,
-            BackgroundJob.kind == "generate_proposal",
-            BackgroundJob.status.in_(("queued", "running", "done")),
-            BackgroundJob.created_at >= start,
-        ).count()
+    inflight = BackgroundJob.query.filter(
+        BackgroundJob.org_id == org_id,
+        BackgroundJob.kind == "generate_proposal",
+        BackgroundJob.status.in_(("queued", "running")),
+        BackgroundJob.created_at >= start,
+    ).count()
+    produced = (
+        Proposal.query.join(Project, Proposal.project_id == Project.id)
+        .filter(Project.org_id == org_id, Proposal.generated_at >= start)
+        .count()
     )
+    return inflight + produced
 
 
 def seats_used(org_id) -> int:
