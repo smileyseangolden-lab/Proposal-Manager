@@ -8012,64 +8012,92 @@ def calendar_view():
 @app.route("/reports")
 @login_required
 def reports():
-    """Win/loss analysis, pipeline trends, vertical performance."""
-    from sqlalchemy import func
-    from collections import OrderedDict, Counter
+    """Win/loss analysis, pipeline trends, vertical performance.
+
+    Every section aggregates in SQL (grouped counts/sums, like _counts_by and
+    the admin panel) so the page stays flat-cost as a tenant's history grows —
+    previously every project row was loaded into Python and bucketed there,
+    which degraded linearly and would eventually blow the request out of
+    memory on a large org."""
+    from sqlalchemy import case, func
+    from collections import OrderedDict
 
     # Admins see company-wide; other users see own + assigned
     if current_user.is_admin:
-        base_query = Project.query.filter_by(org_id=current_user.org_id)
+        scope = [Project.org_id == current_user.org_id]
     else:
-        base_query = Project.query.filter(_my_projects_filter())
+        scope = [_my_projects_filter()]
+    decided = Project.status.in_(("won", "lost"))
+    amount = func.coalesce(func.sum(Project.dollar_amount), 0.0)
 
-    all_projects = base_query.all()
-
-    # Overall stats
-    won_projects = [p for p in all_projects if p.status == "won"]
-    lost_projects = [p for p in all_projects if p.status == "lost"]
-    total_won = len(won_projects)
-    total_lost = len(lost_projects)
+    # Overall stats: one pass grouped by status
+    by_status = {
+        status: {"count": count, "value": value or 0}
+        for status, count, value in (
+            db.session.query(Project.status, func.count(Project.id), amount)
+            .filter(*scope).group_by(Project.status).all()
+        )
+    }
+    total_won = by_status.get("won", {}).get("count", 0)
+    total_lost = by_status.get("lost", {}).get("count", 0)
     total_decided = total_won + total_lost
-    overall_win_rate = round((total_won / total_decided) * 100) if total_decided else 0
-    won_value = sum(p.dollar_amount or 0 for p in won_projects)
-    lost_value = sum(p.dollar_amount or 0 for p in lost_projects)
+    stats = {
+        "total_projects": sum(e["count"] for e in by_status.values()),
+        "total_active": by_status.get("active", {}).get("count", 0),
+        "total_submitted": by_status.get("submitted", {}).get("count", 0),
+        "total_won": total_won,
+        "total_lost": total_lost,
+        "win_rate": round((total_won / total_decided) * 100) if total_decided else 0,
+        "won_value": by_status.get("won", {}).get("value", 0),
+        "lost_value": by_status.get("lost", {}).get("value", 0),
+    }
 
-    # Win/loss by vertical
+    # Win/loss by vertical: grouped by (label, status). NULL and "" both
+    # collapse to "General", matching the old `label or "General"`.
+    label_col = func.coalesce(func.nullif(Project.vertical_label, ""), "General")
     vertical_stats = {}
-    for p in all_projects:
-        label = p.vertical_label or "General"
-        vs = vertical_stats.setdefault(label, {"won": 0, "lost": 0, "won_value": 0, "lost_value": 0, "active": 0})
-        if p.status == "won":
-            vs["won"] += 1
-            vs["won_value"] += p.dollar_amount or 0
-        elif p.status == "lost":
-            vs["lost"] += 1
-            vs["lost_value"] += p.dollar_amount or 0
-        elif p.status == "active":
-            vs["active"] += 1
-
-    for label, vs in vertical_stats.items():
-        decided = vs["won"] + vs["lost"]
-        vs["win_rate"] = round((vs["won"] / decided) * 100) if decided else 0
+    for label, status, count, value in (
+        db.session.query(label_col, Project.status, func.count(Project.id), amount)
+        .filter(*scope).group_by(label_col, Project.status).all()
+    ):
+        vs = vertical_stats.setdefault(
+            label, {"won": 0, "lost": 0, "won_value": 0, "lost_value": 0, "active": 0}
+        )
+        if status == "won":
+            vs["won"], vs["won_value"] = count, value or 0
+        elif status == "lost":
+            vs["lost"], vs["lost_value"] = count, value or 0
+        elif status == "active":
+            vs["active"] = count
+    for vs in vertical_stats.values():
+        vertical_decided = vs["won"] + vs["lost"]
+        vs["win_rate"] = round((vs["won"] / vertical_decided) * 100) if vertical_decided else 0
         vs["total_value"] = vs["won_value"] + vs["lost_value"]
+    # Biggest book of business first (was arbitrary iteration order)
+    vertical_stats = dict(
+        sorted(vertical_stats.items(), key=lambda kv: (-kv[1]["total_value"], kv[0]))
+    )
 
-    # Top competitors
-    competitor_counter = Counter()
-    competitor_wins = Counter()
-    for p in won_projects + lost_projects:
-        if p.competitor_name:
-            competitor_counter[p.competitor_name] += 1
-            if p.status == "won":
-                competitor_wins[p.competitor_name] += 1
+    # Top competitors: grouped, capped in SQL
     top_competitors = []
-    for name, total in competitor_counter.most_common(10):
-        wins = competitor_wins.get(name, 0)
-        losses = total - wins
+    for name, total, wins in (
+        db.session.query(
+            Project.competitor_name,
+            func.count(Project.id),
+            func.sum(case((Project.status == "won", 1), else_=0)),
+        )
+        .filter(*scope, decided,
+                Project.competitor_name.isnot(None), Project.competitor_name != "")
+        .group_by(Project.competitor_name)
+        .order_by(func.count(Project.id).desc(), Project.competitor_name.asc())
+        .limit(10).all()
+    ):
+        wins = int(wins or 0)
         top_competitors.append({
             "name": name,
             "total": total,
             "wins": wins,
-            "losses": losses,
+            "losses": total - wins,
             "win_rate": round((wins / total) * 100) if total else 0,
         })
 
@@ -8085,60 +8113,60 @@ def reports():
     }
     won_category_counts = {k: 0 for k in category_labels}
     lost_category_counts = {k: 0 for k in category_labels}
-    for p in won_projects:
-        key = p.close_category or "other"
-        if key in won_category_counts:
-            won_category_counts[key] += 1
-    for p in lost_projects:
-        key = p.close_category or "other"
-        if key in lost_category_counts:
-            lost_category_counts[key] += 1
+    cat_col = func.coalesce(func.nullif(Project.close_category, ""), "other")
+    for status, key, count in (
+        db.session.query(Project.status, cat_col, func.count(Project.id))
+        .filter(*scope, decided).group_by(Project.status, cat_col).all()
+    ):
+        target = won_category_counts if status == "won" else lost_category_counts
+        if key in target:  # unknown categories are dropped, as before
+            target[key] += count
 
-    # Monthly trend (last 6 months of closures)
-    from datetime import timedelta
+    # Monthly trend (last 6 calendar months of closures), bucketed in SQL
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     trend = OrderedDict()
     for i in range(5, -1, -1):
-        # Approximate by calendar month
         m = now.month - i
         y = now.year
         while m <= 0:
             m += 12
             y -= 1
-        key = f"{y}-{m:02d}"
-        trend[key] = {"won": 0, "lost": 0, "won_value": 0, "lost_value": 0}
+        trend[f"{y}-{m:02d}"] = {"won": 0, "lost": 0, "won_value": 0, "lost_value": 0}
+    oldest_year, oldest_month = (int(x) for x in next(iter(trend)).split("-"))
+    window_start = datetime(oldest_year, oldest_month, 1)
 
-    for p in won_projects + lost_projects:
-        when = p.closed_at or p.submitted_at or p.updated_at
-        if not when:
+    closed_when = func.coalesce(Project.closed_at, Project.submitted_at, Project.updated_at)
+    if db.engine.dialect.name == "postgresql":
+        month_col = func.to_char(closed_when, "YYYY-MM")
+    else:  # sqlite
+        month_col = func.strftime("%Y-%m", closed_when)
+    for key, status, count, value in (
+        db.session.query(month_col, Project.status, func.count(Project.id), amount)
+        .filter(*scope, decided, closed_when >= window_start)
+        .group_by(month_col, Project.status).all()
+    ):
+        if key not in trend:
             continue
-        when = when.replace(tzinfo=None) if when.tzinfo else when
-        key = f"{when.year}-{when.month:02d}"
-        if key in trend:
-            if p.status == "won":
-                trend[key]["won"] += 1
-                trend[key]["won_value"] += p.dollar_amount or 0
-            else:
-                trend[key]["lost"] += 1
-                trend[key]["lost_value"] += p.dollar_amount or 0
+        if status == "won":
+            trend[key]["won"], trend[key]["won_value"] = count, value or 0
+        else:
+            trend[key]["lost"], trend[key]["lost_value"] = count, value or 0
 
-    # Recently closed projects with missing details (prompt user to fill in)
-    missing_details = [
-        p for p in (won_projects + lost_projects)
-        if not (p.close_reason or p.close_category or p.competitor_name)
-    ]
-    missing_details.sort(key=lambda p: p.closed_at or p.updated_at or now, reverse=True)
+    # Recently closed projects with missing details (prompt user to fill in) —
+    # filtered, ordered, and capped in SQL instead of materializing every row.
+    def _blank(col):
+        return db.or_(col.is_(None), col == "")
 
-    stats = {
-        "total_projects": len(all_projects),
-        "total_active": sum(1 for p in all_projects if p.status == "active"),
-        "total_submitted": sum(1 for p in all_projects if p.status == "submitted"),
-        "total_won": total_won,
-        "total_lost": total_lost,
-        "win_rate": overall_win_rate,
-        "won_value": won_value,
-        "lost_value": lost_value,
-    }
+    missing_details = (
+        Project.query.filter(
+            *scope, decided,
+            _blank(Project.close_reason),
+            _blank(Project.close_category),
+            _blank(Project.competitor_name),
+        )
+        .order_by(func.coalesce(Project.closed_at, Project.updated_at).desc())
+        .limit(10).all()
+    )
 
     return render_template(
         "reports.html",
@@ -8149,7 +8177,7 @@ def reports():
         lost_category_counts=lost_category_counts,
         category_labels=category_labels,
         trend=trend,
-        missing_details=missing_details[:10],
+        missing_details=missing_details,
     )
 
 
