@@ -119,6 +119,7 @@
                     <td><span class="badge badge-doc-{{ d.file_type }}">{{ d.file_type }}</span></td>
                     <td>
                         {% if d.text_chars is none %}<span class="form-hint">&mdash;</span>
+                        {% elif d.text_chars == 0 and d.original_filename.lower().endswith('.pdf') and ocr_enabled %}<span class="chip chip-gold" title="No embedded text, but it will be read with OCR when you generate.">&#128444; Scanned &middot; OCR</span>
                         {% elif d.text_chars == 0 %}<span class="chip chip-red" title="No machine-readable text — likely a scanned image. The AI cannot analyze this file.">&#9888; No text</span>
                         {% else %}<span class="chip chip-ok" title="{{ '{:,}'.format(d.text_chars) }} characters extracted">&#10003; {{ '{:,}'.format(d.text_chars) }} chars</span>
                         {% endif %}

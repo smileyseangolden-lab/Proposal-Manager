@@ -68,6 +68,7 @@ import billing
 import crypto_util
 import htmlsafe
 import jobs
+import ocr
 import proposal_agent
 import storage
 from document_parser import parse_document
@@ -800,13 +801,35 @@ def _save_upload(file, subdir: str = "") -> tuple[str, str, int]:
 
 def _extract_text_chars(path: str):
     """Parse receipt for an uploaded document: how many characters of
-    machine-readable text it yields. 0 = parsed but empty (e.g. a scanned
-    image PDF the AI can't read); None = format we couldn't check. Lets the
-    UI warn at UPLOAD time instead of failing minutes later at generation."""
+    machine-readable text it yields (fast pass — no OCR, so the upload request
+    stays quick). 0 = parsed but empty (e.g. a scanned image PDF); None =
+    format we couldn't check. Lets the UI warn at UPLOAD time instead of
+    failing minutes later at generation."""
     try:
         return len(parse_document(path).strip())
     except Exception:
         return None
+
+
+def _flag_unreadable(entries):
+    """Given [(filename, text_chars)], flash the right message: files that will
+    be recovered by OCR at generation vs. genuinely unreadable ones."""
+    scanned, unreadable = [], []
+    for name, chars in entries:
+        if chars != 0:
+            continue
+        if name.lower().endswith(".pdf") and ocr.available():
+            scanned.append(name)
+        else:
+            unreadable.append(name)
+    if scanned:
+        flash("Looks like a scan: " + ", ".join(scanned)
+              + " has no embedded text, but we'll read it with OCR when you "
+              "generate (it may take a little longer).", "success")
+    if unreadable:
+        flash("Heads up: no readable text could be extracted from "
+              + ", ".join(unreadable) + " — it may be a scanned image. "
+              "The AI won't be able to analyze it.", "error")
 
 
 def _send_stored_file(path, **kwargs):
@@ -1522,12 +1545,11 @@ def quick_start():
     db.session.add(project)
     db.session.flush()
 
-    unreadable = []
+    receipts = []
     for f in valid:
         safe, path, size = _save_upload(f, f"projects/{project.id}")
         chars = _extract_text_chars(path)
-        if chars == 0:
-            unreadable.append(safe)
+        receipts.append((safe, chars))
         db.session.add(ProjectDocument(
             project_id=project.id,
             filename=f"{uuid.uuid4().hex[:8]}_{safe}",
@@ -1539,10 +1561,7 @@ def quick_start():
         ))
 
     db.session.commit()
-    if unreadable:
-        flash("Heads up: no readable text could be extracted from "
-              f"{', '.join(unreadable)} — it may be a scanned image. "
-              "The AI won't be able to analyze it.", "error")
+    _flag_unreadable(receipts)
     _log_activity("project_quick_start", f"Quick-started project from {len(valid)} file(s)", project.id)
     _notify_role(
         "proposal", "rfp_uploaded",
@@ -3071,13 +3090,13 @@ def project_upload(project_id):
         files = request.files.getlist("documents")
         file_type = request.form.get("file_type", "rfp")
 
-        unreadable = []
+        receipts = []
         for file in files:
             if file and _allowed_file(file.filename, ALLOWED_EXTENSIONS | {"xlsx", "xls"}):
                 safe, path, size = _save_upload(file, f"projects/{project_id}")
                 chars = _extract_text_chars(path)
-                if chars == 0 and file_type in ("rfp", "supporting", "legal"):
-                    unreadable.append(safe)
+                if file_type in ("rfp", "supporting", "legal"):
+                    receipts.append((safe, chars))
                 doc = ProjectDocument(
                     project_id=project_id,
                     filename=f"{uuid.uuid4().hex[:8]}_{safe}",
@@ -3090,10 +3109,7 @@ def project_upload(project_id):
                 db.session.add(doc)
 
         db.session.commit()
-        if unreadable:
-            flash("Heads up: no readable text could be extracted from "
-                  f"{', '.join(unreadable)} — it may be a scanned image. "
-                  "The AI won't be able to analyze it.", "error")
+        _flag_unreadable(receipts)
         _log_activity("document_upload", f"Uploaded {len(files)} document(s)", project_id)
         # Notify proposal users when RFPs are uploaded
         _notify_role(
@@ -3149,6 +3165,7 @@ def project_upload(project_id):
         "project_upload.html",
         gen_limit=gen_limit,
         gens_used=gens_used,
+        ocr_enabled=ocr.available(),
         project=project,
         documents=documents,
         verticals=VERTICALS,
@@ -3281,7 +3298,7 @@ def _perform_generation(project_id, user, vertical, output_format, cost_options,
     for doc in rfp_docs:
         try:
             storage.ensure_local(doc.file_path)
-            text = parse_document(doc.file_path)
+            text = parse_document(doc.file_path, ocr=True)
             combined_text += f"\n\n--- Document: {doc.original_filename} ---\n\n{text}"
         except Exception:
             continue
@@ -3676,7 +3693,7 @@ def _project_rfp_text(project_id: str) -> str:
     for doc in rfp_docs:
         try:
             storage.ensure_local(doc.file_path)
-            text = parse_document(doc.file_path)
+            text = parse_document(doc.file_path, ocr=True)
             combined += f"\n\n--- Document: {doc.original_filename} ---\n\n{text}"
         except Exception:
             continue
@@ -7186,6 +7203,7 @@ def delete_document(doc_id):
     DocumentTag.query.filter_by(document_id=doc.id).delete()
     try:
         storage.delete(doc.file_path)
+        storage.delete(str(doc.file_path) + ".ocr.txt")  # OCR sidecar cache
     except Exception:
         pass
     db.session.delete(doc)
@@ -7229,6 +7247,7 @@ def delete_project(project_id):
     for doc in docs:
         try:
             storage.delete(doc.file_path)
+            storage.delete(str(doc.file_path) + ".ocr.txt")  # OCR sidecar cache
         except Exception:
             pass
         DocumentTag.query.filter_by(document_id=doc.id).delete()
