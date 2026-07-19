@@ -84,6 +84,9 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("organizations", "logo_show_on_cover", "BOOLEAN DEFAULT TRUE"),
     # P1: parse receipt captured at upload (NULL = never checked)
     ("project_documents", "text_chars", "INTEGER"),
+    # P3: typed-name acceptance on the customer portal
+    ("proposal_shares", "decided_by_name", "VARCHAR(200) DEFAULT ''"),
+    ("proposal_shares", "decided_by_title", "VARCHAR(200) DEFAULT ''"),
 ]
 
 # Indexes on hot filter / foreign-key columns. CREATE INDEX IF NOT EXISTS is

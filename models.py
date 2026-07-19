@@ -816,9 +816,12 @@ class ProposalShare(db.Model):
     view_count = db.Column(db.Integer, default=0)
     last_viewed_at = db.Column(db.DateTime, nullable=True)
 
-    # Customer's decision recorded through the portal
+    # Customer's decision recorded through the portal. Name/title typed by the
+    # decider give the acceptance a lightweight signature record.
     decision = db.Column(db.String(20), default="")  # accepted, declined
     decision_note = db.Column(db.Text, default="")
+    decided_by_name = db.Column(db.String(200), default="")
+    decided_by_title = db.Column(db.String(200), default="")
     decided_at = db.Column(db.DateTime, nullable=True)
 
     revoked_at = db.Column(db.DateTime, nullable=True)

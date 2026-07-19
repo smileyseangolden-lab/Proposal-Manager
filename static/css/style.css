@@ -3132,3 +3132,20 @@ summary:focus-visible,
     font-size: 13px;
     color: var(--ink-500);
 }
+
+/* Flash dismiss control (P3) */
+.flash { position: relative; padding-right: 38px; }
+.flash-close {
+    position: absolute;
+    top: 6px;
+    right: 8px;
+    border: 0;
+    background: none;
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    color: inherit;
+    opacity: 0.55;
+    padding: 4px;
+}
+.flash-close:hover { opacity: 1; }

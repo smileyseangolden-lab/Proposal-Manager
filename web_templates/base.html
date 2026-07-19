@@ -217,6 +217,25 @@
     {% if current_user.is_authenticated %}
     <script>
     (function(){
+        // Flash messages: dismiss button + auto-fade for successes (errors stay)
+        document.querySelectorAll(".flash-messages .flash").forEach(function(el){
+            var btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "flash-close";
+            btn.setAttribute("aria-label", "Dismiss message");
+            btn.innerHTML = "&times;";
+            btn.addEventListener("click", function(){ el.remove(); });
+            el.appendChild(btn);
+            if (el.classList.contains("flash-success")) {
+                setTimeout(function(){
+                    el.style.transition = "opacity 0.6s";
+                    el.style.opacity = "0";
+                    setTimeout(function(){ el.remove(); }, 700);
+                }, 6000);
+            }
+        });
+    })();
+    (function(){
         // Localize <time data-utc> elements to the viewer's timezone.
         document.querySelectorAll("time[data-utc]").forEach(function(el){
             var d = new Date(el.getAttribute("data-utc"));

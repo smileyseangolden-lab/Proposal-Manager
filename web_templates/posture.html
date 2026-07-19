@@ -272,9 +272,22 @@
                     <td>${{ "%.2f"|format(r.hourly_rate) }}</td>
                     <td>{{ "$%.2f"|format(r.overtime_rate) if r.overtime_rate else '—' }}</td>
                     <td class="td-desc">{{ r.description or '—' }}</td>
-                    <td>
+                    <td style="white-space:nowrap;">
+                        <button type="button" class="btn btn-small btn-secondary row-edit-btn" data-target="edit-sr-{{ r.id }}">Edit</button>
                         <form method="post" action="{{ url_for('delete_staff_role', role_id=r.id) }}" class="inline-form">
                             <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this staff role?')">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+                <tr id="edit-sr-{{ r.id }}" class="inline-edit-row" style="display:none;">
+                    <td colspan="6">
+                        <form method="post" action="{{ url_for('edit_staff_role', role_id=r.id) }}" class="inline-form" style="display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end;">
+                            <label style="font-size:11px;">Role<br><input type="text" name="role_name" value="{{ r.role_name }}"></label>
+                            <label style="font-size:11px;">Category<br><input type="text" name="category" value="{{ r.category }}"></label>
+                            <label style="font-size:11px;">Hourly $<br><input type="number" step="0.01" min="0" name="hourly_rate" value="{{ r.hourly_rate }}" style="width:100px;"></label>
+                            <label style="font-size:11px;">OT $<br><input type="number" step="0.01" min="0" name="overtime_rate" value="{{ r.overtime_rate or '' }}" style="width:100px;"></label>
+                            <label style="font-size:11px; flex:1;">Description<br><input type="text" name="description" value="{{ r.description }}" style="width:100%;"></label>
+                            <button type="submit" class="btn btn-small btn-primary">Save</button>
                         </form>
                     </td>
                 </tr>
@@ -402,9 +415,23 @@
                     <td>{{ e.manufacturer or '—' }}</td>
                     <td>${{ "%.2f"|format(e.unit_cost) }}</td>
                     <td>{{ e.unit }}</td>
-                    <td>
+                    <td style="white-space:nowrap;">
+                        <button type="button" class="btn btn-small btn-secondary row-edit-btn" data-target="edit-eq-{{ e.id }}">Edit</button>
                         <form method="post" action="{{ url_for('delete_equipment_item', item_id=e.id) }}" class="inline-form">
                             <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this item?')">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+                <tr id="edit-eq-{{ e.id }}" class="inline-edit-row" style="display:none;">
+                    <td colspan="7">
+                        <form method="post" action="{{ url_for('edit_equipment_item', item_id=e.id) }}" class="inline-form" style="display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end;">
+                            <label style="font-size:11px; flex:1;">Item<br><input type="text" name="item_name" value="{{ e.item_name }}" style="width:100%;"></label>
+                            <label style="font-size:11px;">Category<br><input type="text" name="eq_category" value="{{ e.category }}"></label>
+                            <label style="font-size:11px;">Part #<br><input type="text" name="part_number" value="{{ e.part_number }}" style="width:120px;"></label>
+                            <label style="font-size:11px;">Manufacturer<br><input type="text" name="manufacturer" value="{{ e.manufacturer }}" style="width:140px;"></label>
+                            <label style="font-size:11px;">Unit $<br><input type="number" step="0.01" min="0" name="unit_cost" value="{{ e.unit_cost }}" style="width:110px;"></label>
+                            <label style="font-size:11px;">Unit<br><input type="text" name="unit" value="{{ e.unit }}" style="width:80px;"></label>
+                            <button type="submit" class="btn btn-small btn-primary">Save</button>
                         </form>
                     </td>
                 </tr>
@@ -491,9 +518,21 @@
                     <td>${{ "%.2f"|format(t.rate) }}</td>
                     <td>{{ t.unit }}</td>
                     <td class="td-desc">{{ t.description or '—' }}</td>
-                    <td>
+                    <td style="white-space:nowrap;">
+                        <button type="button" class="btn btn-small btn-secondary row-edit-btn" data-target="edit-tr-{{ t.id }}">Edit</button>
                         <form method="post" action="{{ url_for('delete_travel_rate', rate_id=t.id) }}" class="inline-form">
                             <button type="submit" class="btn btn-small btn-danger" onclick="return confirm('Delete this rate?')">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+                <tr id="edit-tr-{{ t.id }}" class="inline-edit-row" style="display:none;">
+                    <td colspan="5">
+                        <form method="post" action="{{ url_for('edit_travel_rate', rate_id=t.id) }}" class="inline-form" style="display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end;">
+                            <label style="font-size:11px;">Expense<br><input type="text" name="expense_type" value="{{ t.expense_type }}"></label>
+                            <label style="font-size:11px;">Rate $<br><input type="number" step="0.01" min="0" name="travel_rate" value="{{ t.rate }}" style="width:110px;"></label>
+                            <label style="font-size:11px;">Unit<br><input type="text" name="travel_unit" value="{{ t.unit }}" style="width:110px;"></label>
+                            <label style="font-size:11px; flex:1;">Description<br><input type="text" name="travel_description" value="{{ t.description }}" style="width:100%;"></label>
+                            <button type="submit" class="btn btn-small btn-primary">Save</button>
                         </form>
                     </td>
                 </tr>
@@ -693,6 +732,14 @@
         btn.addEventListener("click", function(){
             var target = document.getElementById(btn.dataset.target);
             if (target) target.open = true;
+        });
+    });
+
+    // Inline row editing for rate tables
+    document.querySelectorAll(".row-edit-btn").forEach(function(btn){
+        btn.addEventListener("click", function(){
+            var row = document.getElementById(btn.dataset.target);
+            if (row) row.style.display = row.style.display === "none" ? "" : "none";
         });
     });
 

@@ -270,6 +270,14 @@
                 </div>
 
                 <button type="submit" class="btn btn-primary btn-large" id="generate-btn">Generate Proposal</button>
+                <p class="form-hint" style="margin-top:8px;">
+                    Takes ~1&ndash;3 minutes and uses 1 AI generation
+                    {% if gen_limit is defined and gen_limit >= 0 %}
+                    &mdash; <strong>{{ gens_used }} of {{ gen_limit }}</strong> used this month{% if gen_limit - gens_used <= 2 %} <a href="{{ url_for('billing_page') }}">(upgrade for more)</a>{% endif %}.
+                    {% else %}
+                    (your plan has unlimited generations).
+                    {% endif %}
+                </p>
             </form>
 
             <div class="processing-overlay" id="processing" style="display:none;">

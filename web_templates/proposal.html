@@ -221,6 +221,12 @@
                     {% endif %}
                     {% if proposal.review_status == 'internally_approved' %}
                     <form method="post" action="{{ url_for('submit_to_customer', proposal_id=proposal.id) }}" class="inline-form">
+                        {% if proposal.action_items_count %}
+                        <label class="check-inline" style="display:block; margin-bottom:6px;">
+                            <input type="checkbox" name="ack_action_items" value="1">
+                            Send despite <strong>{{ proposal.action_items_count }}</strong> open <a href="#action-items">action item(s)</a>
+                        </label>
+                        {% endif %}
                         <button type="submit" class="btn btn-primary">Submit to Customer</button>
                     </form>
                     <button type="button" class="btn btn-secondary" id="run-preflight">Run Pre-flight Check</button>
@@ -258,13 +264,16 @@
                 <li><strong>{{ share.view_count or 0 }}</strong> view(s){% if share.last_viewed_at %} · last {{ share.last_viewed_at | localtime }}{% endif %}</li>
                 {% if share.version_number %}<li>Customer sees <strong>v{{ share.version_number }}</strong>{% if versions and share.version_number < versions[0].version_number %} · you're on v{{ versions[0].version_number }}{% endif %}</li>{% endif %}
                 {% if share.expires_at %}<li>Link expires {{ share.expires_at.strftime('%b %d, %Y') }}</li>{% endif %}
-                {% if share.decision %}<li>Customer <strong>{{ share.decision }}</strong>{{ ' on ' + share.decided_at.strftime('%b %d') if share.decided_at }}</li>{% endif %}
+                {% if share.decision %}<li>Customer <strong>{{ share.decision }}</strong>{% if share.decided_by_name %} — signed by {{ share.decided_by_name }}{% if share.decided_by_title %} ({{ share.decided_by_title }}){% endif %}{% endif %}{{ ' on ' + share.decided_at.strftime('%b %d') if share.decided_at }}</li>{% endif %}
             </ul>
             {% if versions and share.version_number and share.version_number < versions[0].version_number and not share.decision %}
             <form method="post" action="{{ url_for('create_share', proposal_id=proposal.id) }}" class="inline-form" style="margin-bottom:8px;">
                 <input type="hidden" name="customer_email" value="{{ share.customer_email or '' }}">
                 <input type="hidden" name="allow_comments" value="{{ '1' if share.allow_comments else '0' }}">
                 <input type="hidden" name="allow_decision" value="{{ '1' if share.allow_decision else '0' }}">
+                {% if proposal.action_items_count %}
+                <label class="check-inline" style="display:block; margin-bottom:4px;"><input type="checkbox" name="ack_action_items" value="1"> Update despite {{ proposal.action_items_count }} open action item(s)</label>
+                {% endif %}
                 <button type="submit" class="btn btn-small btn-primary">Update customer view to v{{ versions[0].version_number }}</button>
             </form>
             {% endif %}
@@ -278,6 +287,9 @@
                 <label class="check-inline"><input type="checkbox" name="allow_comments" value="1" checked> Allow comments</label>
                 <label class="check-inline"><input type="checkbox" name="allow_decision" value="1" checked> Allow accept/decline</label>
                 <label class="check-inline"><input type="checkbox" name="send_email" value="1"> Email it with PDF attached</label>
+                {% if proposal.action_items_count %}
+                <label class="check-inline"><input type="checkbox" name="ack_action_items" value="1"> Share despite <strong>{{ proposal.action_items_count }}</strong> open action item(s)</label>
+                {% endif %}
                 <button type="submit" class="btn btn-primary" style="margin-top:8px; width:100%;">Create share link</button>
             </form>
             {% endif %}

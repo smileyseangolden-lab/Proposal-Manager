@@ -4,16 +4,23 @@
 
 {% block content %}
 <div class="page-narrow">
-  <div class="card job-card" id="job-card" data-job-id="{{ job.id }}">
+  <div class="card job-card" id="job-card" data-job-id="{{ job.id }}"
+       data-created="{{ job.created_at.strftime('%Y-%m-%dT%H:%M:%SZ') if job.created_at else '' }}">
     <div class="job-spinner" id="job-spinner"></div>
     <h1 class="job-title" id="job-title">Working on it…</h1>
     <p class="job-phase" id="job-phase">{{ job.message or "Queued — starting shortly." }}</p>
+    <p class="form-hint" id="job-elapsed" aria-live="off"></p>
     <div class="job-steps" id="job-steps">
       <span class="job-step" data-phase="reading">Read documents</span>
       <span class="job-step" data-phase="drafting">Draft with AI</span>
       <span class="job-step" data-phase="saving">Format &amp; save</span>
     </div>
     <div class="job-error" id="job-error" style="display:none"></div>
+    <form method="post" action="{{ url_for('job_cancel', job_id=job.id) }}" id="job-cancel-form"
+          style="margin-top:12px;{% if job.status not in ('queued', 'running') %} display:none;{% endif %}"
+          onsubmit="return confirm('Cancel this job? Any AI work in progress will be discarded.');">
+      <button type="submit" class="btn btn-small btn-secondary">Cancel</button>
+    </form>
     <div class="job-actions" id="job-actions" style="display:none">
       <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Back to dashboard</a>
     </div>
@@ -29,7 +36,21 @@
   var errorEl = document.getElementById("job-error");
   var actionsEl = document.getElementById("job-actions");
   var spinner = document.getElementById("job-spinner");
+  var cancelForm = document.getElementById("job-cancel-form");
   var order = ["reading", "drafting", "saving"];
+
+  // Elapsed timer
+  var elapsedEl = document.getElementById("job-elapsed");
+  var startedAt = new Date(card.getAttribute("data-created"));
+  var elapsedTimer = null;
+  function tickElapsed(){
+    if (isNaN(startedAt)) return;
+    var s = Math.max(0, Math.floor((Date.now() - startedAt.getTime()) / 1000));
+    elapsedEl.textContent = "Elapsed " + Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+  }
+  tickElapsed();
+  elapsedTimer = setInterval(tickElapsed, 1000);
+  function stopElapsed(){ if (elapsedTimer) clearInterval(elapsedTimer); }
 
   function markSteps(phase){
     var idx = order.indexOf(phase);
@@ -48,12 +69,25 @@
         if (d.message) phaseEl.textContent = d.message;
         if (d.phase) markSteps(d.phase);
         if (d.status === "done"){
+          stopElapsed();
+          if (cancelForm) cancelForm.style.display = "none";
           titleEl.textContent = "Done!";
           phaseEl.textContent = "Redirecting to your proposal…";
           window.location.href = d.redirect;
           return;
         }
+        if (d.status === "canceled"){
+          stopElapsed();
+          if (cancelForm) cancelForm.style.display = "none";
+          spinner.style.display = "none";
+          titleEl.textContent = "Canceled";
+          phaseEl.textContent = "This job was canceled — nothing was saved or charged.";
+          actionsEl.style.display = "block";
+          return;
+        }
         if (d.status === "failed"){
+          stopElapsed();
+          if (cancelForm) cancelForm.style.display = "none";
           spinner.style.display = "none";
           titleEl.textContent = "Something went wrong";
           phaseEl.style.display = "none";

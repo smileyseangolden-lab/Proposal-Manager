@@ -118,6 +118,11 @@ def _run_job(job_id: str):
         payload = json.loads(job.payload or "{}")
         result = handler(payload, job) or {}
         job = db.session.get(BackgroundJob, job_id)
+        if job.status == "canceled":
+            # User canceled while the handler ran. The work (and any LLM
+            # tokens) already happened, but the result is discarded and the
+            # job never counts as done.
+            return
         job.status = "done"
         job.result = json.dumps(result)
         job.finished_at = datetime.now(timezone.utc)
@@ -126,6 +131,8 @@ def _run_job(job_id: str):
         logger.error("Job %s (%s) failed:\n%s", job_id, job.kind, traceback.format_exc())
         db.session.rollback()
         job = db.session.get(BackgroundJob, job_id)
+        if job.status == "canceled":
+            return
         job.status = "failed"
         job.error = str(e)
         job.finished_at = datetime.now(timezone.utc)

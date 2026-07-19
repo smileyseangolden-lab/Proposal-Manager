@@ -102,7 +102,7 @@ def login():
             return render_template("platform/login.html")
 
         user = User.query.filter(
-            db.or_(User.email.ilike(ident), User.username == ident)
+            db.or_(db.func.lower(User.email) == ident.lower(), User.username == ident)
         ).first()
 
         now = datetime.now(timezone.utc)
@@ -457,7 +457,7 @@ def controls_settings():
 def controls_owner():
     email = request.form.get("email", "").strip().lower()
     action = request.form.get("action", "grant")
-    user = User.query.filter(User.email.ilike(email)).first() if email else None
+    user = User.query.filter(db.func.lower(User.email) == email).first() if email else None
     if not user:
         flash("No user found with that email.", "error")
         return redirect(url_for("platform_admin.controls"))
